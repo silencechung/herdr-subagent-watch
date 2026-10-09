@@ -1,0 +1,15 @@
+id = "subagent.watch"
+name = "Sub Agent Watch (demo)"
+version = "0.1.0"
+min_herdr_version = "0.9.3"
+description = "Demo of a live sub agent viewer popup, driven by fake data"
+platforms = ["linux"]
+
+# fnm default alias path: the shell's `node` lives in a per-session fnm_multishells dir that disappears.
+[[panes]]
+id = "viewer"
+title = "Sub agent viewer"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "demo.mjs"]
