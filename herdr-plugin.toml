@@ -1,15 +1,22 @@
 id = "subagent.watch"
-name = "Sub Agent Watch (demo)"
-version = "0.1.0"
+name = "Sub Agent Watch"
+version = "0.2.0"
 min_herdr_version = "0.9.3"
-description = "Demo of a live sub agent viewer popup, driven by fake data"
+description = "Popup that follows the sub agents of the Claude Code session in the pane it was opened from"
 platforms = ["linux"]
 
-# fnm default alias path: the shell's `node` lives in a per-session fnm_multishells dir that disappears.
+# node 一律寫 fnm default alias 的絕對路徑：shell 裡的 `node` 在每個 session 各自的 fnm_multishells 暫存資料夾，關掉就不見
+[[actions]]
+id = "open"
+title = "Open sub agent viewer"
+# 文件沒寫 contexts 的作用；照 persiyanov.reviewr（同樣靠 focused_pane_id 找觸發的 pane）的寫法
+contexts = ["pane", "workspace"]
+command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "open-action.mjs"]
+
 [[panes]]
 id = "viewer"
 title = "Sub agent viewer"
 placement = "popup"
 width = "70%"
 height = "60%"
-command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "demo.mjs"]
+command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "viewer.mjs"]
