@@ -84,14 +84,39 @@ wait_for_key() {
   fi
 }
 
+# 跟 lib/herdr.mjs 同規則：PATH 只看絕對路徑的項目。直接寫 `herdr` 讓 shell 去找的話，PATH 裡的相對項目會執行 cwd（使用者的 repo）裡的檔案
+find_herdr() {
+  if [ -n "${HERDR_BIN_PATH:-}" ]; then
+    printf '%s\n' "$HERDR_BIN_PATH"
+    return 0
+  fi
+  remaining_path=${PATH:-}
+  while [ -n "$remaining_path" ]; do
+    directory=${remaining_path%%:*}
+    case $remaining_path in
+      *:*) remaining_path=${remaining_path#*:} ;;
+      *) remaining_path='' ;;
+    esac
+    case $directory in
+      /*)
+        if [ -f "$directory/herdr" ] && [ -x "$directory/herdr" ]; then
+          printf '%s\n' "$directory/herdr"
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+
 fail() {
   if [ "$is_quiet" = 1 ]; then
     exit 0
   fi
   printf '%s\n' "$1" >&2
-  if [ -n "${HERDR_PLUGIN_ACTION_ID:-}" ]; then
+  if [ -n "${HERDR_PLUGIN_ACTION_ID:-}" ] && herdr_path=$(find_herdr); then
     # action 的輸出只進 plugin log，使用者看不到；用 herdr 通知告訴他為什麼沒反應
-    "${HERDR_BIN_PATH:-herdr}" notification show 'subagent.watch: Node.js 22+ not found' \
+    "$herdr_path" notification show 'subagent.watch: Node.js 22+ not found' \
       --body 'Install Node.js 22+ or set SUBAGENT_WATCH_NODE, then try again.' >/dev/null 2>&1 || true
   fi
   # popup 裡的 command 一結束 popup 就關，不等按鍵的話錯誤訊息一閃就不見

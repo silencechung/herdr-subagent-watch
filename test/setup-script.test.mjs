@@ -210,14 +210,21 @@ test('when prefix+. is taken, the key is skipped with the snippet to paste and e
   assert.equal(readHerdrCalls(testCase).at(-1).args[2], 'subagent.watch: setup needs a manual step');
 });
 
-test('when herdr config check fails after the change, config.toml is restored and nothing is reloaded', () => {
+test('when herdr config check fails on the new config, config.toml is never touched and nothing is reloaded', () => {
   const testCase = createCase();
+  const inodeBefore = fs.statSync(testCase.configPath).ino;
   const result = runSetup(testCase, [], { FAKE_HERDR_CHECK_FAIL_ON: 'rows_by_agent' });
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /herdr config check failed after the change, so .+ was restored/);
+  assert.match(result.stdout, /herdr config check failed on the new config, so .+ was not modified/);
   assert.match(result.stdout, /fake problem caused by rows_by_agent/);
   assert.equal(fs.readFileSync(testCase.configPath, 'utf8'), originalConfigText);
+  assert.equal(fs.statSync(testCase.configPath).ino, inodeBefore, 'the original file is not rewritten, not even to restore it');
+  assert.ok(!fs.existsSync(`${testCase.configPath}.subagent-watch.bak`));
+  assert.deepEqual(fs.readdirSync(path.dirname(testCase.configPath)), ['config.toml'], 'the temporary file is cleaned up');
   const calls = readHerdrCalls(testCase);
+  assert.equal(calls[0].configPath, testCase.configPath);
+  assert.notEqual(calls[1].configPath, testCase.configPath);
+  assert.equal(path.dirname(calls[1].configPath), path.dirname(testCase.configPath), 'the new config is checked as a temporary file next to the real one');
   assert.ok(!calls.some((call) => call.args[0] === 'server'));
   assert.equal(calls.at(-1).args[2], 'subagent.watch: setup failed');
   assert.equal(readJson(testCase.settingsPath).hooks.SubagentStart.length, 1, 'the Claude Code part is independent of the herdr part');
@@ -312,4 +319,135 @@ test('unknown arguments exit 2 with usage', () => {
   assert.equal(result.status, 2);
   assert.match(result.stdout, /unknown argument: --bogus/);
   assert.deepEqual(readHerdrCalls(testCase), []);
+});
+
+test('the first backup is kept: setup, remove and setup again never overwrite the .bak', () => {
+  const testCase = createCase();
+  assert.equal(runSetup(testCase).status, 0);
+  const settingsBackupPath = `${testCase.settingsPath}.subagent-watch.bak`;
+  const configBackupPath = `${testCase.configPath}.subagent-watch.bak`;
+  // 使用者在 setup 之後自己又改了設定；之後的 remove／setup 都不能拿這些版本蓋掉原始備份
+  const editedSettings = readJson(testCase.settingsPath);
+  editedSettings.model = 'sonnet';
+  fs.writeFileSync(testCase.settingsPath, `${JSON.stringify(editedSettings, null, 2)}\n`);
+  fs.appendFileSync(testCase.configPath, '\n[ui.extra_section]\n');
+
+  const removed = runSetup(testCase, ['--remove']);
+  assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+  assert.match(removed.stdout, /backup: kept the existing .+settings\.json\.subagent-watch\.bak/);
+  assert.match(removed.stdout, /backup: kept the existing .+config\.toml\.subagent-watch\.bak/);
+  assert.equal(runSetup(testCase).status, 0);
+  assert.equal(fs.readFileSync(settingsBackupPath, 'utf8'), originalSettingsText);
+  assert.equal(fs.readFileSync(configBackupPath, 'utf8'), originalConfigText);
+});
+
+test('--dry-run says an existing backup is kept', () => {
+  const testCase = createCase();
+  fs.writeFileSync(`${testCase.settingsPath}.subagent-watch.bak`, 'older backup');
+  const result = runSetup(testCase, ['--dry-run']);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /\(dry run\) would write .+settings\.json \(keeping the existing backup .+settings\.json\.subagent-watch\.bak\)/);
+  assert.equal(fs.readFileSync(`${testCase.settingsPath}.subagent-watch.bak`, 'utf8'), 'older backup');
+});
+
+test('review PoC: settings.json and config.toml symlinked from a dotfiles folder stay symlinks', () => {
+  const testCase = createCase();
+  const dotfilesDirectory = path.join(testCase.caseDirectory, 'dotfiles');
+  fs.mkdirSync(dotfilesDirectory);
+  const realSettingsPath = path.join(dotfilesDirectory, 'settings.json');
+  const realConfigPath = path.join(dotfilesDirectory, 'config.toml');
+  fs.renameSync(testCase.settingsPath, realSettingsPath);
+  fs.renameSync(testCase.configPath, realConfigPath);
+  fs.chmodSync(realSettingsPath, 0o600);
+  fs.symlinkSync(realSettingsPath, testCase.settingsPath);
+  fs.symlinkSync(path.relative(path.dirname(testCase.configPath), realConfigPath), testCase.configPath);
+
+  const result = runSetup(testCase);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.ok(fs.lstatSync(testCase.settingsPath).isSymbolicLink());
+  assert.ok(fs.lstatSync(testCase.configPath).isSymbolicLink());
+  assert.equal(readJson(realSettingsPath).hooks.SubagentStart[0].hooks[0].command, expectedCommand);
+  assert.match(fs.readFileSync(realConfigPath, 'utf8'), /subagent\.watch\.open/);
+  assert.equal(fs.statSync(realSettingsPath).mode & 0o777, 0o600);
+  assert.match(result.stdout, /settings\.json is a symlink; wrote .+dotfiles\/settings\.json and left the symlink in place/);
+  assert.equal(fs.readFileSync(`${testCase.settingsPath}.subagent-watch.bak`, 'utf8'), originalSettingsText);
+  const calls = readHerdrCalls(testCase);
+  assert.equal(path.dirname(calls[1].configPath), dotfilesDirectory, 'the temporary config is written next to the real file');
+  assert.deepEqual(fs.readdirSync(dotfilesDirectory).sort(), ['config.toml', 'settings.json']);
+
+  assert.equal(runSetup(testCase, ['--remove']).status, 0);
+  assert.ok(fs.lstatSync(testCase.settingsPath).isSymbolicLink());
+  assert.ok(fs.lstatSync(testCase.configPath).isSymbolicLink());
+  assert.equal(fs.readFileSync(realSettingsPath, 'utf8'), originalSettingsText);
+  assert.equal(fs.readFileSync(realConfigPath, 'utf8'), originalConfigText);
+});
+
+test('a symlink pointing at a missing file is reported and not replaced', () => {
+  const testCase = createCase();
+  fs.rmSync(testCase.settingsPath);
+  fs.symlinkSync(path.join(testCase.caseDirectory, 'missing-dotfiles', 'settings.json'), testCase.settingsPath);
+  const result = runSetup(testCase);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /settings\.json is a symlink to a file that does not exist; not modified/);
+  assert.ok(fs.lstatSync(testCase.settingsPath).isSymbolicLink());
+});
+
+test('a folder setup cannot write into gives a clear error instead of a crash, and the original stays', { skip: process.getuid() === 0 && 'root ignores folder permissions' }, () => {
+  const testCase = createCase();
+  const configDirectory = path.dirname(testCase.configPath);
+  fs.chmodSync(configDirectory, 0o555);
+  try {
+    const result = runSetup(testCase);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /ERROR cannot write a temporary file next to .+config\.toml: .+; config\.toml not modified/);
+    assert.equal(fs.readFileSync(testCase.configPath, 'utf8'), originalConfigText);
+  } finally {
+    fs.chmodSync(configDirectory, 0o755);
+  }
+});
+
+test('--remove with nothing of ours leaves settings.json untouched, empty arrays included', () => {
+  const settingsText = '{\n  "hooks": {\n    "SubagentStart": [],\n    "Stop": [{ "hooks": [{ "type": "command", "command": "echo done" }] }]\n  }\n}\n';
+  const testCase = createCase({ settingsText });
+  const before = fs.statSync(testCase.settingsPath);
+  const result = runSetup(testCase, ['--remove']);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /nothing to remove, file not touched/);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), settingsText);
+  assert.equal(fs.statSync(testCase.settingsPath).ino, before.ino);
+  assert.equal(fs.statSync(testCase.settingsPath).mtimeMs, before.mtimeMs);
+  assert.ok(!fs.existsSync(`${testCase.settingsPath}.subagent-watch.bak`));
+});
+
+test('a CRLF settings.json with 4-space indent keeps CRLF and its indent, and remove gives it back byte for byte', () => {
+  const settingsText = `${JSON.stringify(JSON.parse(originalSettingsText), null, 4)}\n`.replace(/\n/g, '\r\n');
+  const testCase = createCase({ settingsText });
+  assert.equal(runSetup(testCase).status, 0);
+  const written = fs.readFileSync(testCase.settingsPath, 'utf8');
+  assert.match(written, /^\{\r\n {4}"model"/);
+  assert.doesNotMatch(written, /[^\r]\n/);
+  assert.ok(written.endsWith('}\r\n'));
+  assert.equal(runSetup(testCase, ['--remove']).status, 0);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), settingsText);
+});
+
+test('another tool\'s hook that merely mentions sidebar-hook.mjs is neither replaced nor removed', () => {
+  const otherCommands = [
+    'node /opt/other-tool/sidebar-hook.mjs',
+    'node /opt/other-tool/hooks/sidebar-hook.mjs --verbose',
+    'sh "/opt/a/bin/run.sh" "/opt/b/hooks/sidebar-hook.mjs"',
+    'python3 /opt/other-tool/hooks/sidebar-hook.mjs',
+  ];
+  const otherGroups = otherCommands.map((command) => ({ hooks: [{ type: 'command', command }] }));
+  const settingsText = `${JSON.stringify({ hooks: { SubagentStart: otherGroups, SubagentStop: otherGroups } }, null, 2)}\n`;
+  const testCase = createCase({ settingsText });
+  const result = runSetup(testCase);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /SubagentStart: added/);
+  const settings = readJson(testCase.settingsPath);
+  assert.deepEqual(settings.hooks.SubagentStart, [...otherGroups, { hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] }]);
+
+  assert.equal(runSetup(testCase, ['--remove']).status, 0);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), settingsText);
 });

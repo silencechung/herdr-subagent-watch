@@ -1,6 +1,7 @@
 // subagent.watch.setup／subagent.watch.remove：把 Claude Code hook、herdr 快捷鍵與側邊欄 rows 加進（或移出）使用者自己的設定檔。
 // 用法：sh bin/run.sh scripts/setup.mjs [--remove] [--dry-run]
 import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -69,27 +70,97 @@ function readTextFile(filePath) {
   }
 }
 
-// 先寫暫存檔再 rename：中途失敗也不會留下寫一半的設定檔；權限照原檔（settings.json 可能是 0600）
-function writeFileAtomically(filePath, text) {
-  let mode = 0o644;
+// 設定檔可能是指向 dotfiles repo 的 symlink：直接 rename 到原路徑會把 symlink 換成一般檔案，所以寫到它指向的真實檔案
+function resolveWritePath(filePath) {
   try {
-    mode = fs.statSync(filePath).mode & 0o777;
-  } catch {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    return { path: fs.realpathSync(filePath), error: null };
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      return { path: null, error: `cannot resolve ${filePath}: ${error.message}` };
+    }
   }
-  const temporaryPath = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporaryPath, text, { mode });
-  fs.chmodSync(temporaryPath, mode);
-  fs.renameSync(temporaryPath, filePath);
+  let isDanglingSymlink = false;
+  try {
+    isDanglingSymlink = fs.lstatSync(filePath).isSymbolicLink();
+  } catch {
+    // 檔案不存在：照原路徑新建
+  }
+  if (isDanglingSymlink) {
+    return { path: null, error: `${filePath} is a symlink to a file that does not exist` };
+  }
+  return { path: filePath, error: null };
 }
 
-function writeWithBackup(filePath, originalText, existed, nextText) {
-  const backupPath = `${filePath}${backupSuffix}`;
-  if (existed) {
-    fs.writeFileSync(backupPath, originalText, { mode: fs.statSync(filePath).mode & 0o777 });
+function readFileMode(filePath) {
+  try {
+    return fs.statSync(filePath).mode & 0o777;
+  } catch {
+    return 0o644;
   }
-  writeFileAtomically(filePath, nextText);
-  return existed ? backupPath : null;
+}
+
+function removeQuietly(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // 已經不在了
+  }
+}
+
+// 暫存檔放在目標旁邊（同一個檔案系統 rename 才是原子的），檔名隨機、用 wx 建立，不會跟著別人預放的 symlink 寫出去；權限照原檔（settings.json 可能是 0600）
+function writeTemporaryFile(targetPath, text, mode) {
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  const temporaryPath = `${targetPath}.${randomBytes(6).toString('hex')}.tmp`;
+  fs.writeFileSync(temporaryPath, text, { mode, flag: 'wx' });
+  try {
+    fs.chmodSync(temporaryPath, mode);
+  } catch (error) {
+    removeQuietly(temporaryPath);
+    throw error;
+  }
+  return temporaryPath;
+}
+
+function replaceFile(temporaryPath, targetPath) {
+  try {
+    fs.renameSync(temporaryPath, targetPath);
+  } catch (error) {
+    removeQuietly(temporaryPath);
+    throw error;
+  }
+}
+
+// 只備份第一次：.bak 已經在就不覆寫。每次都覆寫的話，setup → remove → setup 之後 .bak 裡已經是改過的版本，使用者原本的設定就找不回來
+function backUpOnce(filePath, originalText, mode) {
+  const backupPath = `${filePath}${backupSuffix}`;
+  try {
+    fs.writeFileSync(backupPath, originalText, { mode, flag: 'wx' });
+    return `backup: ${backupPath}`;
+  } catch (error) {
+    if (error.code === 'EEXIST') {
+      return `backup: kept the existing ${backupPath} (from an earlier run, not overwritten)`;
+    }
+    throw error;
+  }
+}
+
+function describePlannedBackup(filePath, existed) {
+  if (!existed) {
+    return '';
+  }
+  const backupPath = `${filePath}${backupSuffix}`;
+  let hasBackup = false;
+  try {
+    fs.lstatSync(backupPath);
+    hasBackup = true;
+  } catch {
+    // 還沒有備份
+  }
+  return hasBackup ? ` (keeping the existing backup ${backupPath})` : ` and back it up to ${backupPath}`;
+}
+
+function describeSymlinkTarget(filePath, targetPath) {
+  return targetPath === filePath ? [] : [`${filePath} is a symlink; wrote ${targetPath} and left the symlink in place`];
 }
 
 function runHerdr(herdrBinPath, argumentList, environment) {
@@ -171,18 +242,26 @@ function setUpClaudeHooks({ environment, pluginRoot, isRemove, isDryRun }) {
     section.lines.push(`${eventName}: ${result.changes[eventName]}`);
   }
   const nextText = formatSettings(result.settings, file.existed ? file.text : '');
-  if (JSON.stringify(result.settings) === JSON.stringify(settings)) {
-    section.lines.push(isRemove ? 'nothing to remove' : 'already set up, file not touched');
+  const isUnchanged = isRemove ? result.removedCount === 0 : JSON.stringify(result.settings) === JSON.stringify(settings);
+  if (isUnchanged) {
+    section.lines.push(isRemove ? 'nothing to remove, file not touched' : 'already set up, file not touched');
+    return section;
+  }
+  const target = resolveWritePath(settingsPath);
+  if (target.error !== null) {
+    section.errors.push(`${target.error}; not modified`);
     return section;
   }
   section.changed = true;
   if (isDryRun) {
-    section.lines.push(`(dry run) would write ${settingsPath}${file.existed ? ` and back it up to ${settingsPath}${backupSuffix}` : ''}`);
+    section.lines.push(`(dry run) would write ${target.path}${describePlannedBackup(settingsPath, file.existed)}`);
     return section;
   }
   try {
-    const backupPath = writeWithBackup(settingsPath, file.text, file.existed, nextText);
-    section.lines.push(backupPath === null ? `created ${settingsPath}` : `backup: ${backupPath}`);
+    const mode = readFileMode(target.path);
+    const backupLine = file.existed ? backUpOnce(settingsPath, file.text, mode) : `created ${settingsPath}`;
+    replaceFile(writeTemporaryFile(target.path, nextText, mode), target.path);
+    section.lines.push(backupLine, ...describeSymlinkTarget(settingsPath, target.path));
   } catch (error) {
     section.errors.push(`cannot write ${settingsPath}: ${error.message}`);
   }
@@ -262,9 +341,15 @@ function setUpHerdrConfig({ environment, isRemove, isDryRun }) {
   if (operations.length === 0) {
     return section;
   }
+  const target = resolveWritePath(configPath);
+  if (target.error !== null) {
+    section.errors.push(`${target.error}; config.toml not modified`);
+    return section;
+  }
   section.changed = true;
   if (isDryRun) {
     section.lines.push(...describeOperations(operations));
+    section.lines.push(`(dry run) would write ${target.path}${describePlannedBackup(configPath, file.existed)}`);
     return section;
   }
 
@@ -284,25 +369,38 @@ function setUpHerdrConfig({ environment, isRemove, isDryRun }) {
     return section;
   }
 
-  let backupPath;
+  // 新內容先寫成暫存檔、用 HERDR_CONFIG_PATH 讓 herdr 檢查，通過才 rename 過去：原檔在檢查通過前完全不動，不需要事後還原
+  const mode = readFileMode(target.path);
+  let temporaryPath;
   try {
-    backupPath = writeWithBackup(configPath, file.text, file.existed, nextText);
+    temporaryPath = writeTemporaryFile(target.path, nextText, mode);
   } catch (error) {
-    section.errors.push(`cannot write ${configPath}: ${error.message}`);
+    section.errors.push(`cannot write a temporary file next to ${target.path}: ${error.message}; config.toml not modified`);
     return section;
   }
-  const after = checkHerdrConfig(herdrBinPath, configPath, environment);
+  const after = checkHerdrConfig(herdrBinPath, temporaryPath, environment);
   if (!isAcceptableCheck(before, after)) {
-    // 不刪使用者的檔案：原本不存在就寫回空內容，herdr 會當成全部用預設值
-    writeFileAtomically(configPath, file.text);
-    section.errors.push(`herdr config check failed after the change, so ${configPath} was restored:`);
+    removeQuietly(temporaryPath);
+    section.errors.push(`herdr config check failed on the new config, so ${configPath} was not modified:`);
     section.errors.push(...after.output.split('\n').map((line) => `    ${line}`));
     return section;
   }
-  section.lines.push(after.isOk ? 'herdr config check: ok' : 'herdr config check: only issues that were already there');
-  if (backupPath !== null) {
-    section.lines.push(`backup: ${backupPath}`);
+  let backupLine = null;
+  try {
+    if (file.existed) {
+      backupLine = backUpOnce(configPath, file.text, mode);
+    }
+    replaceFile(temporaryPath, target.path);
+  } catch (error) {
+    removeQuietly(temporaryPath);
+    section.errors.push(`cannot write ${configPath}: ${error.message}; config.toml not modified`);
+    return section;
   }
+  section.lines.push(after.isOk ? 'herdr config check: ok' : 'herdr config check: only issues that were already there');
+  if (backupLine !== null) {
+    section.lines.push(backupLine);
+  }
+  section.lines.push(...describeSymlinkTarget(configPath, target.path));
   const reload = runHerdr(herdrBinPath, ['server', 'reload-config'], environment);
   if (reload.status === 0) {
     section.reloaded = true;
