@@ -39,7 +39,9 @@ import {
   readProcessInfo,
   runHook,
   sanitizeText,
+  totalBudgetMs,
 } from '../hooks/sidebar-hook.mjs';
+import { hookTimeoutSeconds } from '../lib/setup-claude.mjs';
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const hookScriptPath = join(testDirectory, '..', 'hooks', 'sidebar-hook.mjs');
@@ -568,6 +570,12 @@ describe('hook script as Claude Code runs it', () => {
     };
     return { runtimeDirectory, callLogPath, environment };
   }
+
+  // 預算從 main() 開始算，不含 node 啟動；很忙時實測最慢約預算再加 0.5 秒。至少留一半給這些，才不會碰到 Claude Code 的 timeout
+  test('the time budget stays at most half of the hook timeout in settings.json', () => {
+    assert.ok(totalBudgetMs > 0);
+    assert.ok(totalBudgetMs * 2 <= hookTimeoutSeconds * 1000, `budget ${totalBudgetMs}ms, timeout ${hookTimeoutSeconds}s`);
+  });
 
   test('outside herdr: exit 0, no output, nothing written, under 1 second', () => {
     const runtimeDirectory = createTemporaryDirectory();

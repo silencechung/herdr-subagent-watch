@@ -1,6 +1,6 @@
 // Claude Code SessionStart／SubagentStart／SubagentStop／Stop／StopFailure hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer），
 // 並寫 pane 對照檔給 popup viewer。
-// 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、1 秒內結束。
+// 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、在 totalBudgetMs 內結束。
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
@@ -48,8 +48,11 @@ const pruneOnlyEventNames = new Set(['Stop', 'StopFailure']);
 // 官方文件列的 source：startup、resume、clear、compact、fork；認不得的記成 unknown，標記照樣成立
 const sessionStartSourcePattern = /^[a-z_]{1,32}$/;
 
-// 加上 node 啟動與 herdr 最低預算後仍要在 1 秒內結束
-const totalBudgetMs = 800;
+// 整體時間上限，從 main() 開始算（不含 node 啟動）。平常碰不到：實測 8 個 hook 同時觸發（真實 transcript、假 herdr 每次 30 ms、跑 20 輪）總時間中位數約 220 ms，跟預算大小無關。
+// 只有機器很忙、搶 lock 時才會等到上限：鎖在 1 個 CPU、旁邊有 6 個吃滿 CPU 的 process 時，800 ms 的預算 160 次更新掉了約 70 次（lock-timeout），
+// 1500 ms 只掉 1 次，最慢的 hook 約 2.0 秒。漏掉的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄，比很忙時多等 1 秒嚴重。
+// 上限要離 settings.json 的 hook timeout（hookTimeoutSeconds，5 秒）夠遠：最慢的 2.0 秒還差 3 秒；測試檢查預算不超過 timeout 的一半
+export const totalBudgetMs = 1500;
 const minimumHerdrBudgetMs = 100;
 const maximumPaneQueryMs = 300;
 // lock 外判斷 sub 是否結束最多用這麼久，剩下的 sub 留到下一次事件：判斷拖太久的話，這次事件自己的更新反而等不到 lock。
@@ -57,9 +60,10 @@ const maximumPaneQueryMs = 300;
 // 每個 hook 都會碰到上限，大家同時判斷、搶 CPU，拿 lock 跟著變慢：上限 200 ms 時 640 次更新掉了 5 次（lock-timeout），100 ms 時 640 次都沒掉
 export const maximumPruneMs = 100;
 const lockRetryIntervalMs = 10;
-// 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的
+// 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的。
+// 空 lock 只有舊版 hook 會建（它的預算是 800 ms），現在的 lock 都有 pid、走 isLockOwnerGone，所以不用跟著 totalBudgetMs 調
 const staleLockMs = 2000;
-// hook 整體預算不到 1 秒，超過這個年紀的 lock 不可能還有人在用；pid 查不準時（例如不同 pid namespace）的保險
+// hook 整體預算 1.5 秒（很忙時實測最慢約 2 秒），超過這個年紀的 lock 不可能還有人在用；pid 查不準時（例如不同 pid namespace）的保險
 const maximumLockAgeMs = 10_000;
 const maximumAncestorDepth = 64;
 const safeIdentifierPattern = /^[A-Za-z0-9_.:-]{1,128}$/;
