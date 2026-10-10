@@ -182,7 +182,11 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 
 ## 已知限制
 
-- 開了新 session 之後 popup 還停在上一個 session：herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它，直到 herdr 或 pane map 回報新的 session（見「怎麼找到 pane 對應的 session」）。
+- 開了新 session 之後 popup 還停在上一個 session：herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它。之後只有 herdr 或 pane map 回報的 session 跟它上一次回報的不同、或畫面上的 transcript 被刪掉，才會換（見「怎麼找到 pane 對應的 session」）。
+- popup 停在較舊的 session：popup 開著時，照上面的規則有兩種情況會這樣：
+  - herdr 的回報變回較舊的 session（例：herdr server 重啟後還原舊值）。這算值變了，popup 不比寫入時間就換過去，之後停在那裡，直到 herdr 或 pane map 回報跟上一次不同的 session。viewer 能不能撐過 herdr server 重啟未驗證。
+  - herdr 或 pane map 第一次回報 session（例：popup 開啟時還沒有 pane map 檔，之後開 sub 時 hook 才寫入；或 herdr 一開始失敗、後來恢復），而別的 pane 剛好把舊 session 的 transcript 寫得一樣晚或更晚：popup 停在舊 session，之後這個來源不會再比寫入時間。
+  - 兩種情況關掉 popup 再開，都會跟第一次開啟一樣照寫入時間重新選擇。
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
 - 只有 East Asian Width 為 W 或 F（Unicode 16.0）的字元算 2 格。有些 terminal 只在加了 variation selector 時才畫成 2 格的符號（例 `❤️`），量出來的寬度可能和 terminal 實際畫的不同。emoji ZWJ 序列量的是各部分加總（👨‍👩‍👧 算 6 格），terminal 把它合成一個字畫的話會比量的窄。
 - herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。
