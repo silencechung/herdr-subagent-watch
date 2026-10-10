@@ -1,6 +1,8 @@
-# 側邊欄 sub agent 樹狀行
+# Sidebar sub agent tree
 
-herdr 側邊欄 claude 那一列底下，用最多 5 行顯示這個 session **還在跑**的 sub agent：
+English | [繁體中文](sidebar.zh-TW.md)
+
+Under the claude row of the herdr sidebar, up to 5 lines show the sub agents of that session that are **still running**:
 
 ```
 <state_icon> <workspace> · <tab>
@@ -10,40 +12,40 @@ claude
 └─ Plan ●
 ```
 
-- 只列跑中的（`●`），不帶編號。sub 一結束（`SubagentStop`）那一行就拿掉，其餘的重排，`├─`／`└─` 每次都重算。
-- 沒有任何跑中的 sub 時，側邊欄只剩 claude 那一列。
-- 側邊欄不留歷程：結束的 sub 和它做過什麼，用 popup viewer（`prefix+.`）看，見 README。
+- Only running sub agents (`●`) are listed, without numbers. When a sub agent ends (`SubagentStop`), its line is removed, the rest move up, and `├─` / `└─` are recomputed every time.
+- With no running sub agent, the sidebar shows only the claude row.
+- The sidebar keeps no history: finished sub agents and what they did are in the popup viewer (`prefix+.`), see the [README](../README.md).
 
-## 原理
+## How it works
 
-1. Claude Code 啟動／結束 sub agent 時觸發 `SubagentStart`／`SubagentStop` hook，經 `bin/run.sh` 找到 node 後執行 `hooks/sidebar-hook.mjs`，payload 從 stdin 進來。
-2. hook 更新狀態檔，再呼叫 `herdr pane report-metadata` 把樹狀行寫進 pane token `sub1`…`sub5`。
-3. `config.toml` 的 `rows_by_agent.claude` 多了 `$sub1`…`$sub5` 五行；herdr 文件寫明沒回報的 token 會讓那一行整行消失，所以平常看不到空行（畫面上實際效果尚待使用者確認）。
+1. When Claude Code starts or ends a sub agent, it fires the `SubagentStart` / `SubagentStop` hook. `bin/run.sh` finds node and runs `hooks/sidebar-hook.mjs`; the payload arrives on stdin.
+2. The hook updates its state file, then calls `herdr pane report-metadata` to write the tree lines into pane tokens `sub1`…`sub5`.
+3. `rows_by_agent.claude` in `config.toml` has five extra lines, `$sub1`…`$sub5`. The herdr docs state that a token that has not been reported makes its whole line disappear, so normally no empty lines show.
 
-### hook 輸入（2026-10-10 用 `claude -p` 2.1.296 實測）
+### Hook input (tested 2026-10-10 with `claude -p` 2.1.296)
 
-| 欄位 | SubagentStart | SubagentStop |
+| Field | SubagentStart | SubagentStop |
 | --- | --- | --- |
 | `hook_event_name` | ✓ | ✓ |
-| `session_id`、`transcript_path`、`cwd`、`prompt_id` | ✓ | ✓ |
-| `agent_id`（例：`a12e8c491ce2f7f4a`，沒有 `agent-` 前綴） | ✓ | ✓ |
-| `agent_type`（例：`general-purpose`） | ✓ | ✓ |
-| `permission_mode`、`effort`、`stop_hook_active`、`agent_transcript_path`、`background_tasks`、`session_crons` | | ✓ |
+| `session_id`, `transcript_path`, `cwd`, `prompt_id` | ✓ | ✓ |
+| `agent_id` (e.g. `a12e8c491ce2f7f4a`, no `agent-` prefix) | ✓ | ✓ |
+| `agent_type` (e.g. `general-purpose`) | ✓ | ✓ |
+| `permission_mode`, `effort`, `stop_hook_active`, `agent_transcript_path`, `background_tasks`, `session_crons` | | ✓ |
 
-官方文件說 `SubagentStop` 有 `last_assistant_message`，實測那次沒有；這個 hook 用不到它。
+The official docs say `SubagentStop` has `last_assistant_message`; it was not there in that test. This hook does not use it.
 
-hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `w8:pV`）、`HERDR_BIN_PATH`、`XDG_RUNTIME_DIR` 都在。範例 payload 在 `test/fixtures/sidebar/`。
+The hook process inherits Claude Code's environment variables: `HERDR_PANE_ID` (e.g. `w8:pV`), `HERDR_BIN_PATH` and `XDG_RUNTIME_DIR` were all present in testing. Sample payloads are in `test/fixtures/sidebar/`.
 
-### 寫出的檔案（`$XDG_RUNTIME_DIR/subagent-watch/`，tmpfs，重開機就清）
+### Files written (`$XDG_RUNTIME_DIR/subagent-watch/`, tmpfs, cleared on reboot)
 
-- `session-<sessionId>.json`：`{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`，`subagents` 只放跑中的。`SubagentStop` 直接把那筆移除，檔案大小只跟同時在跑的 sub 數量有關，不會越長越大。
-  - 舊版留下、`status` 是 `"done"` 的項目，下一次事件讀檔時就丟掉。
-  - 同一個 sub 還在清單裡又收到 `SubagentStart` 時只留一筆（保留原本的啟動順序）；已經移除後再收到它的 `SubagentStart`（resume）就重新列在最後面。
-- `pane-<HERDR_PANE_ID>.json`：給 popup viewer 讀的對照檔，**合約固定**：`{"sessionId","transcriptPath","cwd","updatedAtMs"}`。
+- `session-<sessionId>.json`: `{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`, where `subagents` holds only running sub agents. `SubagentStop` removes the entry, so the file size depends only on how many sub agents run at the same time and does not keep growing.
+  - Entries left by an older version with `status` `"done"` are dropped the next time an event reads the file.
+  - A `SubagentStart` for a sub agent that is still in the list keeps a single entry (with its original start order); a `SubagentStart` for one that has already been removed (resume) adds it again at the end.
+- `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads. **The contract is fixed**: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`.
 
-兩個都用「寫暫存檔再 `rename`」，viewer 不會讀到寫一半的 JSON。同一個 session 的 read-modify-write 用 `session-<id>.json.lock`（`open` 的 `wx` flag）串起來，平行啟動多個 sub 也不會掉資料；lock 超過 2 秒沒放視為失效。
+Both are written to a temporary file and then `rename`d, so the viewer never reads half-written JSON. Read-modify-write for one session is serialized with `session-<id>.json.lock` (`open` with the `wx` flag), so starting several sub agents in parallel loses no data; a lock held for more than 2 seconds is treated as stale.
 
-### herdr 回報
+### Reporting to herdr
 
 ```
 herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
@@ -51,36 +53,36 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
   --clear-token sub3 --clear-token sub4 --clear-token sub5
 ```
 
-最後一個跑中的 sub 結束時，五個 token 全部用 `--clear-token` 清掉。
+When the last running sub agent ends, all five tokens are cleared with `--clear-token`.
 
-- 只用一個 source `subagent.watch`：herdr 每個 pane 一生最多 32 個 sequenced source，清掉也不會還。
-- `--seq` 用 `Date.now()`，同一毫秒連發時取「上一筆 + 1」，保證遞增（herdr 會忽略比較舊的 seq）。
-- 排序：照啟動時間。跑中的超過 5 個時第 5 行改成 `└─ +N more`，N 只算跑中、沒列出來的。
-- herdr token 上限 80 字、會移除控制字元：`agent_type` 太長時截斷成 `…`，保證 `●` 留在行尾。
-- herdr 路徑用 `HERDR_BIN_PATH`，沒有才找 PATH 上的 `herdr`。
+- Only one source, `subagent.watch`, is used: herdr allows at most 32 sequenced sources per pane for its whole lifetime, and clearing one does not give it back.
+- `--seq` is `Date.now()`; for several events in the same millisecond it uses "previous + 1", so it always increases (herdr ignores an older seq).
+- Order: by start time. With more than 5 running, the fifth line becomes `└─ +N more`, where N counts only running sub agents that are not listed.
+- herdr limits a token to 80 characters and strips control characters: an `agent_type` that is too long is truncated with `…`, so `●` always stays at the end of the line.
+- herdr is called through `HERDR_BIN_PATH`; only when that is missing is `herdr` looked up on `PATH`.
 
-### 不干擾 Claude session 的設計
+### Designed not to disturb Claude sessions
 
-這個 hook 是全域的，套用到所有 Claude session：
+The hook is global and applies to every Claude session:
 
-- 永遠 exit 0、stdout 不輸出（herdr 的輸出也導到 `ignore`），整體預算 800 ms（herdr 逾時直接 `SIGKILL`）；`settings.json` 的 timeout 是 5 秒當保險。
-- 沒有 `HERDR_PANE_ID`、沒有 `XDG_RUNTIME_DIR`、找不到 herdr 執行檔 → 什麼都不寫，直接結束。
-- `bin/run.sh` 找不到 Node.js 22+ 時，對這個 hook 一律安靜地 exit 0（其他入口才印錯誤）。
-- `agent_type` 是空字串的事件略過：Claude Code 內部 agent（prompt suggestion、`/btw`）也會觸發 `SubagentStop`。
-- 沒看過 `SubagentStart` 的 `SubagentStop` 略過。
-- 祖先 process 裡有兩個以上 `claude`（例如 pane 裡的 claude 用 Bash 跑 `claude -p`）→ 略過。子 process 繼承同一個 `HERDR_PANE_ID`，不擋的話會蓋掉主 session 的樹和對照檔。
+- It always exits 0 and prints nothing to stdout (herdr's output is sent to `ignore` too), with an overall budget of 800 ms (herdr is killed with `SIGKILL` on timeout); the 5-second timeout in `settings.json` is a safety net.
+- No `HERDR_PANE_ID`, no `XDG_RUNTIME_DIR`, or no herdr executable → it writes nothing and exits.
+- When `bin/run.sh` cannot find Node.js 22+, it always exits 0 silently for this hook (the other entry points print an error).
+- Events with an empty `agent_type` are skipped: Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`.
+- A `SubagentStop` without a matching `SubagentStart` seen earlier is skipped.
+- Two or more `claude` processes among the ancestors (for example the claude in the pane running `claude -p` through Bash) → skipped. Child processes inherit the same `HERDR_PANE_ID`; without this check they would overwrite the main session's tree and mapping file.
 
-### 已知限制
+### Known limitations
 
-- session 在還有 sub 跑中時結束或換 session，舊的樹狀行會留著，直到這個 pane 下一次 sub agent 事件才被覆蓋（只接了 `SubagentStart`／`SubagentStop`，沒接 `SessionStart`／`SessionEnd`）。
-- 某個 sub 的 `SubagentStop` 沒記到（例如等 lock 超過時間預算，hook 直接放棄這次事件），那一行在同一個 session 裡不會自己消失（那個 sub 之後再收到一次 `SubagentStop` 才會拿掉）；換 session 後的下一次 sub 事件才會蓋掉。
-- `●`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
+- If a session ends or switches to another session while sub agents are still running, the old tree lines stay until the next sub agent event in that pane overwrites them (only `SubagentStart` / `SubagentStop` are hooked, not `SessionStart` / `SessionEnd`).
+- If a sub agent's `SubagentStop` is missed (for example the hook gives up on the event after waiting too long for the lock), its line does not go away by itself within the same session (it is removed only when that sub agent gets another `SubagentStop`); after switching sessions, the next sub agent event overwrites it.
+- `●` and `─` are ambiguous width characters; their actual width depends on the terminal settings.
 
-## setup 會加什麼
+## What setup adds
 
-由 `subagent.watch.setup` action（或 `sh bin/run.sh scripts/setup.mjs`）寫入，規則與衝突處理見 README 的「安裝」。
+Written by the `subagent.watch.setup` action (or `sh bin/run.sh scripts/setup.mjs`). For the rules and conflict handling, see [Setup](../README.md#setup) in the README.
 
-`${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks` 底下（其他設定不動）：
+Under `hooks` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (other settings are untouched):
 
 ```json
 "SubagentStart": [
@@ -88,18 +90,18 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
     "hooks": [
       {
         "type": "command",
-        "command": "sh \"<plugin 目錄>/bin/run.sh\" \"<plugin 目錄>/hooks/sidebar-hook.mjs\"",
+        "command": "sh \"<plugin dir>/bin/run.sh\" \"<plugin dir>/hooks/sidebar-hook.mjs\"",
         "timeout": 5
       }
     ]
   }
 ],
-"SubagentStop": [ 同上 ]
+"SubagentStop": [ same as above ]
 ```
 
-`<plugin 目錄>` 是 setup 執行當下 plugin 的絕對路徑（`herdr plugin install` 的 managed checkout 或 `herdr plugin link` 的資料夾）。node 不寫進 command，由 `bin/run.sh` 每次找。
+`<plugin dir>` is the absolute path of the plugin when setup runs (the managed checkout from `herdr plugin install`, or the folder given to `herdr plugin link`). node is not written into the command; `bin/run.sh` looks it up every time.
 
-`config.toml`（`$HERDR_CONFIG_PATH`，沒設就是 `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml`）新增，每段都包在 `# >>> subagent.watch` ／ `# <<< subagent.watch` 之間：
+Added to `config.toml` (`$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set), each block wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`:
 
 ```toml
 [[keys.command]]
@@ -120,32 +122,32 @@ claude = [
 ]
 ```
 
-前兩行是 herdr 文件裡的預設 rows。`rows_by_agent` 會整個取代 `rows`，不是接在後面，所以預設的兩行要寫進來；如果你在 `[ui.sidebar.agents]` 自訂過 `rows`，claude 那一列會改回這兩行（setup 會提醒）。
+The first two rows are the default rows from the herdr docs. `rows_by_agent` replaces `rows` entirely instead of appending to it, so the two default rows have to be included. If you customized `rows` under `[ui.sidebar.agents]`, the claude row goes back to these two rows (setup warns you about this).
 
-`$sub*` 用 inline style table，一律 `bold`：側邊欄只會出現跑中的 sub，不用區分狀態。
+`$sub*` uses an inline style table and is always `bold`: the sidebar only shows running sub agents, so there is no status to tell apart.
 
-- 不指定 `fg`：顏色全部跟著 herdr theme，換 theme 也不用改這五行。
-- `dim = false`：herdr 文件寫明沒寫的欄位沿用 token 的 contextual style，明確寫 `false` 才會拿掉那個修飾，這裡確保樹狀行不會被畫成 dim。
+- No `fg`: colors follow the herdr theme entirely, so switching themes needs no change to these five lines.
+- `dim = false`: the herdr docs state that fields left out inherit the token's contextual style, and only an explicit `false` removes that modifier. This makes sure the tree lines are never drawn dim.
 
-舊版 setup 每行多寫了 `rules = [{ contains = "✓", bold = false }]`。現在不會再出現 `✓`，那條 rule 留著也沒有作用。setup 看到 claude rows 已經有 `$sub1` 就當成設定好，不會改寫；想拿掉就自己刪，或（在 marker 裡的話）先跑 remove 再跑 setup。
+Older versions of setup also wrote `rules = [{ contains = "✓", bold = false }]` on each line. `✓` no longer appears, so that rule does nothing if it is still there. Setup treats claude rows that already contain `$sub1` as configured and does not rewrite them; to remove the rule, delete it yourself, or (if it is inside the markers) run remove and then setup again.
 
-## 怎麼移除
+## How to remove
 
-1. 跑 `herdr plugin action invoke subagent.watch.remove`（或 `sh bin/run.sh scripts/setup.mjs --remove`）：拿掉 `settings.json` 裡指向 `sidebar-hook.mjs` 的 hook 與 `config.toml` 裡 marker 之間的內容，然後 `herdr server reload-config`。
-2. 沒有 marker、手動加的設定要自己刪：`settings.json` 刪掉 `command` 指向 `sidebar-hook.mjs` 的那筆（陣列空了就把整個 key 拿掉）；`config.toml` 刪掉 `prefix+.` 那段 `[[keys.command]]` 和 `claude` rows 裡的 `$sub1`…`$sub5`，再 `herdr server reload-config`。
-3. 清掉 pane 上殘留的 token（每個有 claude 的 pane 各跑一次）：
+1. Run `herdr plugin action invoke subagent.watch.remove` (or `sh bin/run.sh scripts/setup.mjs --remove`): it removes the hooks in `settings.json` that point at `sidebar-hook.mjs` and the content between the markers in `config.toml`, then runs `herdr server reload-config`.
+2. Settings added by hand without markers have to be removed yourself: in `settings.json`, delete the entry whose `command` points at `sidebar-hook.mjs` (if the array becomes empty, remove the whole key); in `config.toml`, delete the `[[keys.command]]` block for `prefix+.` and `$sub1`…`$sub5` from the `claude` rows, then run `herdr server reload-config`.
+3. Clear tokens left on panes (run once for each pane that has claude):
 
    ```
    herdr pane report-metadata <pane_id> --source subagent.watch --seq "$(date +%s%3N)" \
      --clear-token sub1 --clear-token sub2 --clear-token sub3 --clear-token sub4 --clear-token sub5
    ```
 
-4. 狀態檔在 `$XDG_RUNTIME_DIR/subagent-watch/`，重開機會自動清掉，也可以手動刪掉這個資料夾。
+4. The state files are in `$XDG_RUNTIME_DIR/subagent-watch/`. They are cleared automatically on reboot, or you can delete that folder by hand.
 
-## 測試
+## Tests
 
 ```
 node --test test/sidebar*.test.mjs
 ```
 
-涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr、巢狀 `claude -p` 略過、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+Covers payload parsing, state updates (stop removes the entry, a stop without a seen start is skipped, old `done` entries are dropped), tree lines (start two → stop one leaves `└─` → stop all clears everything, `+N more` counts only running ones, 80-character truncation), increasing seq, staying silent outside herdr, falling back to herdr on `PATH` when `HERDR_BIN_PATH` is missing, skipping nested `claude -p`, no data loss with parallel starts, and running the script for real with a fake herdr executable (checking exit 0, empty stdout, and finishing within 1 second).
