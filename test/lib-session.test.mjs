@@ -297,23 +297,180 @@ test('resolveSession hands its abort signal to the herdr command', async () => {
   assert.equal(receivedSignal, abortController.signal);
 });
 
-test('shouldReplaceSession switches to a new session but never downgrades to a guess or to nothing', () => {
-  const herdrA = { transcriptPath: '/p/a.jsonl', isGuessed: false };
-  const herdrB = { transcriptPath: '/p/b.jsonl', isGuessed: false };
-  const guessedC = { transcriptPath: '/p/c.jsonl', isGuessed: true };
-  const guessedD = { transcriptPath: '/p/d.jsonl', isGuessed: true };
-  const unresolved = { transcriptPath: null, isGuessed: false };
+test('shouldReplaceSession follows the most recently written transcript and never downgrades to a guess or to nothing', () => {
+  const { projectsDirectory } = createCase();
+  const nowMs = Date.now();
+  const session = (sessionId, source, modifiedMs) => ({
+    transcriptPath: writeTranscript(projectsDirectory, '/srv/replace', sessionId, modifiedMs),
+    sessionId,
+    source,
+    isGuessed: source === 'guessed',
+  });
+  const herdrOld = session('a0000000-0000-4000-8000-000000000001', 'herdr', nowMs - 60_000);
+  const herdrNew = session('b0000000-0000-4000-8000-000000000002', 'herdr', nowMs);
+  const paneMapOld = { ...herdrOld, source: 'pane-map' };
+  const guessedC = session('c0000000-0000-4000-8000-000000000003', 'guessed', nowMs + 60_000);
+  const guessedD = session('d0000000-0000-4000-8000-000000000004', 'guessed', nowMs + 120_000);
+  const unresolved = { transcriptPath: null, sessionId: null, source: null, isGuessed: false };
   assert.equal(shouldReplaceSession(null, unresolved), true);
   assert.equal(shouldReplaceSession(unresolved, unresolved), true);
   assert.equal(shouldReplaceSession(unresolved, guessedC), true);
-  // /resume、重開 claude：herdr 回報另一個 session id
-  assert.equal(shouldReplaceSession(herdrA, herdrB), true);
-  // 猜的被確定的取代，猜的也跟著最新的換
-  assert.equal(shouldReplaceSession(guessedC, herdrA), true);
+  // /resume、重開 claude：新 session 的 transcript 正在寫，比較新
+  assert.equal(shouldReplaceSession(herdrOld, herdrNew), true);
+  // herdr 逾時退回 /resume 前寫的 pane map：那個 transcript 比較舊，不能跳回去
+  assert.equal(shouldReplaceSession(herdrNew, paneMapOld), false);
+  assert.equal(shouldReplaceSession(herdrNew, { ...herdrOld }), false);
+  // 同一個 transcript 換成新的結果（例 isTranscriptMissing 變了）
+  assert.equal(shouldReplaceSession(herdrNew, { ...herdrNew, source: 'pane-map' }), true);
+  // 猜的被 herdr／pane map 給的取代，就算猜的寫得比較近
+  assert.equal(shouldReplaceSession(guessedC, paneMapOld), true);
+  // 猜的不能取代 herdr／pane map 給的，同一個 transcript 也不行
+  assert.equal(shouldReplaceSession(herdrOld, guessedC), false);
+  assert.equal(shouldReplaceSession(herdrOld, { ...herdrOld, source: 'guessed', isGuessed: true }), false);
+  assert.equal(shouldReplaceSession(herdrOld, unresolved), false);
+  // 猜的換猜的：現在的 transcript 還在就不換，就算另一個寫得比較近
+  assert.equal(shouldReplaceSession(guessedC, guessedD), false);
+  // 寫入時間相同（tmpfs 的 mtime 是 coarse clock，常常一樣）時留著現在的
+  assert.equal(shouldReplaceSession(herdrNew, { ...herdrNew, transcriptPath: '/elsewhere/x.jsonl' }, { getModifiedMs: () => nowMs }), false);
+
+  fs.rmSync(guessedC.transcriptPath);
+  fs.rmSync(herdrNew.transcriptPath);
+  // 現在的 transcript 不見了：換成任何還在的 session
   assert.equal(shouldReplaceSession(guessedC, guessedD), true);
-  // herdr 暫時失敗退回猜測或找不到時，留著已經確定的 session
-  assert.equal(shouldReplaceSession(herdrA, guessedC), false);
-  assert.equal(shouldReplaceSession(herdrA, unresolved), false);
+  assert.equal(shouldReplaceSession(herdrNew, paneMapOld), true);
+});
+
+function writePaneMap(runtimeDirectory, paneId, mapping) {
+  fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
+  fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', `pane-${paneId}.json`), JSON.stringify(mapping));
+}
+
+function herdrClaudePane(sessionValue, cwd = '/srv/work') {
+  return { pane_id: 'w1:p1', agent: 'claude', agent_session: { agent: 'claude', kind: 'id', source: 'herdr:claude', value: sessionValue }, cwd, foreground_cwd: cwd };
+}
+
+function herdrTimingOut() {
+  return () => {
+    const error = new Error('Command failed');
+    error.killed = true;
+    error.signal = 'SIGTERM';
+    throw error;
+  };
+}
+
+test('a stale herdr session loses to the pane map session whose transcript was written more recently', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  // 實測：herdr server 重啟後同一個 pane 開新的 claude，herdr 仍回報重啟前的 session
+  const staleId = 'aaab440d-0000-4000-8000-000000000001';
+  const currentId = '3cd69807-0000-4000-8000-000000000002';
+  writeTranscript(projectsDirectory, '/srv/work', staleId, Date.now() - 3_600_000);
+  const currentPath = writeTranscript(projectsDirectory, '/srv/work', currentId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: currentId, transcriptPath: currentPath, cwd: '/srv/work', updatedAtMs: Date.now() });
+  const { runCommand } = herdrReturning(herdrClaudePane(staleId));
+  const result = await resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.equal(result.transcriptPath, currentPath);
+  assert.equal(result.source, 'pane-map');
+  assert.equal(result.isGuessed, false);
+  assert.equal(result.statusNote, 'herdr says session aaab440d, pane map says 3cd69807');
+  assert.ok(result.notes.includes(result.statusNote));
+});
+
+test('herdr wins over a pane map left over from before /resume, and agreeing sources leave no status note', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const oldId = 'a1a1a1a1-0000-4000-8000-000000000001';
+  const newId = 'b2b2b2b2-0000-4000-8000-000000000002';
+  const oldPath = writeTranscript(projectsDirectory, '/srv/work', oldId, Date.now() - 60_000);
+  const newPath = writeTranscript(projectsDirectory, '/srv/work', newId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: oldId, transcriptPath: oldPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const result = await resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(result.transcriptPath, newPath);
+  assert.equal(result.source, 'herdr');
+  assert.equal(result.statusNote, 'herdr says session b2b2b2b2, pane map says a1a1a1a1');
+
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: newId, transcriptPath: newPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const agreeing = await resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(agreeing.transcriptPath, newPath);
+  assert.equal(agreeing.statusNote, null);
+});
+
+test('herdr timing out after /resume falls back to the old pane map, and the viewer keeps the newer session', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const oldId = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const newId = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const oldPath = writeTranscript(projectsDirectory, '/srv/work', oldId, Date.now() - 60_000);
+  const newPath = writeTranscript(projectsDirectory, '/srv/work', newId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: oldId, transcriptPath: oldPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', contextCwd: '/srv/work', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const current = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(current.transcriptPath, newPath);
+  const duringTimeout = await resolveSession({ ...base, runCommand: herdrTimingOut() });
+  assert.equal(duringTimeout.transcriptPath, oldPath);
+  assert.ok(duringTimeout.notes.includes('herdr pane get failed (timed out)'));
+  assert.equal(shouldReplaceSession(current, duringTimeout), false);
+  const recovered = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(shouldReplaceSession(current, recovered), true);
+  assert.equal(recovered.transcriptPath, current.transcriptPath);
+});
+
+test('a session herdr reports before its first write waits only when the pane map has nothing usable', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const previousId = 'c3c3c3c3-0000-4000-8000-000000000003';
+  const startingId = 'd4d4d4d4-0000-4000-8000-000000000004';
+  const previousPath = writeTranscript(projectsDirectory, '/srv/work', previousId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: previousId, transcriptPath: previousPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const beforeFirstWrite = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(startingId)).runCommand });
+  assert.equal(beforeFirstWrite.transcriptPath, previousPath);
+  assert.equal(beforeFirstWrite.isTranscriptMissing, false);
+  const startingPath = writeTranscript(projectsDirectory, '/srv/work', startingId, Date.now());
+  const afterFirstWrite = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(startingId)).runCommand });
+  assert.equal(afterFirstWrite.transcriptPath, startingPath);
+  assert.equal(shouldReplaceSession(beforeFirstWrite, afterFirstWrite), true);
+});
+
+test('with two sessions writing in turn in the same folder, a guessed session sticks until its transcript is gone', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const firstPath = writeTranscript(projectsDirectory, '/srv/shared', 'e5e5e5e5-0000-4000-8000-000000000005', Date.now() - 1_000);
+  const secondPath = writeTranscript(projectsDirectory, '/srv/shared', 'f6f6f6f6-0000-4000-8000-000000000006', Date.now() - 2_000);
+  const base = { paneId: null, fallbackCwd: '/srv/shared', projectsDirectory, runtimeDirectory, herdrBinPath: null };
+  let current = await resolveSession(base);
+  assert.equal(current.transcriptPath, firstPath);
+  assert.equal(current.isGuessed, true);
+  let switchCount = 0;
+  for (let round = 1; round <= 6; round += 1) {
+    const writtenDate = new Date(Date.now() + round * 1_000);
+    fs.utimesSync(round % 2 === 1 ? secondPath : firstPath, writtenDate, writtenDate);
+    const next = await resolveSession(base);
+    if (shouldReplaceSession(current, next) && next.transcriptPath !== current.transcriptPath) {
+      switchCount += 1;
+      current = next;
+    }
+  }
+  assert.equal(switchCount, 0);
+  assert.equal(current.transcriptPath, firstPath);
+  fs.rmSync(firstPath);
+  const next = await resolveSession(base);
+  assert.equal(next.transcriptPath, secondPath);
+  assert.equal(shouldReplaceSession(current, next), true);
+});
+
+test('the herdr / pane map disagreement note carries no terminal escapes', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  // herdr 的 agent_session 可以是 transcript 的絕對路徑，session id 就取檔名：檔名裡的 escape 會跟著進 note
+  const projectDirectory = path.join(projectsDirectory, encodeProjectDirectoryName('/srv/work'));
+  fs.mkdirSync(projectDirectory, { recursive: true });
+  const hostilePath = path.join(projectDirectory, 'ev\u001b]52;c;QQ==\u0007\u202eil.jsonl');
+  fs.writeFileSync(hostilePath, '{}\n');
+  const olderDate = new Date(Date.now() - 60_000);
+  fs.utimesSync(hostilePath, olderDate, olderDate);
+  const mappedId = 'abcdef01-0000-4000-8000-000000000001';
+  const mappedPath = writeTranscript(projectsDirectory, '/srv/work', mappedId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: mappedId, transcriptPath: mappedPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const { runCommand } = herdrReturning(herdrClaudePane(hostilePath));
+  const result = await resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.equal(result.transcriptPath, mappedPath);
+  assert.match(result.statusNote, /^herdr says session ev.*, pane map says abcdef01$/);
+  assert.doesNotMatch(result.statusNote, terminalControlPattern);
 });
 
 function writeExecutable(name, body) {

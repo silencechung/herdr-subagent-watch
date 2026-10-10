@@ -94,7 +94,7 @@ const hostileSamples = [
   ['8-bit OSC ended by 8-bit ST', 'a\x9d0;title\x9cb', 'ab'],
   ['DCS string', 'a\x1bPq#0;2;0;0;0\x1b\\b', 'ab'],
   ['charset designation and save cursor', '\x1b(Ba\x1b7b', 'ab'],
-  ['unterminated OSC swallows the rest like a terminal would', 'tail \x1b]52;c;QUJD', 'tail '],
+  ['unterminated OSC loses only its introducer', 'tail \x1b]52;c;QUJD', 'tail 52;c;QUJD'],
   ['bidi override and zero-width characters', 'a\u202eb\u2066c\u200bd\ufeffe', 'abcde'],
   ['lone C0, DEL and C1', 'a\x07b\x7fc\x85d\x1b', 'abcd'],
 ];
@@ -127,6 +127,57 @@ test('sanitizeText and sanitizeMultilineText also strip 8-bit controls and bidi 
   }
   assert.equal(sanitizeText('general-\u202epurpose'), 'general-purpose');
   assert.equal(sanitizeMultilineText('line 1\x9b2J\nline 2'), 'line 1\nline 2');
+});
+
+test('an unterminated OSC / DCS / 8-bit C1 string drops only its introducer and keeps the text after it', () => {
+  // cp1252 亂碼：” 的 UTF-8 bytes E2 80 9D 被當成 cp1252 讀，0x9D 沒有對應字元，變成單獨的 U+009D
+  assert.equal(sanitizeText('he said â€\x9dhello world, more text'), 'he said â€ hello world, more text');
+  assert.equal(stripTerminalControls('he said â€\x9dhello'), 'he said â€hello');
+  assert.equal(sanitizeMultilineText('line1 \x9d tail\nline2\nline3'), 'line1  tail\nline2\nline3');
+  assert.equal(sanitizeMultilineText("printf '\x1b]0;title'\necho next\necho last"), "printf '0;title'\necho next\necho last");
+  assert.equal(truncateToWidth('abc\x1bPdef ghi', 80).text, 'abcdef ghi');
+  assert.equal(sanitizeText('a\x90b \x98c \x9ed \x9fe'), 'a b c d e');
+  // ESC 後面不是 \ 就不是 ST：前面的 OSC 算沒結尾，只剝 introducer，ESC 開頭的序列另外剝
+  assert.equal(stripTerminalControls('a\x1b]0;x\x1b[31mb'), 'a0;xb');
+  // 有結尾的照舊整段剝掉，跨行也一樣
+  assert.equal(sanitizeMultilineText('a\x1b]0;x\ny\x07b\nnext'), 'ab\nnext');
+  assert.equal(stripTerminalControls('a\x9d0;title\x9cb\x90q\x1b\\c'), 'abc');
+});
+
+test('stripping unterminated string sequences stays linear on adversarial input', () => {
+  const length = 1_000_000;
+  const inputs = [
+    '\x9d' + 'a'.repeat(length),
+    ('\x9d' + 'a'.repeat(99)).repeat(length / 100),
+    ('\x1b]' + 'a'.repeat(96) + '\x1bX').repeat(length / 100),
+    '\x9d' + '\x9b'.repeat(length),
+    '\x9d\x9b\x90\x98\x9e\x9f'.repeat(length / 6),
+  ];
+  for (const input of inputs) {
+    const startMs = performance.now();
+    stripTerminalControls(input);
+    sanitizeMultilineText(input);
+    sanitizeText(input);
+    const elapsedMs = performance.now() - startMs;
+    // 線性時實測數十毫秒；平方時間是好幾分鐘，門檻放寬到不會因為機器忙而誤判
+    assert.ok(elapsedMs < 5_000, `${JSON.stringify(input.slice(0, 8))}… took ${elapsedMs.toFixed(0)} ms`);
+  }
+});
+
+test('ZWJ and ZWNJ are kept with zero width while other format characters are still removed', () => {
+  const family = '👨\u200d👩\u200d👧';
+  const persian = 'می\u200cخواهم';
+  assert.equal(sanitizeText(`${family} ok`), `${family} ok`);
+  assert.equal(sanitizeText(persian), persian);
+  assert.equal(sanitizeMultilineText(`${family}\n${persian}`), `${family}\n${persian}`);
+  assert.equal(stripTerminalControls(family), family);
+  assert.equal(truncateWithEllipsis(family, 10), family);
+  assert.equal(characterWidth('\u200d'), 0);
+  assert.equal(characterWidth('\u200c'), 0);
+  // 量的是各部分加總，terminal 把整串畫成一個字時會比較窄（README 已知限制）
+  assert.equal(displayWidth(family), 6);
+  assert.equal(displayWidth(persian), 7);
+  assert.equal(stripTerminalControls('a\u202eb\u200bc\ufeffd\u2066e\u200ef'), 'abcdef');
 });
 
 test('emoji and symbols with East Asian Width W or F take two columns', () => {

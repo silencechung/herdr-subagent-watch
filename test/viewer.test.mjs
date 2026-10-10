@@ -532,6 +532,23 @@ test('--once strips every escape sequence, C1 control and bidi character that ca
   assert.match(result.stdout, /session aaaaaaaa/);
 });
 
+test('--once that fails prints a sanitized error to stderr and exits 1', () => {
+  // 用 --import 預載：讀 stdout 寬度時丟例外，runOnce 的 promise 會 reject
+  const preloadPath = path.join(temporaryRoot, 'throwing-columns.mjs');
+  fs.writeFileSync(preloadPath, `Object.defineProperty(process.stdout, 'columns', {
+  get() {
+    throw new Error('stdout broke \\u001b]52;c;cHduZWQ=\\u0007 \\u009b2J \\u202eevil');
+  },
+});
+`);
+  const result = runViewer(['--once', '--session', copyFixtureSession()], {
+    environment: isolatedEnvironment({ NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` }),
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /stdout broke/);
+  assert.doesNotMatch(result.stderr, foreignControlPattern, JSON.stringify(result.stderr.match(foreignControlPattern)?.[0]));
+});
+
 // 假 herdr：每次 `pane get` 讀 responsePath 的內容，等 delayPath 指定的毫秒數，開始與結束都記在 logPath
 function writeScriptedHerdr(name, { response, delayMs = 0 }) {
   const directory = path.join(temporaryRoot, name);
@@ -589,6 +606,10 @@ function writeTwoSessions(name) {
   return { configDirectory, workDirectory, projectDirectory };
 }
 
+function appendUserLine(transcriptPath, content) {
+  fs.appendFileSync(transcriptPath, `${JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { content } })}\n`);
+}
+
 function popupEnvironment(herdrBinPath, { configDirectory, workDirectory }) {
   return isolatedEnvironment({
     HERDR_PLUGIN_ID: 'subagent.watch',
@@ -639,6 +660,8 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     try {
       await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'first session');
       fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, secondSessionId)));
+      // 換過去的 session 正在寫 transcript；viewer 只換到寫得比現在的更近的 session（tmpfs 上剛複製的兩個檔 mtime 常常一樣）
+      appendUserLine(path.join(sessions.projectDirectory, `${secondSessionId}.jsonl`), 'resumed');
       const screen = await pty.waitForScreen((lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 ─/.test(line)), 'second session');
       assert.doesNotMatch(screen[0], /Explore/);
       pty.send('q');
@@ -662,6 +685,92 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
       assert.ok(!screen.some((line) => /guessed/.test(line)));
       pty.send('q');
       assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('herdr failing after /resume does not bring back the older session from the pane map', { timeout: 20_000 }, async () => {
+    const sessions = writeTwoSessions('flap');
+    // pane map 停在 /resume 前的 fixture session（只有開 sub 時才更新），那個 transcript 比較舊
+    const olderDate = new Date(Date.now() - 60_000);
+    const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
+    fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
+    const runtimeDirectory = path.join(temporaryRoot, 'flap-runtime');
+    fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
+    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
+      sessionId: fixtureSessionId,
+      transcriptPath: fixtureTranscriptPath,
+      cwd: sessions.workDirectory,
+      updatedAtMs: olderDate.getTime(),
+    }));
+    const herdr = writeScriptedHerdr('flap-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
+    const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
+    const pty = startInPty([], { columns: 160, environment });
+    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    try {
+      await pty.waitForScreen(isSecondSession, 'second session');
+      // herdr 回不出 pane（和逾時一樣退回 pane map）：等兩次查詢，畫面不能跳回 fixture
+      fs.writeFileSync(herdr.responsePath, 'not json');
+      const callCount = readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
+      await waitUntil(() => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length >= callCount + 2, 'two failed herdr lookups', 10_000);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 300);
+      });
+      const screen = pty.getScreenLines();
+      assert.ok(isSecondSession(screen), screen.join('\n'));
+      assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
+      // herdr 與 pane map 說法不同時，狀態列看得出來
+      assert.ok(screen.some((line) => /session 22222222 · herdr says session 22222222, pane map says 11111111/.test(line)), screen.join('\n'));
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('a lookup that keeps throwing shows one sanitized line in the status line and clears once it recovers', { timeout: 30_000 }, async () => {
+    const sessions = writeTwoSessions('lookup-error');
+    const herdr = writeScriptedHerdr('lookup-error-herdr', { response: claudePaneResponse(sessions.workDirectory, fixtureSessionId) });
+    const failFlagPath = path.join(temporaryRoot, 'lookup-error-flag');
+    const failLogPath = path.join(temporaryRoot, 'lookup-error.log');
+    fs.writeFileSync(failLogPath, '');
+    // 用 --import 預載：flag 存在時讀 CLAUDE_CONFIG_DIR 就丟例外，模擬查詢本身出錯（例 HOME 沒設時 os.homedir() 失敗）
+    const preloadPath = path.join(temporaryRoot, 'throwing-environment.mjs');
+    fs.writeFileSync(preloadPath, `import fs from 'node:fs';
+const realEnvironment = process.env;
+process.env = new Proxy(realEnvironment, {
+  get(target, key) {
+    if (key === 'CLAUDE_CONFIG_DIR' && fs.existsSync(${JSON.stringify(failFlagPath)})) {
+      fs.appendFileSync(${JSON.stringify(failLogPath)}, 'fail\\n');
+      throw new Error('config broke \\u001b]52;c;cHduZWQ=\\u0007\\nsecond line \\u009b2J');
+    }
+    return Reflect.get(target, key);
+  },
+});
+`);
+    const environment = { ...popupEnvironment(herdr.binPath, sessions), NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` };
+    const pty = startInPty([], { columns: 160, environment });
+    const statusLine = (lines) => lines.find((line) => /^── session 11111111/.test(line)) ?? '';
+    try {
+      await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && /session 11111111 ─/.test(statusLine(lines)), 'first session');
+      fs.writeFileSync(failFlagPath, '');
+      const screen = await pty.waitForScreen((lines) => /session 11111111 · session lookup failed: config broke/.test(statusLine(lines)), 'lookup error in the status line');
+      assert.match(statusLine(screen), /session lookup failed: config broke second line/);
+      assert.match(screen[0], /\[● Explore\]/);
+      // 再失敗兩次：同一個錯誤不重畫，輸出裡只出現一次
+      await waitUntil(() => fs.readFileSync(failLogPath, 'utf8').split('\n').filter(Boolean).length >= 3, 'two more failed lookups', 10_000);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 300);
+      });
+      assert.equal(stripAnsi(pty.session.output).split('session lookup failed').length - 1, 1);
+      fs.rmSync(failFlagPath);
+      await pty.waitForScreen((lines) => /session 11111111 ─/.test(statusLine(lines)), 'status line cleared after recovery', 10_000);
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+      const ownSequencePattern = /\x1b\[(?:[0-9;]*m|H|2K|2J|\?25[hl]|\?1049[hl]|\?100[06][hl])/g;
+      const leftover = pty.session.output.replace(ownSequencePattern, '').replace(/\r|\n/g, '');
+      assert.doesNotMatch(leftover, foreignControlPattern, JSON.stringify(leftover.match(foreignControlPattern)?.[0]));
     } finally {
       pty.kill();
     }

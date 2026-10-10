@@ -54,7 +54,9 @@ function pickString(...values) {
   return values.find((value) => typeof value === 'string' && value !== '') ?? null;
 }
 
-function resolveFromEnvironment(environment, signal) {
+// async：讀 env 的部分（例 HOME 沒設時的 os.homedir()）若丟例外，要變成 rejection 交給 resolveNow 的錯誤處理
+// 同步丟出去的話會從 tick 的 setInterval 一路變成 uncaughtException，viewer 直接結束
+async function resolveFromEnvironment(environment, signal) {
   const context = parseContextJson(environment.HERDR_PLUGIN_CONTEXT_JSON);
   // popup 沒有 HERDR_PANE_ID；open action 會把觸發時的 pane 用 env 傳進來，context 的 focused_pane_id 是第二來源
   const paneId = pickString(environment.SUBAGENT_WATCH_PANE_ID, context.focused_pane_id, environment.HERDR_PANE_ID);
@@ -94,6 +96,7 @@ function createController({ options, environment, onChange }) {
   let source = null;
   let selectedAgentId = null;
   let lastResolveAttemptMs = 0;
+  let lookupError = null;
   let isStarted = false;
   let isStopped = false;
   // 同時只跑一個查詢：herdr 卡住時不要每秒疊一個新的子程序
@@ -126,6 +129,16 @@ function createController({ options, environment, onChange }) {
     onChange();
   }
 
+  // 已經接上 session 時，查詢失敗的結果不會取代它（shouldReplaceSession），錯誤只能另外顯示在狀態列
+  // 狀態列是固定位置、同一個訊息不重畫：每 2 秒重試失敗也不會洗版；下一次查詢成功就清掉
+  function setLookupError(message) {
+    if (isStopped || message === lookupError) {
+      return;
+    }
+    lookupError = message;
+    onChange();
+  }
+
   function resolveNow() {
     lastResolveAttemptMs = Date.now();
     if (options.sessionPath !== null) {
@@ -135,14 +148,19 @@ function createController({ options, environment, onChange }) {
     }
     const abortController = new AbortController();
     const promise = resolveFromEnvironment(environment, abortController.signal)
-      .then(applyResolvedSession, (error) => {
+      .then((nextSession) => {
+        setLookupError(null);
+        applyResolvedSession(nextSession);
+      }, (error) => {
+        const message = sanitizeText(`session lookup failed: ${error?.message ?? error}`);
+        setLookupError(message);
         applyResolvedSession({
           transcriptPath: null,
           sessionId: null,
           source: null,
           isGuessed: false,
           isTranscriptMissing: true,
-          notes: [sanitizeText(`session lookup failed: ${error?.message ?? error}`)],
+          notes: [message],
         });
       })
       .finally(() => {
@@ -165,7 +183,11 @@ function createController({ options, environment, onChange }) {
     if (options.isDemo) {
       return 'demo data';
     }
-    return describeSession(session);
+    // 還沒接上 session 時，錯誤與 notes 已經畫在 body，狀態列不重複
+    if (session === null || session.transcriptPath === null) {
+      return describeSession(session);
+    }
+    return [describeSession(session), lookupError, session.statusNote].filter(Boolean).join(' · ');
   }
 
   function getTabs(nowMs) {
@@ -412,6 +434,10 @@ function main() {
   if (options.isOnce) {
     runOnce(controller).then(() => {
       controller.stop();
+    }, (error) => {
+      // 不能交給 Node 預設的 unhandled rejection 輸出：會把錯誤訊息原樣印出，訊息可能夾著 transcript 或路徑裡的 escape
+      process.stderr.write(`${sanitizeMultilineText(String(error?.stack ?? error))}\n`);
+      process.exit(1);
     });
     return;
   }
