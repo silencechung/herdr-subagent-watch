@@ -1,17 +1,30 @@
 id = "subagent.watch"
 name = "Sub Agent Watch"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.3"
 description = "Popup that follows the sub agents of the Claude Code session in the pane it was opened from"
 platforms = ["linux"]
 
-# node 一律寫 fnm default alias 的絕對路徑：shell 裡的 `node` 在每個 session 各自的 fnm_multishells 暫存資料夾，關掉就不見
+# 一律經過 bin/run.sh 找 node（順序見 README「Node 怎麼找」），manifest 不寫死任何路徑
 [[actions]]
 id = "open"
 title = "Open sub agent viewer"
 # 文件沒寫 contexts 的作用；照 persiyanov.reviewr（同樣靠 focused_pane_id 找觸發的 pane）的寫法
 contexts = ["pane", "workspace"]
-command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "open-action.mjs"]
+command = ["sh", "bin/run.sh", "open-action.mjs"]
+
+# setup／remove 改的是使用者自己的 Claude Code settings.json 與 herdr config.toml，跟哪個 pane 無關；contexts 照 herdr-automatic-rename 的 global 寫法
+[[actions]]
+id = "setup"
+title = "Sub agent watch: set up Claude Code hooks, key and sidebar rows"
+contexts = ["global"]
+command = ["sh", "bin/run.sh", "scripts/setup.mjs"]
+
+[[actions]]
+id = "remove"
+title = "Sub agent watch: remove Claude Code hooks, key and sidebar rows"
+contexts = ["global"]
+command = ["sh", "bin/run.sh", "scripts/setup.mjs", "--remove"]
 
 [[panes]]
 id = "viewer"
@@ -19,4 +32,4 @@ title = "Sub agent viewer"
 placement = "popup"
 width = "70%"
 height = "60%"
-command = ["/home/hotpapa/.local/share/fnm/aliases/default/bin/node", "viewer.mjs"]
+command = ["sh", "bin/run.sh", "viewer.mjs"]

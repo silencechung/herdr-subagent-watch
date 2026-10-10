@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { herdrNotFoundMessage, resolveHerdrBinPath } from './lib/herdr.mjs';
 
-const fallbackHerdrBinPath = '/opt/herdr/bin/herdr';
 const viewerEntrypointId = 'viewer';
 
 function parseContext(text) {
@@ -22,7 +22,7 @@ function pickString(...values) {
 }
 
 const environment = process.env;
-const herdrBinPath = pickString(environment.HERDR_BIN_PATH) ?? fallbackHerdrBinPath;
+const herdrBinPath = resolveHerdrBinPath(environment);
 const pluginId = pickString(environment.HERDR_PLUGIN_ID) ?? 'subagent.watch';
 const context = parseContext(environment.HERDR_PLUGIN_CONTEXT_JSON);
 const paneId = pickString(context.focused_pane_id, environment.HERDR_PANE_ID);
@@ -45,7 +45,8 @@ if (isDryRun) {
     paneIdEnvironment: environment.HERDR_PANE_ID ?? null,
     stateDirectory,
     context,
-    wouldRun: [herdrBinPath, ...openArguments],
+    herdrBinPath,
+    wouldRun: [herdrBinPath ?? 'herdr', ...openArguments],
   };
   const line = `${JSON.stringify(entry)}\n`;
   if (stateDirectory !== null) {
@@ -53,6 +54,11 @@ if (isDryRun) {
   }
   process.stdout.write(line);
   process.exit(0);
+}
+
+if (herdrBinPath === null) {
+  process.stderr.write(`${herdrNotFoundMessage}\n`);
+  process.exit(1);
 }
 
 const result = spawnSync(herdrBinPath, openArguments, { stdio: ['ignore', 'inherit', 'inherit'] });

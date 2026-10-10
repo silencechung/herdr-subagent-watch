@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
+  describeNonClaudePane,
   encodeProjectDirectoryName,
   findLatestTranscript,
   getCwdVariants,
@@ -11,6 +13,14 @@ import {
   isSafeSessionId,
   resolveSession,
 } from '../lib/session.mjs';
+
+const herdrFixtureDirectory = fileURLToPath(new URL('./fixtures/herdr/', import.meta.url));
+
+// herdr 0.9.3 實際的 `pane get` 輸出（路徑、標題換成假的）
+function readPaneFixture(name, overrides = {}) {
+  const response = JSON.parse(fs.readFileSync(path.join(herdrFixtureDirectory, name), 'utf8'));
+  return { ...response.result.pane, ...overrides };
+}
 
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-watch-session-'));
 after(() => {
@@ -57,7 +67,7 @@ function herdrFailing() {
 }
 
 test('encodeProjectDirectoryName replaces slashes with dashes', () => {
-  assert.equal(encodeProjectDirectoryName('/var/home/hotpapa'), '-var-home-hotpapa');
+  assert.equal(encodeProjectDirectoryName('/var/home/someone'), '-var-home-someone');
 });
 
 test('getCwdVariants adds the other spelling of a Fedora Atomic home path', () => {
@@ -100,10 +110,11 @@ test('path a: a reported session without a transcript yet waits instead of guess
   writeTranscript(projectsDirectory, '/srv/work', 'old00000-0000-4000-8000-000000000000');
   const { runCommand } = herdrReturning({
     pane_id: 'w1:p1',
+    agent: 'claude',
     agent_session: { agent: 'claude', kind: 'id', value: 'new00000-0000-4000-8000-000000000000' },
     foreground_cwd: '/srv/work',
   });
-  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, runCommand });
+  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
   assert.equal(result.isTranscriptMissing, true);
   assert.equal(result.isGuessed, false);
   assert.equal(result.transcriptPath, path.join(projectsDirectory, '-srv-work', 'new00000-0000-4000-8000-000000000000.jsonl'));
@@ -121,7 +132,7 @@ test('path b: the pane map written by the hook is used when herdr has no session
     updatedAtMs: Date.now(),
   }));
   const { runCommand } = herdrReturning({ pane_id: 'w2:p3', agent: 'claude', cwd: '/srv/mapped' });
-  const result = resolveSession({ paneId: 'w2:p3', projectsDirectory, runtimeDirectory, runCommand });
+  const result = resolveSession({ paneId: 'w2:p3', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
   assert.equal(result.transcriptPath, transcriptPath);
   assert.equal(result.source, 'pane-map');
   assert.equal(result.isGuessed, false);
@@ -133,7 +144,7 @@ test('path b: a pane map with only sessionId is looked up by id', () => {
   const transcriptPath = writeTranscript(projectsDirectory, '/srv/mapped', sessionId);
   fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
   fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w2:p4.json'), JSON.stringify({ sessionId, cwd: '/srv/mapped' }));
-  const result = resolveSession({ paneId: 'w2:p4', projectsDirectory, runtimeDirectory, runCommand: herdrFailing() });
+  const result = resolveSession({ paneId: 'w2:p4', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrFailing() });
   assert.equal(result.transcriptPath, transcriptPath);
   assert.equal(result.source, 'pane-map');
 });
@@ -148,6 +159,7 @@ test('path c: without herdr or pane map, the newest transcript for the pane cwd 
     contextCwd: '/srv/guess',
     projectsDirectory,
     runtimeDirectory,
+    herdrBinPath: '/fake/herdr',
     runCommand: herdrFailing(),
   });
   assert.equal(result.transcriptPath, newestPath);
@@ -166,22 +178,80 @@ test('path c ignores sub folders and non-jsonl files when picking the newest tra
   assert.equal(findLatestTranscript({ projectsDirectory, cwd: '/srv/mixed' }), transcriptPath);
 });
 
-test('a non-claude agent session in the pane is not used', () => {
+test('a pane where herdr detects another agent says so and does not guess a session', () => {
   const { projectsDirectory, runtimeDirectory } = createCase();
-  const { runCommand } = herdrReturning({
-    pane_id: 'w4:p1',
-    agent: 'codex',
-    agent_session: { agent: 'codex', kind: 'id', value: 'codex-session' },
-    cwd: '/srv/none',
-  });
-  const result = resolveSession({ paneId: 'w4:p1', projectsDirectory, runtimeDirectory, runCommand });
+  writeTranscript(projectsDirectory, '/srv/work', 'abcd0000-0000-4000-8000-000000000000');
+  const { runCommand } = herdrReturning(readPaneFixture('pane-get-codex.json'));
+  const result = resolveSession({ paneId: 'w1:p1', contextCwd: '/srv/work', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
   assert.equal(result.transcriptPath, null);
+  assert.equal(result.isGuessed, false);
+  assert.equal(result.isTranscriptMissing, true);
+  assert.deepEqual(result.nonClaudePane, { detectedAgent: 'codex' });
+  assert.equal(describeNonClaudePane(result.nonClaudePane), 'This pane is not running Claude Code (detected: codex)');
+});
+
+test('a plain shell pane (no agent key) says there is no Claude Code session and does not guess', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  writeTranscript(projectsDirectory, '/srv/work', 'abcd1111-0000-4000-8000-000000000000');
+  fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
+  fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({ sessionId: 'abcd1111-0000-4000-8000-000000000000', cwd: '/srv/work' }));
+  const { runCommand } = herdrReturning(readPaneFixture('pane-get-shell.json'));
+  const result = resolveSession({ paneId: 'w1:p1', contextCwd: '/srv/work', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.equal(result.transcriptPath, null);
+  assert.equal(result.isGuessed, false);
+  assert.deepEqual(result.nonClaudePane, { detectedAgent: null });
+  assert.equal(describeNonClaudePane(result.nonClaudePane), 'No Claude Code session in this pane');
+});
+
+test('herdr detection wins over a leftover claude agent_session on a pane now running another agent', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const { runCommand } = herdrReturning(readPaneFixture('pane-get-codex.json', {
+    agent_session: { agent: 'claude', kind: 'id', value: 'abcd2222-0000-4000-8000-000000000000' },
+  }));
+  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.deepEqual(result.nonClaudePane, { detectedAgent: 'codex' });
+});
+
+test('the real claude pane shape resolves through agent_session', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const pane = readPaneFixture('pane-get-claude.json');
+  const transcriptPath = writeTranscript(projectsDirectory, '/srv/work', pane.agent_session.value);
+  const { runCommand } = herdrReturning(pane);
+  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.equal(result.transcriptPath, transcriptPath);
+  assert.equal(result.source, 'herdr');
+  assert.equal(result.nonClaudePane, undefined);
+});
+
+test('a claude pane without agent_session still falls back to the pane map, then the cwd guess', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const newestPath = writeTranscript(projectsDirectory, '/srv/work', 'abcd3333-0000-4000-8000-000000000000');
+  const { runCommand } = herdrReturning(readPaneFixture('pane-get-claude-without-session.json'));
+  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.equal(result.transcriptPath, newestPath);
+  assert.equal(result.isGuessed, true);
   assert.ok(result.notes.some((note) => note.includes('has no claude agent_session')));
+});
+
+test('without a herdr binary the viewer falls back to guessing and says why', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const newestPath = writeTranscript(projectsDirectory, '/srv/nobin', 'abcd4444-0000-4000-8000-000000000000');
+  const result = resolveSession({ paneId: 'w1:p1', contextCwd: '/srv/nobin', projectsDirectory, runtimeDirectory, herdrBinPath: null });
+  assert.equal(result.transcriptPath, newestPath);
+  assert.equal(result.isGuessed, true);
+  assert.ok(result.notes.some((note) => note.startsWith('herdr not found')));
+});
+
+test('detected agent names are cleaned before they reach the screen', () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const { runCommand } = herdrReturning({ pane_id: 'w1:p1', agent: 'evil\u001b[31m\nagent' });
+  const result = resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand });
+  assert.doesNotMatch(result.nonClaudePane.detectedAgent, /[\u0000-\u001f]/);
 });
 
 test('nothing to go on yields an unresolved result with notes instead of throwing', () => {
   const { projectsDirectory, runtimeDirectory } = createCase();
-  const result = resolveSession({ paneId: null, projectsDirectory, runtimeDirectory, runCommand: herdrFailing() });
+  const result = resolveSession({ paneId: null, projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrFailing() });
   assert.equal(result.transcriptPath, null);
   assert.ok(result.notes.includes('no pane id available'));
 });

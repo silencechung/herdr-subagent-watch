@@ -109,6 +109,45 @@ test('the popup uses the pane id from the open action and labels a cwd guess', (
   assert.match(result.stdout, /\[● Explore\]/);
 });
 
+// 假 herdr：`pane get` 回傳 herdr 0.9.3 實際輸出的 fixture
+function writeFakeHerdr(fixtureName) {
+  const fakePath = path.join(temporaryRoot, `herdr-${path.basename(fixtureName, '.json')}`);
+  const fixture = fs.readFileSync(path.join(repositoryDirectory, 'test', 'fixtures', 'herdr', fixtureName), 'utf8');
+  fs.writeFileSync(fakePath, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(fixture)});\n`, { mode: 0o755 });
+  return fakePath;
+}
+
+// cwd 底下故意放一個 session：畫面若出現它，代表 viewer 還在猜
+function popupEnvironmentWithGuessableSession(herdrBinPath, name) {
+  const configDirectory = path.join(temporaryRoot, `${name}-config`);
+  const workDirectory = path.join(temporaryRoot, `${name}-work`);
+  fs.mkdirSync(workDirectory, { recursive: true });
+  const projectDirectory = path.join(configDirectory, 'projects', fs.realpathSync(workDirectory).replaceAll('/', '-'));
+  fs.cpSync(fixtureProjectDirectory, projectDirectory, { recursive: true });
+  return isolatedEnvironment({
+    HERDR_PLUGIN_ID: 'subagent.watch',
+    HERDR_BIN_PATH: herdrBinPath,
+    SUBAGENT_WATCH_PANE_ID: 'w1:p1',
+    HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w1:p1', focused_pane_cwd: workDirectory }),
+    XDG_RUNTIME_DIR: temporaryRoot,
+    CLAUDE_CONFIG_DIR: configDirectory,
+  });
+}
+
+test('a pane where herdr detects another agent says so instead of guessing a session', () => {
+  const result = runViewer(['--once'], { environment: popupEnvironmentWithGuessableSession(writeFakeHerdr('pane-get-codex.json'), 'codex') });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /This pane is not running Claude Code \(detected: codex\)/);
+  assert.doesNotMatch(result.stdout, /guessed|Explore|No Claude Code session found/);
+});
+
+test('a plain shell pane says there is no Claude Code session in it', () => {
+  const result = runViewer(['--once'], { environment: popupEnvironmentWithGuessableSession(writeFakeHerdr('pane-get-shell.json'), 'shell') });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No Claude Code session in this pane/);
+  assert.doesNotMatch(result.stdout, /guessed|Explore|not running Claude Code/);
+});
+
 test('unknown arguments exit with status 2', () => {
   const result = runViewer(['--bogus']);
   assert.equal(result.status, 2);

@@ -343,17 +343,29 @@ describe('runHook', () => {
     assert.equal(existsSync(harness.stateDirectory), false);
   });
 
-  test('falls back to /opt/herdr/bin/herdr without HERDR_BIN_PATH', () => {
+  test('without HERDR_BIN_PATH, herdr is looked up on PATH instead of a fixed install path', () => {
     const checkedPaths = [];
     const harness = createHarness({
       isExecutable: (filePath) => {
         checkedPaths.push(filePath);
-        return true;
+        return filePath === '/second/bin/herdr';
       },
     });
-    runHook(startPayloadText, { ...harness.environment, HERDR_BIN_PATH: undefined }, harness.dependencies);
-    assert.deepEqual(checkedPaths, ['/opt/herdr/bin/herdr']);
-    assert.equal(harness.herdrCalls[0].binaryPath, '/opt/herdr/bin/herdr');
+    const environment = { ...harness.environment, HERDR_BIN_PATH: undefined, PATH: '/first/bin:/second/bin:/third/bin' };
+    const result = runHook(startPayloadText, environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.equal(harness.herdrCalls[0].binaryPath, '/second/bin/herdr');
+    assert.deepEqual(checkedPaths.slice(0, 2), ['/first/bin/herdr', '/second/bin/herdr']);
+    assert.ok(!checkedPaths.includes('/third/bin/herdr'));
+  });
+
+  test('without HERDR_BIN_PATH and without herdr on PATH the hook skips quietly', () => {
+    const harness = createHarness({ isExecutable: () => false });
+    const environment = { ...harness.environment, HERDR_BIN_PATH: undefined, PATH: '/first/bin:/second/bin' };
+    const result = runHook(startPayloadText, environment, harness.dependencies);
+    assert.equal(result.reason, 'herdr-not-found');
+    assert.equal(existsSync(harness.stateDirectory), false);
+    assert.equal(harness.herdrCalls.length, 0);
   });
 
   test('nested claude -p inside a claude pane is ignored', () => {

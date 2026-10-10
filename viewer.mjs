@@ -1,10 +1,11 @@
 import path from 'node:path';
-import os from 'node:os';
+import { getClaudeProjectsDirectory } from './lib/claude-config.mjs';
 import { createDemoSource } from './lib/demo.mjs';
+import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder } from './lib/keys.mjs';
 import { ansi, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
-import { defaultHerdrBinPath, parseContextJson, resolveSession } from './lib/session.mjs';
+import { describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
 import { createSessionWatcher, getSessionPaths } from './lib/watcher.mjs';
 
@@ -50,12 +51,6 @@ function pickString(...values) {
   return values.find((value) => typeof value === 'string' && value !== '') ?? null;
 }
 
-function getProjectsDirectory(environment) {
-  // Claude Code 允許用 CLAUDE_CONFIG_DIR 搬走 ~/.claude
-  const configDirectory = pickString(environment.CLAUDE_CONFIG_DIR) ?? path.join(os.homedir(), '.claude');
-  return path.join(configDirectory, 'projects');
-}
-
 function resolveFromEnvironment(environment) {
   const context = parseContextJson(environment.HERDR_PLUGIN_CONTEXT_JSON);
   // popup 沒有 HERDR_PANE_ID；open action 會把觸發時的 pane 用 env 傳進來，context 的 focused_pane_id 是第二來源
@@ -66,10 +61,17 @@ function resolveFromEnvironment(environment) {
     contextCwd: pickString(context.focused_pane_cwd),
     // plugin process 的 cwd 是 plugin 資料夾，拿來猜 session 一定錯
     fallbackCwd: isPluginProcess ? null : process.cwd(),
-    projectsDirectory: getProjectsDirectory(environment),
+    projectsDirectory: getClaudeProjectsDirectory(environment),
     runtimeDirectory: environment.XDG_RUNTIME_DIR,
-    herdrBinPath: pickString(environment.HERDR_BIN_PATH) ?? defaultHerdrBinPath,
+    herdrBinPath: resolveHerdrBinPath(environment),
   });
+}
+
+function getUnresolvedMessages(session) {
+  if (session?.nonClaudePane) {
+    return [describeNonClaudePane(session.nonClaudePane)];
+  }
+  return [unresolvedMessage, ...(session?.notes ?? [])];
 }
 
 function describeSession(session) {
@@ -210,7 +212,7 @@ function createController({ options, environment, onChange }) {
       const tabs = getTabs(nowMs);
       const selectedIndex = getSelectedIndex(tabs);
       const hasSession = options.isDemo || (session !== null && session.transcriptPath !== null);
-      const messages = hasSession ? [emptySessionMessage] : [unresolvedMessage, ...(session?.notes ?? [])];
+      const messages = hasSession ? [emptySessionMessage] : getUnresolvedMessages(session);
       let scrollView = null;
       if (tabs.length > 0) {
         const tab = tabs[selectedIndex];

@@ -2,9 +2,7 @@
 // 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、1 秒內結束。
 import { spawnSync } from 'node:child_process';
 import {
-  accessSync,
   closeSync,
-  constants,
   mkdirSync,
   openSync,
   readFileSync,
@@ -15,11 +13,11 @@ import {
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isExecutableFile, resolveHerdrBinPath } from '../lib/herdr.mjs';
 
 export const metadataSource = 'subagent.watch';
 export const maximumTreeLines = 5;
 export const maximumTokenLength = 80;
-export const defaultHerdrBinaryPath = '/opt/herdr/bin/herdr';
 export const runningIcon = '●';
 export const doneIcon = '✓';
 
@@ -217,15 +215,6 @@ export function countClaudeAncestors(startProcessId, readInfo = readProcessInfo)
   return claudeCount;
 }
 
-export function isExecutable(filePath) {
-  try {
-    accessSync(filePath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function runHerdr(binaryPath, argumentList, timeoutMs) {
   // stdio 全部 ignore：herdr 的輸出若流進 hook 的 stdout，Claude Code 會把它當成 hook 輸出
   spawnSync(binaryPath, argumentList, { stdio: 'ignore', timeout: timeoutMs, killSignal: 'SIGKILL' });
@@ -285,7 +274,7 @@ function releaseLock(lockPath) {
 const defaultDependencies = {
   now: () => Date.now(),
   runHerdr,
-  isExecutable,
+  isExecutable: isExecutableFile,
   countClaudeAncestors: () => countClaudeAncestors(process.ppid),
 };
 
@@ -300,8 +289,8 @@ export function runHook(rawInput, environment, overrides = {}) {
   if (!runtimeDirectory) {
     return { action: 'skipped', reason: 'no-runtime-directory' };
   }
-  const herdrBinaryPath = environment.HERDR_BIN_PATH || defaultHerdrBinaryPath;
-  if (!dependencies.isExecutable(herdrBinaryPath)) {
+  const herdrBinaryPath = resolveHerdrBinPath(environment, dependencies.isExecutable);
+  if (herdrBinaryPath === null || !dependencies.isExecutable(herdrBinaryPath)) {
     return { action: 'skipped', reason: 'herdr-not-found' };
   }
   const event = parseHookPayload(rawInput);
