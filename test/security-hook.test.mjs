@@ -119,7 +119,7 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     throw new Error('fake claude did not finish');
   }
 
-  test('a wrapper named claude no longer hides every event when herdr knows the pane session', async () => {
+  test('a wrapper named claude next to claude counts as one group, so its event updates the sidebar', async () => {
     const tree = createProcessTree();
     const environment = { ...tree.environment, FAKE_PANE_SESSION: mainSessionId, HOOK_PAYLOAD: startPayload(mainSessionId, 'wrapped') };
     const result = await runDetached(`"${tree.wrapperPath}"`, environment, tree.donePath);

@@ -94,7 +94,7 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 - 某個 sub 的 `SubagentStop` 沒記到（例如等 lock 超過時間預算，hook 直接放棄這次事件），那一行在同一個 session 裡不會自己消失（那個 sub 之後再收到一次 `SubagentStop` 才會拿掉）；換 session 後的下一次 sub 事件才會蓋掉。
 - herdr 的 `agent_session` 可能是舊的：herdr server 重啟後，它可能停在重啟前（從 session.json 還原）的 session，之後 Claude Code 的 `startup` 回報不會覆寫它（herdr 0.9.3 實測；同一次測試裡 `resume` 回報也沒有覆寫，原因不明）。所以 hook 不靠它判斷哪個是 pane 的主 session，只有祖先 process 掃到兩組以上 `claude` 時才問 herdr。仍然擋不到的：
   - 巢狀的 `claude -p --resume`／`claude -p -c`：herdr 若接受它的回報、把它當成 pane 的 `agent_session`，它的事件會被當成主 session。
-  - `exec claude -p`：巢狀的 claude 會跟主 claude 直接相鄰、被當成同一組，事件會被收。
+  - `exec claude -p`，或只跑這一個指令的 `sh -c 'claude -p …'`（例如 hook command 本身就是 `claude -p …`；sh 會 exec 成 claude）：巢狀的 claude 直接接在主 claude 底下，跟主 claude 算成同一組而被當成主 session，事件會被收。Claude Code 實際怎麼起 hook 的 process 未驗證。
   - 用 npm 安裝的 Claude Code 若 process 名稱是 `node` 而不是 `claude`，祖先掃描算到 0 組，所有事件（包括巢狀的）都會被收（未驗證）。
 - hook command 開頭的 `sh` 是 Claude Code 在 `bin/run.sh` 執行之前照使用者的 PATH 找的，`bin/run.sh` 清 PATH 管不到這一步。
 - `●`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
