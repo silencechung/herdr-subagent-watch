@@ -94,8 +94,12 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 - tab 名稱用 meta 的 `agentType`；同一個 type 出現多次時接 `description` 片段區分。
 - 新的 `agent-*.jsonl` 出現就即時多一個 tab（`fs.watch` 監看 `subagents/`，每秒 polling 備援）。第一次有 tab 時選最新的跑中 sub，之後選取跟著 agent 走，新 tab 不會搶走目前看的。
 - 事件格式：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。
-  - 摘要太長時自動折行，續行縮排對齊摘要欄（時間與 tool 欄留白）；寬度照 display width 算（CJK／全形算 2 格），寬字不會被切半。
+  - 摘要太長時自動折行，續行縮排對齊摘要欄（時間與 tool 欄留白）；寬度照 display width 算：Unicode East Asian Width 為 W 或 F 的字元（CJK、全形、`✅` `🚀` 等 emoji）算 2 格，寬字不會被切半。
   - 多行內容（例 Bash heredoc）保留原本的換行與縮排，每一行各自折行；tab 換成 4 個空白。
+  - transcript、meta、herdr 回傳內容裡的 escape sequence（CSI、OSC 52／OSC 8 等 OSC、DCS）、其他控制字元（含 8-bit C1）與 Unicode format 字元（bidi override、zero-width space、BOM）畫出來之前全部拿掉，transcript 沒辦法寫剪貼簿、加連結或清畫面。
+    - ESC 開頭的字串型序列（OSC、DCS、SOS、PM、APC）連同結尾（BEL 或 ST）整段拿掉；沒有結尾時只拿掉 introducer，後面的文字留著，不會把摘要後面整段吃掉。
+    - 8-bit C1（`U+0080`–`U+009F`，含 CSI、OSC、DCS 的 8-bit 寫法）只拿掉它自己，不會連後面的文字一起拿：C1 拿掉之後 terminal 看不到序列；latin1／cp1252 亂碼常在一般文字兩邊出現成對的 `U+009D` … `U+009C`（`“a” and “b”` 用 latin1 讀）。
+    - ZWJ（`U+200D`）、ZWNJ（`U+200C`）保留、寬度算 0，👨‍👩‍👧 這類 emoji 序列和波斯文等文字不會被拆開。
   - tool 名稱比 tool 欄（10 格）寬時（例 `SubagentHandback`），tool 名稱自己佔一行、摘要從下一行的摘要欄開始，所有事件的摘要都對齊同一欄。
   - 一個事件最多 20 行，超過時第 20 行顯示 `… (+N more lines)`（dim）。
   - resize 會重新折行，暫停中的捲動位置停在同一個事件。
@@ -104,7 +108,7 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
   - 往上捲就暫停 follow，底部提示列最前面顯示 `↓ N new`（暫停後新進來的事件佔幾個畫面行）；按 `End` 或捲回最底恢復 follow。
   - 每個 tab 各自記住捲動位置，切 tab 不會影響其他 tab。
   - 底部提示列：`<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`，視窗窄時自動縮短。
-- 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、未預期的例外都會關）。
+- 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、SIGHUP、未預期的例外都會關）。
 - 還沒有 sub 時顯示 `No sub agents yet in this session`。
 
 ## 怎麼找到 pane 對應的 session
@@ -119,22 +123,33 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 
 這兩種「不是 Claude Code」的情況不會去猜 session；viewer 每 2 秒重問一次，之後在同一個 pane 開 Claude Code 會自動接上。
 
-1. **herdr**：`agent_session`（herdr 的 claude integration 會回報，實測 `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`）。用 session id 在 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/` 找 `<session-id>.jsonl`。session 剛開還沒寫 transcript 時會等它出現，不會退回去猜。
-2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。
-3. **猜**：用 pane 的 cwd 對到 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd 的 / 換成 ->/`，取最新修改的 `<session-id>.jsonl`。底部分隔線會標 `(guessed: latest session)`：同一個資料夾開多個 Claude Code 時可能猜錯。`/var/home/...` 與 `/home/...` 兩種寫法都會試（Fedora Atomic 的 home 在 `/var/home`）；另外也試把所有非英數字元換成 `-` 的寫法（未驗證 Claude Code 是否這樣編碼含 `.` 的路徑）。
+1. **herdr**：`agent_session`（herdr 的 claude integration 會回報，實測 `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`）。用 session id 在 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/` 找 `<session-id>.jsonl`。herdr 的回報可能過期：實測 herdr server 重啟後，在同一個 pane 開新的 Claude Code，herdr 仍回報重啟前的 session（原因未知）。
+2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。只在 `SubagentStart`／`SubagentStop` 時寫，`/resume` 或重開 `claude` 之後、開下一個 sub 之前都指向上一個 session。
+3. **猜**（herdr 和 pane map 都沒有 session 時才用）：用 pane 的 cwd 對到 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd 的 / 換成 ->/`，取最新修改的 `<session-id>.jsonl`。底部分隔線會標 `(guessed: latest session)`：同一個資料夾開多個 Claude Code 時可能猜錯。`/var/home/...` 與 `/home/...` 兩種寫法都會試（Fedora Atomic 的 home 在 `/var/home`）；另外也試把所有非英數字元換成 `-` 的寫法（未驗證 Claude Code 是否這樣編碼含 `.` 的路徑）。
 
-問不到 herdr（找不到 herdr、`herdr pane get` 失敗）時，直接走 2 → 3；完全沒有 pane id 時跳過 pane map，只能用猜的（3）。都找不到時顯示 `No Claude Code session found for this pane` 和每一步失敗的原因。
+前兩個都可能過期，所以不固定哪一個優先。viewer 還沒有 session（或畫面上的 transcript 被刪掉）時，取 transcript 存在、而且最近寫入的那個 session（同時間取 herdr 的）：兩個都是這個 pane 專屬的，過期的值通常指向已經沒人在寫的舊 session。兩邊說的 session 不同時，底部分隔線會多一段 `herdr says session <id>, pane map says <id>`。兩個的 transcript 都還不存在時（session 剛開、還沒寫任何東西），等 herdr 回報的 session 出現（herdr 沒有就等 pane map 的），不會退回去猜。
+
+問不到 herdr（找不到 herdr、`herdr pane get` 失敗）時，猜之前只剩 pane map；完全沒有 pane id 時跳過 pane map，只能用猜的（3）。都找不到時顯示 `No Claude Code session found for this pane` 和每一步失敗的原因。
+
+找到 session 之後仍然每 2 秒重查一次，但之後不再只看寫入時間決定換不換。過期的值可能指向別的 pane 正在寫的 session（`claude -c`、`--resume` 沿用同一個 session id），兩個 transcript 會輪流變成最新的；跟著最新的走，popup 會每幾秒來回切一次，選取的 tab 與捲動位置都被清掉。所以 viewer 記住 herdr、pane map 各自上一次查詢成功時回報的 session，只有下面幾種情況才換掉畫面上的：
+
+- 現在的是猜的，新的來自 herdr 或 pane map；
+- 兩個都不是猜的，herdr 或 pane map 現在回報的 session 跟之前不同（值變了）、不是畫面上的那個、transcript 存在。兩個同一輪都變了，取寫得比較近的。某個來源第一次回報 session（例：herdr 一開始失敗、後來恢復）時，只有那個 transcript 比現在的寫得更近才換，而且只會發生這一次；
+- 現在的 transcript 已經不存在（照上面的方式重選）；
+- 兩個都是猜的，而且現在的 transcript 已經不存在。
+
+所以 `/resume` 或重開 `claude` 之後，herdr 或 pane map 一回報新 session、它的 transcript 一出現，popup 就換過去（重建 tab、底部的 session 標籤跟著換）。查詢失敗不會改 viewer 記住的值，herdr 暫時失敗、或恢復後回報同一個過期的值，都不會跳回上一個 session。猜的不會取代來自 herdr 或 pane map 的 session，查不到也會留著畫面上的 session；同一個資料夾兩個 session 輪流寫入時，猜到的 session 留在原地，不會來回切換。已經顯示 session 時，查詢本身出錯的話，錯誤顯示在底部分隔線，下一次查詢成功就清掉。查詢是非同步、同時只跑一個，`herdr pane get` 3 秒逾時；herdr 卡住時 `q`／`Esc` 一樣立即關閉。
 
 ## 資料來源與結束判斷
 
-- sub transcript：`${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project>/<session-id>/subagents/agent-<id>.jsonl`，旁邊 `agent-<id>.meta.json`（`agentType`、`description`）。只讀新增的 bytes；壞掉或不完整的行直接跳過。格式是 Claude Code internal，升版可能改。
-- 判斷 sub 結束（任一成立就 `✓`），依據是開發時看過的 117 個真實 sub transcript：
-  1. sub JSONL 出現 `tool_use` `SubagentHandback`（85 個背景 sub 都是這樣結束）。
-  2. 最後一筆 assistant 的 `stop_reason` 是 `end_turn`（27 個 `fork` sub 沒有 `SubagentHandback`，都是這樣結束）。
-  3. main transcript 出現 `<task-notification>`，`<task-id>` 是這個 agent、`<status>` 是 `completed`／`killed`／`failed`（被 kill 的 sub 只有這個訊號）。
+- sub transcript：`${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project>/<session-id>/subagents/agent-<id>.jsonl`，旁邊 `agent-<id>.meta.json`（`agentType`、`description`）。只讀新增的 bytes，一次最多 8 MB；壞掉或不完整的行、超過 64 MB 的單一行直接跳過。檔案變小時從頭重讀。格式是 Claude Code internal，升版可能改。
+- 判斷 sub 結束（任一成立就 `✓`），依據是開發時看過的 154 個真實 sub transcript（含 meta）：
+  1. sub JSONL 出現 `tool_use` `SubagentHandback`（117 個 sub 這樣結束，包含唯一的前景 sub）。
+  2. assistant 的 `stop_reason` 是 `end_turn`，但只限非 background 的 sub：meta 有 `isFork: true`，或 `requestShape` 不是 `"background"`。31 個 `fork` sub 沒有 `SubagentHandback`，都是這樣結束。background sub 不看 `end_turn`：其中 6 個中途出現 `end_turn`，接著收到 `[handback-send-enforce]` 才補呼叫 `SubagentHandback`，把 `end_turn` 當結束會讓它們閃一下 `✓`。
+  3. main transcript 出現 `<task-notification>`，`<task-id>` 是這個 agent、`<status>` 是 `completed`／`killed`／`failed`（被 kill 的 sub 只有這個訊號）。只認 content 以 `<task-notification>` 開頭的 `queue-operation` 行：樣本裡每則通知都是這樣寫的；user 訊息、排隊中的訊息、tool result 裡引用的同樣 tag 不算。
   4. 備案：transcript 超過 10 分鐘沒寫入。門檻對齊 Bash tool 單次最長 10 分鐘，避免把正在等指令的 sub 誤判。這時結束行顯示 `no writes for 10 min`，之後若又寫入會變回 `●`。
 - 結束訊號比最後一筆 assistant 活動早時不算數：sub 被 resume 後會回到 `●`。
-- 前景 sub：樣本裡的 meta 全是 `"requestShape":"background"`，沒有前景 sub 的樣本，前景 sub 的結束訊號**未驗證**；預期會落在 2（`end_turn`）或 4（10 分鐘備案）。
+- 前景 sub：樣本只有一個（`"requestShape":"foreground"`），用 `SubagentHandback` 結束（規則 1）。規則 2（`end_turn`）對前景 sub 照樣適用；前景 sub 會不會中途出現 `end_turn` **未驗證**。
 
 ## 模式
 
@@ -167,7 +182,13 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 
 ## 已知限制
 
+- 開了新 session 之後 popup 還停在上一個 session：herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它。之後只有 herdr 或 pane map 回報的 session 跟它上一次回報的不同、或畫面上的 transcript 被刪掉，才會換（見「怎麼找到 pane 對應的 session」）。
+- popup 停在較舊的 session：popup 開著時，照上面的規則有兩種情況會這樣：
+  - herdr 的回報變回較舊的 session（例：herdr server 重啟後還原舊值）。這算值變了，popup 不比寫入時間就換過去，之後停在那裡，直到 herdr 或 pane map 回報跟上一次不同的 session。viewer 能不能撐過 herdr server 重啟未驗證。
+  - herdr 或 pane map 第一次回報 session（例：popup 開啟時還沒有 pane map 檔，之後開 sub 時 hook 才寫入；或 herdr 一開始失敗、後來恢復），而別的 pane 剛好把舊 session 的 transcript 寫得一樣晚或更晚：popup 停在舊 session，之後這個來源不會再比寫入時間。
+  - 兩種情況關掉 popup 再開，都會跟第一次開啟一樣照寫入時間重新選擇。
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
+- 只有 East Asian Width 為 W 或 F（Unicode 16.0）的字元算 2 格。有些 terminal 只在加了 variation selector 時才畫成 2 格的符號（例 `❤️`），量出來的寬度可能和 terminal 實際畫的不同。emoji ZWJ 序列量的是各部分加總（👨‍👩‍👧 算 6 格），terminal 把它合成一個字畫的話會比量的窄。
 - herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。
 - 開了 mouse reporting，在 viewer 裡用滑鼠拖曳選字會被 viewer 吃掉、選不到字。部分 terminal 按住 Shift 拖曳可以繞過，herdr popup 裡是否可行未驗證。
 - 摘要在讀 transcript 時只留前 20 行、總寬度 8000 欄（夠在 400 欄寬的摘要欄折滿 20 行）；被截掉的部分在 `+N` 裡每個原始行算一行，原始行很長時實際會更多。

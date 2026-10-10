@@ -1,1 +1,1 @@
-{"agentType":"fork","description":"Summarize findings","toolUseId":"toolu_main_4","spawnDepth":1,"requestShape":"background"}
+{"agentType":"fork","isFork":true,"description":"Summarize findings","toolUseId":"toolu_main_4","spawnDepth":1,"requestShape":"background"}
