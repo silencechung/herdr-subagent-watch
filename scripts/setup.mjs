@@ -70,13 +70,15 @@ function readTextFile(filePath) {
   }
 }
 
-// 設定檔可能是指向 dotfiles repo 的 symlink：直接 rename 到原路徑會把 symlink 換成一般檔案，所以寫到它指向的真實檔案
+// 設定檔可能是指向 dotfiles repo 的 symlink：直接 rename 到原路徑會把 symlink 換成一般檔案，所以寫到它指向的真實檔案。
+// isSymlink 只看設定檔本身：上層資料夾是 symlink（例如 Bazzite 的 /home → /var/home）時 realpath 也會不同，但那不是使用者自己放的 symlink
 function resolveWritePath(filePath) {
   try {
-    return { path: fs.realpathSync(filePath), error: null };
+    const realPath = fs.realpathSync(filePath);
+    return { path: realPath, isSymlink: fs.lstatSync(filePath).isSymbolicLink(), error: null };
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      return { path: null, error: `cannot resolve ${filePath}: ${error.message}` };
+      return { path: null, isSymlink: false, error: `cannot resolve ${filePath}: ${error.message}` };
     }
   }
   let isDanglingSymlink = false;
@@ -86,9 +88,9 @@ function resolveWritePath(filePath) {
     // 檔案不存在：照原路徑新建
   }
   if (isDanglingSymlink) {
-    return { path: null, error: `${filePath} is a symlink to a file that does not exist` };
+    return { path: null, isSymlink: true, error: `${filePath} is a symlink to a file that does not exist` };
   }
-  return { path: filePath, error: null };
+  return { path: filePath, isSymlink: false, error: null };
 }
 
 function readFileMode(filePath) {
@@ -159,8 +161,8 @@ function describePlannedBackup(filePath, existed) {
   return hasBackup ? ` (keeping the existing backup ${backupPath})` : ` and back it up to ${backupPath}`;
 }
 
-function describeSymlinkTarget(filePath, targetPath) {
-  return targetPath === filePath ? [] : [`${filePath} is a symlink; wrote ${targetPath} and left the symlink in place`];
+function describeSymlinkTarget(filePath, target) {
+  return target.isSymlink ? [`${filePath} is a symlink; wrote ${target.path} and left the symlink in place`] : [];
 }
 
 function runHerdr(herdrBinPath, argumentList, environment) {
@@ -261,7 +263,7 @@ function setUpClaudeHooks({ environment, pluginRoot, isRemove, isDryRun }) {
     const mode = readFileMode(target.path);
     const backupLine = file.existed ? backUpOnce(settingsPath, file.text, mode) : `created ${settingsPath}`;
     replaceFile(writeTemporaryFile(target.path, nextText, mode), target.path);
-    section.lines.push(backupLine, ...describeSymlinkTarget(settingsPath, target.path));
+    section.lines.push(backupLine, ...describeSymlinkTarget(settingsPath, target));
   } catch (error) {
     section.errors.push(`cannot write ${settingsPath}: ${error.message}`);
   }
@@ -400,7 +402,7 @@ function setUpHerdrConfig({ environment, isRemove, isDryRun }) {
   if (backupLine !== null) {
     section.lines.push(backupLine);
   }
-  section.lines.push(...describeSymlinkTarget(configPath, target.path));
+  section.lines.push(...describeSymlinkTarget(configPath, target));
   const reload = runHerdr(herdrBinPath, ['server', 'reload-config'], environment);
   if (reload.status === 0) {
     section.reloaded = true;

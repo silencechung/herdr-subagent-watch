@@ -496,17 +496,17 @@ export function runHook(rawInput, environment, overrides = {}) {
     return { action: 'skipped', reason: 'irrelevant-payload' };
   }
   // pane 裡的 claude 用 Bash 跑 `claude -p` 時，子 process 繼承同一個 HERDR_PANE_ID；不擋的話會蓋掉主 session 的樹與對照檔。
-  // herdr 知道這個 pane 的 session 時以它為準：只看祖先 process 名稱的話，名為 claude 的 wrapper 會讓每個事件都被當成巢狀
-  const paneQueryTimeoutMs = Math.min(maximumPaneQueryMs, deadlineMs - minimumHerdrBudgetMs - dependencies.now());
-  const paneAgentSession = paneQueryTimeoutMs > 0
-    ? dependencies.queryPaneAgentSession(herdrBinaryPath, paneId, paneQueryTimeoutMs)
-    : null;
-  if (paneAgentSession !== null) {
-    if (paneAgentSession.agent !== 'claude' || paneAgentSession.sessionId !== event.sessionId) {
-      return { action: 'skipped', reason: 'not-pane-session' };
+  // 祖先只有一組 claude 就直接收，不問 herdr：herdr 的 agent_session 在 server 重啟後可能停在重啟前的舊 session，
+  // 之後的 startup 回報也不會覆寫（herdr 0.9.3 實測），拿它否決的話主 session 的事件會全部被擋、側邊欄完全不更新。
+  // 兩組以上才可能是巢狀：herdr 說的 session 跟 payload 一樣才收（例如名為 claude 的 wrapper 跟 claude 中間隔了 shell），不一樣或查不到就略過
+  if (dependencies.countClaudeAncestors() >= 2) {
+    const paneQueryTimeoutMs = Math.min(maximumPaneQueryMs, deadlineMs - minimumHerdrBudgetMs - dependencies.now());
+    const paneAgentSession = paneQueryTimeoutMs > 0
+      ? dependencies.queryPaneAgentSession(herdrBinaryPath, paneId, paneQueryTimeoutMs)
+      : null;
+    if (paneAgentSession === null || paneAgentSession.agent !== 'claude' || paneAgentSession.sessionId !== event.sessionId) {
+      return { action: 'skipped', reason: 'nested-claude' };
     }
-  } else if (dependencies.countClaudeAncestors() >= 2) {
-    return { action: 'skipped', reason: 'nested-claude' };
   }
 
   const stateDirectory = prepareStateDirectory(runtimeDirectory, dependencies.getUserId());

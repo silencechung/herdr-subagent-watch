@@ -70,6 +70,7 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 - 排序：照啟動時間。跑中的超過 5 個時第 5 行改成 `└─ +N more`，N 只算跑中、沒列出來的。
 - herdr token 上限 80 字、會移除控制字元。hook 先拿掉控制字元（`\p{Cc}`）和格式字元（`\p{Cf}`，例如 U+202A–202E、U+2066–2069 的 bidi 控制、U+200B–200F 的零寬字元），不讓 `agent_type` 把側邊欄的字反轉或藏起來；太長時截斷成 `…`，保證 `●` 留在行尾。
 - herdr 路徑用 `HERDR_BIN_PATH`，沒有才找 PATH 上的 `herdr`，而且只看 PATH 裡的絕對路徑：空項目和 `node_modules/.bin` 這類相對路徑是相對於目前資料夾，也就是使用者正在開的 repo，裡面放的 `herdr` 不能被執行。`open-action.mjs`、`scripts/setup.mjs`、`bin/run.sh` 的通知都用同一套規則。
+- `bin/run.sh` 更進一步：在跑任何其他指令之前，先把 PATH 的空項目和相對路徑項目拿掉再 export，所以 `dirname`、`sed`、`sort`、`tail`、`cut` 和它 `exec` 的 `node` 也不會從目前資料夾拿。一個都不剩時改用 `/usr/bin:/bin`，因為 bash（Fedora 系的 `sh`）會把空的 PATH 當成目前資料夾。
 
 ### 不干擾 Claude session 的設計
 
@@ -82,15 +83,20 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 - 沒看過 `SubagentStart` 的 `SubagentStop` 略過。
 - `subagent-watch` 資料夾不是自己的、是 symlink、或權限不是 `0700` → 什麼都不寫。
 - 同一個 pane 裡別的 Claude session 的事件略過（例如 pane 裡的 claude 用 Bash 跑 `claude -p`）：子 process 繼承同一個 `HERDR_PANE_ID`，不擋的話會蓋掉主 session 的樹和對照檔。判斷方式：
-  - 先問 `herdr pane get <pane>` 的 `agent_session`（herdr 的 claude integration 回報）：跟 payload 的 `session_id` 一樣才更新；不一樣、或是別的 agent 的 session 就略過。最多等 300 ms，而且不會吃掉回報 herdr 的最低預算。
-  - herdr 拿不到 `agent_session`（沒裝 integration、herdr 沒回應）才退回看祖先 process：有兩組以上 `claude` 就略過。直接父子相鄰的 `claude` 只算一組，所以名為 claude、沒有 `exec` 的 wrapper script 不會讓每個事件都被當成巢狀；Bash tool 跑的指令一定隔著一層 shell，巢狀的 `claude -p` 仍然算第二組。
+  - 先數祖先 process 裡有幾組 `claude`。直接父子相鄰的 `claude` 只算一組，所以名為 claude、沒有 `exec` 的 wrapper script 仍然是一組；Bash tool 跑的指令一定隔著一層 shell，巢狀的 `claude -p` 會算第二組。
+  - 一組（或沒有）→ 直接收，不問 herdr。
+  - 兩組以上 → 問 `herdr pane get <pane>` 的 `agent_session`（herdr 的 claude integration 回報）：跟 payload 的 `session_id` 一樣才更新；不一樣、是別的 agent 的 session、或沒拿到就略過。最多等 300 ms，而且不會吃掉回報 herdr 的最低預算。
+  - 單憑 herdr 的 `agent_session` 不會擋掉任何事件，因為它可能是舊的（見已知限制）。
 
 ### 已知限制
 
 - session 在還有 sub 跑中時結束或換 session，舊的樹狀行會留著，直到這個 pane 下一次 sub agent 事件才被覆蓋（只接了 `SubagentStart`／`SubagentStop`，沒接 `SessionStart`／`SessionEnd`）。
 - 某個 sub 的 `SubagentStop` 沒記到（例如等 lock 超過時間預算，hook 直接放棄這次事件），那一行在同一個 session 裡不會自己消失（那個 sub 之後再收到一次 `SubagentStop` 才會拿掉）；換 session 後的下一次 sub 事件才會蓋掉。
-- `agent_session` 是 herdr 的 claude integration 在 `SessionStart` 回報的；它的 hook 只排除 sub agent（有 `agent_id` 的事件），沒有排除巢狀的 `claude -p`。如果巢狀 session 的回報蓋掉了 pane 的 `agent_session`，主 session 之後的事件會被當成別的 session 略過，直到主 session 下一次 `SessionStart`（`/clear`、`/resume` 等）。herdr server 會不會擋這種回報沒有驗證。
-- 祖先 process 的退路分不出 `exec claude -p` 這種寫法（巢狀的 claude 會跟主 claude 直接相鄰，被當成同一組）。
+- herdr 的 `agent_session` 可能是舊的：herdr server 重啟後，它可能停在重啟前（從 session.json 還原）的 session，之後 Claude Code 的 `startup` 回報不會覆寫它（herdr 0.9.3 實測；同一次測試裡 `resume` 回報也沒有覆寫，原因不明）。所以 hook 不靠它判斷哪個是 pane 的主 session，只有祖先 process 掃到兩組以上 `claude` 時才問 herdr。仍然擋不到的：
+  - 巢狀的 `claude -p --resume`／`claude -p -c`：herdr 若接受它的回報、把它當成 pane 的 `agent_session`，它的事件會被當成主 session。
+  - `exec claude -p`：巢狀的 claude 會跟主 claude 直接相鄰、被當成同一組，事件會被收。
+  - 用 npm 安裝的 Claude Code 若 process 名稱是 `node` 而不是 `claude`，祖先掃描算到 0 組，所有事件（包括巢狀的）都會被收（未驗證）。
+- hook command 開頭的 `sh` 是 Claude Code 在 `bin/run.sh` 執行之前照使用者的 PATH 找的，`bin/run.sh` 清 PATH 管不到這一步。
 - `●`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
 
 ## setup 會加什麼
@@ -121,7 +127,7 @@ setup／remove 認自己的 hook 是比對整個 `command`：必須正好是上�
 寫檔方式：
 
 - 兩個檔案改動前都備份成同資料夾的 `<檔名>.subagent-watch.bak`，**只備份第一次**：`.bak` 已經存在就不覆寫，保留最早的原始檔（想重新備份就自己刪掉舊的 `.bak`）。
-- 設定檔是 symlink（例如指向 dotfiles repo）時，寫到它指向的真實檔案，symlink 本身留著；指向不存在的檔案就報錯、不改。
+- 設定檔是 symlink（例如指向 dotfiles repo）時，寫到它指向的真實檔案，symlink 本身留著；指向不存在的檔案就報錯、不改。只看設定檔本身：路徑上的資料夾是 symlink（例如 Bazzite 的 `/home` → `/var/home`）不會被當成 symlink 提示。
 - `config.toml` 的新內容先寫成真實檔案旁邊的暫存檔，用 `HERDR_CONFIG_PATH` 指向它跑 `herdr config check`，通過才 `rename` 過去；沒通過就刪掉暫存檔，原檔完全沒動過，不需要還原。
 - `settings.json` 照原檔的縮排、換行字元（CRLF 寫回仍是 CRLF）與結尾換行寫回；remove 沒有東西可拿掉時不寫檔。
 
@@ -174,4 +180,4 @@ claude = [
 node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、用 `agent_session` 判斷 pane 的 session（名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管與釋放不刪到別人的新 lock（拿到同一個 inode 也一樣）、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、`bin/run.sh` 不執行相對路徑 PATH 項目裡的任何指令、判斷 pane 的 session（祖先只有一組 `claude` 時 herdr 回報舊的 `agent_session` 也照常更新、名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 除非 herdr 回報的就是它的 session 否則略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管與釋放不刪到別人的新 lock（拿到同一個 inode 也一樣）、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。

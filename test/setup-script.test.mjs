@@ -382,6 +382,24 @@ test('review PoC: settings.json and config.toml symlinked from a dotfiles folder
   assert.equal(fs.readFileSync(realConfigPath, 'utf8'), originalConfigText);
 });
 
+// Bazzite 的 /home 是指向 /var/home 的 symlink：設定檔本身是一般檔案，只是路徑上有 symlink 的資料夾，不該說它是 symlink
+test('a symlinked parent folder (like /home -> /var/home) is not reported as a symlinked config file', () => {
+  const testCase = createCase();
+  for (const linkedDirectory of [path.dirname(testCase.settingsPath), path.dirname(path.dirname(testCase.configPath))]) {
+    fs.renameSync(linkedDirectory, `${linkedDirectory}-real`);
+    fs.symlinkSync(`${linkedDirectory}-real`, linkedDirectory);
+  }
+  const result = runSetup(testCase);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.doesNotMatch(result.stdout, /is a symlink/);
+  assert.equal(readJson(testCase.settingsPath).hooks.SubagentStart[0].hooks[0].command, expectedCommand);
+  assert.match(fs.readFileSync(testCase.configPath, 'utf8'), /subagent\.watch\.open/);
+  assert.ok(!fs.lstatSync(testCase.settingsPath).isSymbolicLink());
+  assert.ok(!fs.lstatSync(testCase.configPath).isSymbolicLink());
+  assert.ok(fs.lstatSync(path.dirname(testCase.settingsPath)).isSymbolicLink(), 'the symlinked folder stays a symlink');
+  assert.equal(fs.readFileSync(`${testCase.settingsPath}.subagent-watch.bak`, 'utf8'), originalSettingsText);
+});
+
 test('a symlink pointing at a missing file is reported and not replaced', () => {
   const testCase = createCase();
   fs.rmSync(testCase.settingsPath);

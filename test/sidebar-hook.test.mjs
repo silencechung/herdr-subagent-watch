@@ -604,15 +604,6 @@ describe('hook script as Claude Code runs it', () => {
     assert.ok(existsSync(join(runtimeDirectory, 'subagent-watch', `pane-${testPaneId}.json`)));
   });
 
-  test('an event from another session in the same pane (nested claude -p) is skipped by the script', () => {
-    const { runtimeDirectory, callLogPath, environment } = createScriptCase();
-    const result = runScript(environment, payloadWith({ session_id: 'nested-session-0000' }));
-    assert.equal(result.status, 0);
-    assert.equal(result.stdout, '');
-    assert.equal(existsSync(callLogPath), false);
-    assert.deepEqual(readdirSync(runtimeDirectory), []);
-  });
-
   test('parallel starts are all recorded and the newest seq shows every sub agent', async () => {
     const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const parallelCount = 6;
@@ -648,7 +639,7 @@ describe('hook script as Claude Code runs it', () => {
   });
 });
 
-describe('the session herdr reports for the pane decides who may update it', () => {
+describe('the ancestor scan decides; herdr\'s session is asked only when claude looks nested', () => {
   const herdrFixtureDirectory = join(testDirectory, 'fixtures', 'herdr');
   const readHerdrFixture = (name) => readFileSync(join(herdrFixtureDirectory, name), 'utf8');
 
@@ -701,20 +692,45 @@ describe('the session herdr reports for the pane decides who may update it', () 
     assert.equal(harness.herdrCalls.length, 1);
   });
 
-  test('another session in the same pane (nested claude -p) is skipped without writing anything', () => {
+  test('nested claude -p (two claude ancestors) whose session is not the one herdr reports is skipped without writing anything', () => {
     const harness = createHarness({
       queryPaneAgentSession: () => ({ agent: 'claude', sessionId: 'main-session' }),
-      countClaudeAncestors: () => 1,
+      countClaudeAncestors: () => 2,
     });
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
-    assert.deepEqual(result, { action: 'skipped', reason: 'not-pane-session' });
+    assert.deepEqual(result, { action: 'skipped', reason: 'nested-claude' });
     assert.deepEqual(readdirSync(harness.runtimeDirectory), []);
     assert.equal(harness.herdrCalls.length, 0);
   });
 
-  test('a pane whose session belongs to another agent is skipped', () => {
-    const harness = createHarness({ queryPaneAgentSession: () => ({ agent: 'codex', sessionId: startPayload.session_id }) });
-    assert.equal(runHook(startPayloadText, harness.environment, harness.dependencies).reason, 'not-pane-session');
+  test('with two claude ancestors, a pane whose session belongs to another agent is skipped', () => {
+    const harness = createHarness({
+      queryPaneAgentSession: () => ({ agent: 'codex', sessionId: startPayload.session_id }),
+      countClaudeAncestors: () => 2,
+    });
+    assert.equal(runHook(startPayloadText, harness.environment, harness.dependencies).reason, 'nested-claude');
+  });
+
+  // review Blocker：herdr server 重啟後 w8:pV 的 agent_session 停在重啟前的 session，實際在跑的是另一個；以前會被當成別的 session，側邊欄完全不更新
+  test('review Blocker (w8:pV): a stale agent_session from herdr does not stop one claude ancestor from updating the sidebar', () => {
+    const paneQueries = [];
+    const harness = createHarness({
+      queryPaneAgentSession: (binaryPath, paneId) => {
+        paneQueries.push(paneId);
+        return { agent: 'claude', sessionId: 'aaab440d-0000-4000-8000-000000000000' };
+      },
+      countClaudeAncestors: () => 1,
+    });
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(harness.herdrCalls.length, 1);
+    assert.deepEqual(paneQueries, [], 'one claude ancestor is enough; herdr is not asked');
+    const stateDirectory = join(harness.runtimeDirectory, 'subagent-watch');
+    const paneMapping = JSON.parse(readFileSync(join(stateDirectory, `pane-${testPaneId}.json`), 'utf8'));
+    assert.equal(paneMapping.sessionId, startPayload.session_id);
+    const sessionState = JSON.parse(readFileSync(join(stateDirectory, `session-${startPayload.session_id}.json`), 'utf8'));
+    assert.deepEqual(sessionState.subagents.map((entry) => entry.id), [startPayload.agent_id]);
   });
 
   test('without a session from herdr the ancestor scan decides', () => {
@@ -725,17 +741,18 @@ describe('the session herdr reports for the pane decides who may update it', () 
   });
 
   test('the pane query gets the pane id and a timeout that leaves room for the report', () => {
-    const harness = createHarness({ deadlineMs: 1_000_250 });
+    const harness = createHarness({ deadlineMs: 1_000_250, countClaudeAncestors: () => 2 });
     runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.deepEqual(harness.paneQueries, [{ binaryPath: '/fake/herdr', paneId: testPaneId, timeoutMs: 150 }]);
 
-    const unbounded = createHarness();
+    const unbounded = createHarness({ countClaudeAncestors: () => 2 });
     runHook(startPayloadText, unbounded.environment, unbounded.dependencies);
     assert.equal(unbounded.paneQueries[0].timeoutMs, 300);
 
-    const outOfTime = createHarness({ deadlineMs: 1_000_100 });
-    runHook(startPayloadText, outOfTime.environment, outOfTime.dependencies);
-    assert.deepEqual(outOfTime.paneQueries, [], 'no time left: skip the query and fall back to the ancestor scan');
+    const outOfTime = createHarness({ deadlineMs: 1_000_100, countClaudeAncestors: () => 2 });
+    const result = runHook(startPayloadText, outOfTime.environment, outOfTime.dependencies);
+    assert.deepEqual(outOfTime.paneQueries, [], 'no time left: the query is skipped');
+    assert.equal(result.reason, 'nested-claude', 'without an answer from herdr a nested-looking event is skipped');
   });
 
   test('a claude wrapper directly above claude counts once; claude -p behind a shell still counts twice', () => {

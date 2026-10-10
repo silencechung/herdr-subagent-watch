@@ -137,6 +137,18 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     assert.equal(readCalls(tree.callLogPath).length, 1);
   });
 
+  // review Blocker（w8:pV）：herdr server 重啟後 agent_session 停在重啟前的 session，之後的回報也蓋不掉；hook 上面只有一組 claude 時不能因此被擋
+  test('one claude above the hook still updates the sidebar when herdr reports a stale session', async () => {
+    const tree = createProcessTree();
+    const environment = { ...tree.environment, FAKE_PANE_SESSION: 'stale-session-0004', HOOK_PAYLOAD: startPayload(mainSessionId, 'after-restart') };
+    const result = await runDetached(`"${tree.realClaudePath}" "${tree.fakeClaudeScriptPath}"`, environment, tree.donePath);
+    assert.deepEqual(result, { status: 0, stdout: '' });
+    const calls = readCalls(tree.callLogPath);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.ok(fs.existsSync(path.join(tree.runtimeDirectory, 'subagent-watch', `pane-${paneId}.json`)));
+  });
+
   test('claude -p run by the pane claude through a shell is still skipped when herdr has no session', async () => {
     const tree = createProcessTree();
     const environment = { ...tree.environment, FAKE_CLAUDE_NEST: '1', HOOK_PAYLOAD: startPayload('nested-session-0002', 'nested') };

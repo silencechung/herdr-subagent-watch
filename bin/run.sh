@@ -3,6 +3,25 @@
 # 用法：sh bin/run.sh <script.mjs> [args...]；相對路徑的 script 以 plugin 根目錄為準，不管目前在哪個資料夾。
 set -u
 
+# PATH 的空項目與相對項目（`node_modules/.bin`、`.`）是相對於 cwd，也就是使用者開著的 repo：照原樣用的話，
+# 下面的 dirname、sed、sort、tail、cut 和 exec 出去的 node 都可能跑到 repo 裡的同名檔案。一開頭只留絕對路徑的項目再 export。
+# 只用 shell 內建的字串處理，這時候還不能呼叫任何外部指令
+clean_path=''
+remaining_path=${PATH:-}
+while [ -n "$remaining_path" ]; do
+  directory=${remaining_path%%:*}
+  case $remaining_path in
+    *:*) remaining_path=${remaining_path#*:} ;;
+    *) remaining_path='' ;;
+  esac
+  case $directory in
+    /*) clean_path=${clean_path:+$clean_path:}$directory ;;
+  esac
+done
+# 一個都不剩時不能留空字串：bash（Fedora 系的 sh）把空的 PATH 當成 cwd 去找指令
+PATH=${clean_path:-/usr/bin:/bin}
+export PATH
+
 minimum_node_major=22
 newline='
 '
@@ -84,7 +103,7 @@ wait_for_key() {
   fi
 }
 
-# 跟 lib/herdr.mjs 同規則：PATH 只看絕對路徑的項目。直接寫 `herdr` 讓 shell 去找的話，PATH 裡的相對項目會執行 cwd（使用者的 repo）裡的檔案
+# 跟 lib/herdr.mjs 同規則：PATH 只看絕對路徑的項目（開頭已經清過 PATH，這裡照樣檢查，不靠前面的步驟）
 find_herdr() {
   if [ -n "${HERDR_BIN_PATH:-}" ]; then
     printf '%s\n' "$HERDR_BIN_PATH"
