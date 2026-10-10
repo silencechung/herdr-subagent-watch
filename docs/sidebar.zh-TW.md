@@ -51,8 +51,9 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 
 - lock 內容是持有者的 pid、啟動時間（`/proc/<pid>/stat` 第 22 欄）與建立時間。先寫暫存檔再 `link` 成 lock（跟 `wx` 一樣「不存在才建立」），別人讀不到沒寫完的內容。
 - 判斷失效：`process.kill(pid, 0)` 查不到、process 是 zombie，或同一個 pid 但啟動時間不同（pid 被重用）。舊版留下的空 lock 沒有 pid，超過 2 秒才算失效；任何 lock 超過 10 秒都算失效（pid 查不準時的保險，hook 本身不到 1 秒就結束）。
-- 接管：先用 `link` 搶 `<lock>.break-<inode>` 這個名字，搶到而且確認還是判定失效的那個 inode 才刪 lock，不會刪到別人剛建好的新 lock。搶到的 process 若在刪之前被砍掉，留下的 `.break-*` 超過 2 秒就清掉。
-- 釋放時確認路徑上還是自己建的那個 inode 才刪。
+- 認 lock 用 inode 加上內容（pid、啟動時間、建立時間）。只看 inode 不夠：ext4 這類檔案系統會把剛釋放的 inode 馬上給下一個新檔，失效 lock 被刪掉後別人新建的 lock 可能拿到同一個 inode。讀不到內容就不刪。
+- 接管：先用 `link` 搶 `<lock>.break-<inode>` 這個名字，搶到而且從這個名字讀回來的還是判定失效的那個 inode 與內容才刪 lock，不會刪到別人剛建好的新 lock。搶到的 process 若在刪之前被砍掉，留下的 `.break-*` 超過 2 秒就清掉。
+- 釋放時確認路徑上還是自己建的那個 inode 與內容才刪。
 
 ### herdr 回報
 
@@ -173,4 +174,4 @@ claude = [
 node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、用 `agent_session` 判斷 pane 的 session（名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管不刪到別人的新 lock、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、用 `agent_session` 判斷 pane 的 session（名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管與釋放不刪到別人的新 lock（拿到同一個 inode 也一樣）、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。

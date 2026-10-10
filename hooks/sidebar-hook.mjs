@@ -347,34 +347,42 @@ export function isLockOwnerGone(owner, readInfo = readProcessInfo) {
   return owner.startTime !== null && info.startTime !== owner.startTime;
 }
 
-// lock 的 inode 與內容要從同一個 fd 讀；先 lstat 再 readFile 的話，中間被換掉會拿到對不起來的兩份資料。
-// 回傳 null 代表 lock 剛好被釋放，可以馬上再搶；讀不了的 lock 當成有人在用，照常等
-function inspectLock(lockPath) {
-  const unreadableLock = { inode: null, isStale: false };
-  let descriptor;
+// lock 的 inode 與內容要從同一個 fd 讀；先 lstat 再 readFile 的話，中間被換掉會拿到對不起來的兩份資料
+function readLockFile(filePath) {
+  const descriptor = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    descriptor = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-  } catch (error) {
-    return error.code === 'ENOENT' ? null : unreadableLock;
-  }
-  try {
-    const stats = fstatSync(descriptor);
-    const owner = parseLockOwner(readFileSync(descriptor, 'utf8'));
-    const ageMs = Date.now() - stats.mtimeMs;
-    const isStale = ageMs > maximumLockAgeMs || (owner === null ? ageMs > staleLockMs : isLockOwnerGone(owner));
-    return { inode: stats.ino, isStale };
-  } catch {
-    return unreadableLock;
+    return { stats: fstatSync(descriptor), content: readFileSync(descriptor, 'utf8') };
   } finally {
     closeSync(descriptor);
   }
 }
 
+// 回傳 null 代表 lock 剛好被釋放，可以馬上再搶；讀不了的 lock 當成有人在用，照常等
+function inspectLock(lockPath) {
+  const unreadableLock = { inode: null, content: null, isStale: false };
+  let lockFile;
+  try {
+    lockFile = readLockFile(lockPath);
+  } catch (error) {
+    return error.code === 'ENOENT' ? null : unreadableLock;
+  }
+  try {
+    const owner = parseLockOwner(lockFile.content);
+    const ageMs = Date.now() - lockFile.stats.mtimeMs;
+    const isStale = ageMs > maximumLockAgeMs || (owner === null ? ageMs > staleLockMs : isLockOwnerGone(owner));
+    return { inode: lockFile.stats.ino, content: lockFile.content, isStale };
+  } catch {
+    return unreadableLock;
+  }
+}
+
 // 好幾個 process 同時判定同一個 lock 失效時只能有一個去刪。直接 unlink 的話，別人可能剛刪掉舊 lock、建好新的，
 // 這裡會刪到新的 lock，兩邊都以為拿到 lock，狀態檔就會掉資料。
-// 做法：用 link 搶「<lock>.break-<inode>」這個名字（已存在就失敗），搶到且確認是判定失效的那個 inode 才刪；
-// 能拿掉這個 inode 的只有它的持有者（已確認不在）和搶到 .break 的人，所以刪的一定是失效的那個
-export function breakStaleLock(lockPath, staleInode) {
+// 做法：用 link 搶「<lock>.break-<inode>」這個名字（已存在就失敗），搶到且確認是判定失效的那個 lock 才刪；
+// 能拿掉這個 lock 的只有它的持有者（已確認不在）和搶到 .break 的人，所以刪的一定是失效的那個。
+// 只比 inode 不夠：ext4 這類檔案系統會把剛釋放的 inode 馬上給下一個新檔，別人接管後新建的 lock 可能拿到同一個 inode，
+// 所以內容（持有者的 pid、啟動時間、建立時間）也要跟判定失效時讀到的一字不差；讀不到就不刪
+export function breakStaleLock(lockPath, staleInode, staleContent) {
   const breakPath = `${lockPath}.break-${staleInode}`;
   try {
     linkSync(lockPath, breakPath);
@@ -385,7 +393,8 @@ export function breakStaleLock(lockPath, staleInode) {
     return false;
   }
   try {
-    if (lstatSync(breakPath).ino !== staleInode) {
+    const breakFile = readLockFile(breakPath);
+    if (breakFile.stats.ino !== staleInode || breakFile.content !== staleContent) {
       return false;
     }
     unlinkSync(lockPath);
@@ -412,9 +421,10 @@ function removeAbandonedBreakFile(breakPath) {
 function acquireLock(lockPath, deadlineMs, now) {
   const temporaryPath = createTemporaryPath(lockPath);
   const owner = { pid: process.pid, startTime: readProcessInfo(process.pid)?.startTime ?? null, createdAtMs: Date.now() };
+  const ownContent = JSON.stringify(owner);
   let ownInode;
   try {
-    writeFileSync(temporaryPath, JSON.stringify(owner), { mode: 0o600, flag: 'wx' });
+    writeFileSync(temporaryPath, ownContent, { mode: 0o600, flag: 'wx' });
     ownInode = lstatSync(temporaryPath).ino;
   } catch {
     removeQuietly(temporaryPath);
@@ -424,7 +434,7 @@ function acquireLock(lockPath, deadlineMs, now) {
     while (now() < deadlineMs) {
       try {
         linkSync(temporaryPath, lockPath);
-        return ownInode;
+        return { inode: ownInode, content: ownContent };
       } catch (error) {
         if (error.code !== 'EEXIST') {
           return null;
@@ -434,7 +444,7 @@ function acquireLock(lockPath, deadlineMs, now) {
       if (lock === null) {
         continue;
       }
-      if (lock.isStale && breakStaleLock(lockPath, lock.inode)) {
+      if (lock.isStale && breakStaleLock(lockPath, lock.inode, lock.content)) {
         continue;
       }
       sleepSync(lockRetryIntervalMs);
@@ -445,14 +455,15 @@ function acquireLock(lockPath, deadlineMs, now) {
   }
 }
 
-function releaseLock(lockPath, ownInode) {
+function releaseLock(lockPath, ownLock) {
   try {
-    // lock 若已被別人當成失效接管，路徑上是別人的 lock，不能刪
-    if (lstatSync(lockPath).ino === ownInode) {
+    // lock 若已被別人當成失效接管，路徑上是別人的 lock，不能刪；別人新建的 lock 可能拿到同一個 inode（ext4 會重用），內容也要是自己寫的才算
+    const lockFile = readLockFile(lockPath);
+    if (lockFile.stats.ino === ownLock.inode && lockFile.content === ownLock.content) {
       unlinkSync(lockPath);
     }
   } catch {
-    // 已經不在了
+    // 已經不在了，或讀不到內容：認不出是自己的就不刪
   }
 }
 
@@ -512,8 +523,8 @@ export function runHook(rawInput, environment, overrides = {}) {
 
   const statePath = join(stateDirectory, `session-${event.sessionId}.json`);
   const lockPath = `${statePath}.lock`;
-  const lockInode = acquireLock(lockPath, deadlineMs - minimumHerdrBudgetMs, dependencies.now);
-  if (lockInode === null) {
+  const ownLock = acquireLock(lockPath, deadlineMs - minimumHerdrBudgetMs, dependencies.now);
+  if (ownLock === null) {
     return { action: 'skipped', reason: 'lock-timeout' };
   }
   try {
@@ -532,7 +543,7 @@ export function runHook(rawInput, environment, overrides = {}) {
     dependencies.runHerdr(herdrBinaryPath, argumentList, herdrTimeoutMs);
     return { action: 'reported', lines, argumentList };
   } finally {
-    releaseLock(lockPath, lockInode);
+    releaseLock(lockPath, ownLock);
   }
 }
 

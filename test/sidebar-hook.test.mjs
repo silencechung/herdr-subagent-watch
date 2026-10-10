@@ -962,32 +962,78 @@ describe('session lock', () => {
     assert.equal(existsSync(lockCase.lockPath), false);
   });
 
+  // ext4 會把剛釋放的 inode 馬上給下一個新檔，tmpfs 不會：刪掉再建時 inode 同不同由檔案系統決定，兩種都要守住
   test('review race: a lock judged stale but replaced by a fresh one before the takeover is left alone', () => {
     const lockCase = createLockCase();
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
     const staleInode = statSync(lockCase.lockPath).ino;
     // 另一個 process 在這段時間接管了失效的 lock 並建好自己的
     rmSync(lockCase.lockPath);
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() }));
-    const freshInode = statSync(lockCase.lockPath).ino;
-    assert.notEqual(freshInode, staleInode);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), false);
-    assert.equal(statSync(lockCase.lockPath).ino, freshInode);
+    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, freshContent);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
+    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
+    rmSync(lockCase.lockPath);
+  });
+
+  // 刪掉再建不保證拿到同一個 inode；就地覆寫內容才能在任何檔案系統上穩定做出「inode 相同、內容不同」的新 lock
+  test('review race: a fresh lock that reuses the stale lock\'s inode is left alone', () => {
+    const lockCase = createLockCase();
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
+    const staleInode = statSync(lockCase.lockPath).ino;
+    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, freshContent);
+    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
+    assert.equal(existsSync(lockCase.lockPath), true, 'the fresh lock on the reused inode must survive');
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
     assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
     rmSync(lockCase.lockPath);
   });
 
   test('only one of two takeovers of the same stale lock succeeds', () => {
     const lockCase = createLockCase();
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
     const staleInode = statSync(lockCase.lockPath).ino;
     const breakPath = `${lockCase.lockPath}.break-${staleInode}`;
     linkSync(lockCase.lockPath, breakPath);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), false, 'someone else holds the .break name');
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false, 'someone else holds the .break name');
     assert.equal(statSync(lockCase.lockPath).ino, staleInode);
     rmSync(breakPath);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), true);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), true);
     assert.equal(existsSync(lockCase.lockPath), false);
+  });
+
+  test('a takeover without the content it judged stale removes nothing', () => {
+    const lockCase = createLockCase();
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const staleInode = statSync(lockCase.lockPath).ino;
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), false);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, null), false);
+    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
+    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
+    rmSync(lockCase.lockPath);
+  });
+
+  test('releasing never deletes another lock that reuses this run\'s inode', () => {
+    const otherContent = JSON.stringify({ pid: process.pid, startTime: `${ownStartTime}9`, createdAtMs: Date.now() });
+    let ownInode = null;
+    const lockCase = createLockCase({
+      runHerdr: () => {
+        ownInode = statSync(lockCase.lockPath).ino;
+        // 等同「這次的 lock 被當成失效接管、別人新建的 lock 拿到同一個 inode」
+        writeFileSync(lockCase.lockPath, otherContent);
+      },
+    });
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
+    assert.equal(existsSync(lockCase.lockPath), true, 'the lock on the reused inode must survive our release');
+    assert.equal(statSync(lockCase.lockPath).ino, ownInode);
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), otherContent);
+    rmSync(lockCase.lockPath);
   });
 
   test('releasing never deletes a lock that is no longer the one this run created', () => {
