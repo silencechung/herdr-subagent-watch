@@ -6,6 +6,7 @@ import {
   findSettingsShapeProblem,
   formatSettings,
   installSidebarHooks,
+  isSidebarHookCommand,
   removeSidebarHooks,
 } from '../lib/setup-claude.mjs';
 
@@ -97,4 +98,37 @@ test('formatting keeps the original indent and trailing newline', () => {
   assert.equal(detectJsonIndent('{\n\t"a": 1\n}'), '\t');
   assert.equal(formatSettings({ a: 1 }, '{\n    "a": 0\n}'), '{\n    "a": 1\n}');
   assert.equal(formatSettings({ a: 1 }, ''), '{\n  "a": 1\n}\n');
+});
+
+test('only the two command shapes this plugin writes are recognised as its hook', () => {
+  assert.equal(isSidebarHookCommand(command), true);
+  assert.equal(isSidebarHookCommand('sh "/elsewhere/plugin/bin/run.sh" "/elsewhere/plugin/hooks/sidebar-hook.mjs"'), true, 'a moved plugin is still ours');
+  assert.equal(isSidebarHookCommand('/home/someone/.local/share/fnm/aliases/default/bin/node /old/place/hooks/sidebar-hook.mjs'), true, 'the hand-written form from before the launcher');
+  for (const otherCommand of [
+    'node /opt/other-tool/sidebar-hook.mjs',
+    'node /opt/other-tool/hooks/sidebar-hook.mjs',
+    '/usr/bin/node /opt/other-tool/hooks/sidebar-hook.mjs --verbose',
+    '/usr/bin/python3 /opt/other-tool/hooks/sidebar-hook.mjs',
+    'sh "/opt/a/bin/run.sh" "/opt/b/hooks/sidebar-hook.mjs"',
+    'sh "relative/bin/run.sh" "relative/hooks/sidebar-hook.mjs"',
+    `${command} && curl example.invalid`,
+    'echo sidebar-hook.mjs',
+    undefined,
+  ]) {
+    assert.equal(isSidebarHookCommand(otherCommand), false, String(otherCommand));
+  }
+});
+
+test('remove keeps empty arrays and every other hook when nothing of ours is there', () => {
+  const settings = { hooks: { SubagentStart: [], SubagentStop: [{ hooks: [{ type: 'command', command: 'node /opt/other-tool/sidebar-hook.mjs' }] }] } };
+  const result = removeSidebarHooks(settings);
+  assert.equal(result.removedCount, 0);
+  assert.deepEqual(result.settings, settings);
+});
+
+test('formatting keeps CRLF line endings and one-line files stay on one line', () => {
+  assert.equal(formatSettings({ a: 1, b: [2] }, '{\r\n  "a": 0\r\n}\r\n'), '{\r\n  "a": 1,\r\n  "b": [\r\n    2\r\n  ]\r\n}\r\n');
+  assert.equal(formatSettings({ a: 'line\nbreak' }, '{\r\n\t"a": 0\r\n}'), '{\r\n\t"a": "line\\nbreak"\r\n}');
+  assert.equal(formatSettings({ a: 1, b: 2 }, '{"a":0}\n'), '{"a":1,"b":2}\n');
+  assert.equal(formatSettings({ a: 1 }, '{}\n'), '{\n  "a": 1\n}\n');
 });

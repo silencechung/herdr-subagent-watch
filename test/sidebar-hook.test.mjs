@@ -1,6 +1,20 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -8,16 +22,23 @@ import { fileURLToPath } from 'node:url';
 
 import {
   applyEvent,
+  breakStaleLock,
   buildMetadataArguments,
   buildTreeLines,
   countClaudeAncestors,
   createEmptySessionState,
   formatTreeLine,
+  isLockOwnerGone,
   maximumTokenLength,
   nextSequence,
   normalizeSessionState,
   parseHookPayload,
+  parseLockOwner,
+  parsePaneAgentSession,
+  prepareStateDirectory,
+  readProcessInfo,
   runHook,
+  sanitizeText,
 } from '../hooks/sidebar-hook.mjs';
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
@@ -278,6 +299,7 @@ describe('runHook', () => {
         herdrCalls.push({ binaryPath, argumentList, timeoutMs });
       },
       isExecutable: () => true,
+      queryPaneAgentSession: () => ({ agent: 'claude', sessionId: startPayload.session_id }),
       countClaudeAncestors: () => 1,
       deadlineMs: Number.POSITIVE_INFINITY,
       ...overrides,
@@ -480,8 +502,8 @@ describe('runHook', () => {
     assert.equal(harness.herdrCalls.length, 0);
   });
 
-  test('nested claude -p inside a claude pane is ignored', () => {
-    const harness = createHarness({ countClaudeAncestors: () => 2 });
+  test('without a session from herdr, nested claude -p inside a claude pane is ignored', () => {
+    const harness = createHarness({ queryPaneAgentSession: () => null, countClaudeAncestors: () => 2 });
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(result.reason, 'nested-claude');
     assert.equal(existsSync(harness.stateDirectory), false);
@@ -510,6 +532,41 @@ describe('hook script as Claude Code runs it', () => {
     return { ...result, elapsedMs: Date.now() - startedAtMs };
   }
 
+  // 假 herdr：`pane get` 回報這個 pane 的 claude session，其他呼叫記到 log；兩種都故意往 stdout 印東西，確認不會漏進 hook 的輸出
+  function writeFakeHerdr(workDirectory, callLogPath) {
+    const fakeHerdrPath = join(workDirectory, 'herdr');
+    const paneGetOutput = JSON.stringify({
+      result: { pane: { agent: 'claude', agent_session: { agent: 'claude', kind: 'id', value: startPayload.session_id } } },
+    });
+    writeFileSync(
+      fakeHerdrPath,
+      [
+        `#!${process.execPath}`,
+        'const argumentList = process.argv.slice(2);',
+        `if (argumentList[0] === 'pane' && argumentList[1] === 'get') { process.stdout.write(${JSON.stringify(paneGetOutput)}); process.exit(0); }`,
+        `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(argumentList) + '\\n');`,
+        `process.stdout.write('noise that must not leak');`,
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
+    return fakeHerdrPath;
+  }
+
+  function createScriptCase() {
+    const workDirectory = createTemporaryDirectory();
+    const runtimeDirectory = join(workDirectory, 'runtime');
+    mkdirSync(runtimeDirectory, { mode: 0o700 });
+    const callLogPath = join(workDirectory, 'herdr-calls.jsonl');
+    const environment = {
+      PATH: process.env.PATH,
+      XDG_RUNTIME_DIR: runtimeDirectory,
+      HERDR_PANE_ID: testPaneId,
+      HERDR_BIN_PATH: writeFakeHerdr(workDirectory, callLogPath),
+    };
+    return { runtimeDirectory, callLogPath, environment };
+  }
+
   test('outside herdr: exit 0, no output, nothing written, under 1 second', () => {
     const runtimeDirectory = createTemporaryDirectory();
     const result = runScript({ PATH: process.env.PATH, XDG_RUNTIME_DIR: runtimeDirectory }, startPayloadText);
@@ -533,28 +590,8 @@ describe('hook script as Claude Code runs it', () => {
     assert.equal(result.stderr, '');
   });
 
-  const nestedReason = countClaudeAncestors(process.pid) >= 2 ? 'test runner itself runs under a nested claude' : false;
-  test('inside herdr: calls herdr with the tree tokens, no output, under 1 second', { skip: nestedReason }, () => {
-    const workDirectory = createTemporaryDirectory();
-    const runtimeDirectory = join(workDirectory, 'runtime');
-    const callLogPath = join(workDirectory, 'herdr-calls.jsonl');
-    const fakeHerdrPath = join(workDirectory, 'herdr');
-    writeFileSync(
-      fakeHerdrPath,
-      [
-        `#!${process.execPath}`,
-        `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
-        `process.stdout.write('noise that must not leak');`,
-        '',
-      ].join('\n'),
-      { mode: 0o755 },
-    );
-    const environment = {
-      PATH: process.env.PATH,
-      XDG_RUNTIME_DIR: runtimeDirectory,
-      HERDR_PANE_ID: testPaneId,
-      HERDR_BIN_PATH: fakeHerdrPath,
-    };
+  test('inside herdr: calls herdr with the tree tokens, no output, under 1 second', () => {
+    const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const result = runScript(environment, startPayloadText);
     assert.equal(result.status, 0);
     assert.equal(result.stdout, '');
@@ -567,22 +604,8 @@ describe('hook script as Claude Code runs it', () => {
     assert.ok(existsSync(join(runtimeDirectory, 'subagent-watch', `pane-${testPaneId}.json`)));
   });
 
-  test('parallel starts are all recorded and the newest seq shows every sub agent', { skip: nestedReason }, async () => {
-    const workDirectory = createTemporaryDirectory();
-    const runtimeDirectory = join(workDirectory, 'runtime');
-    const callLogPath = join(workDirectory, 'herdr-calls.jsonl');
-    const fakeHerdrPath = join(workDirectory, 'herdr');
-    writeFileSync(
-      fakeHerdrPath,
-      `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`,
-      { mode: 0o755 },
-    );
-    const environment = {
-      PATH: process.env.PATH,
-      XDG_RUNTIME_DIR: runtimeDirectory,
-      HERDR_PANE_ID: testPaneId,
-      HERDR_BIN_PATH: fakeHerdrPath,
-    };
+  test('parallel starts are all recorded and the newest seq shows every sub agent', async () => {
+    const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const parallelCount = 6;
     const runs = Array.from({ length: parallelCount }, (unused, index) => {
       return new Promise((resolvePromise) => {
@@ -613,5 +636,445 @@ describe('hook script as Claude Code runs it', () => {
     assert.ok(newestCall.includes('sub5=└─ +2 more'));
     const sequences = calls.map((call) => Number(call[6]));
     assert.equal(new Set(sequences).size, parallelCount);
+  });
+});
+
+describe('the ancestor scan decides; herdr\'s session is asked only when claude looks nested', () => {
+  const herdrFixtureDirectory = join(testDirectory, 'fixtures', 'herdr');
+  const readHerdrFixture = (name) => readFileSync(join(herdrFixtureDirectory, name), 'utf8');
+
+  function createHarness(overrides = {}) {
+    const runtimeDirectory = createTemporaryDirectory();
+    const herdrCalls = [];
+    const paneQueries = [];
+    const dependencies = {
+      now: () => 1_000_000,
+      runHerdr: (binaryPath, argumentList) => {
+        herdrCalls.push(argumentList);
+      },
+      isExecutable: () => true,
+      queryPaneAgentSession: (binaryPath, paneId, timeoutMs) => {
+        paneQueries.push({ binaryPath, paneId, timeoutMs });
+        return null;
+      },
+      countClaudeAncestors: () => 1,
+      deadlineMs: Number.POSITIVE_INFINITY,
+      ...overrides,
+    };
+    const environment = { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory };
+    return { runtimeDirectory, herdrCalls, paneQueries, dependencies, environment };
+  }
+
+  test('agent_session from `herdr pane get` is read as a session id', () => {
+    assert.deepEqual(parsePaneAgentSession(readHerdrFixture('pane-get-claude.json')), {
+      agent: 'claude',
+      sessionId: 'aaaa1111-0000-4000-8000-00000000c1a0',
+    });
+    assert.equal(parsePaneAgentSession(readHerdrFixture('pane-get-claude-without-session.json')), null);
+    assert.equal(parsePaneAgentSession(readHerdrFixture('pane-get-codex.json')), null);
+    assert.equal(parsePaneAgentSession(readHerdrFixture('pane-get-shell.json')), null);
+    assert.equal(parsePaneAgentSession('noise'), null);
+    assert.equal(parsePaneAgentSession(JSON.stringify({ result: { pane: { agent_session: { value: 42 } } } })), null);
+  });
+
+  test('an agent_session holding a transcript path is reduced to its session id', () => {
+    const output = JSON.stringify({ result: { pane: { agent_session: { agent: 'claude', value: '/home/u/.claude/projects/-x/abc-123.jsonl' } } } });
+    assert.deepEqual(parsePaneAgentSession(output), { agent: 'claude', sessionId: 'abc-123' });
+  });
+
+  test('a claude wrapper (two claude ancestors) still updates the sidebar when herdr says it is the pane session', () => {
+    const harness = createHarness({
+      queryPaneAgentSession: () => ({ agent: 'claude', sessionId: startPayload.session_id }),
+      countClaudeAncestors: () => 2,
+    });
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.equal(harness.herdrCalls.length, 1);
+  });
+
+  test('nested claude -p (two claude ancestors) whose session is not the one herdr reports is skipped without writing anything', () => {
+    const harness = createHarness({
+      queryPaneAgentSession: () => ({ agent: 'claude', sessionId: 'main-session' }),
+      countClaudeAncestors: () => 2,
+    });
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.deepEqual(result, { action: 'skipped', reason: 'nested-claude' });
+    assert.deepEqual(readdirSync(harness.runtimeDirectory), []);
+    assert.equal(harness.herdrCalls.length, 0);
+  });
+
+  test('with two claude ancestors, a pane whose session belongs to another agent is skipped', () => {
+    const harness = createHarness({
+      queryPaneAgentSession: () => ({ agent: 'codex', sessionId: startPayload.session_id }),
+      countClaudeAncestors: () => 2,
+    });
+    assert.equal(runHook(startPayloadText, harness.environment, harness.dependencies).reason, 'nested-claude');
+  });
+
+  // review Blocker：herdr server 重啟後 w8:pV 的 agent_session 停在重啟前的 session，實際在跑的是另一個；以前會被當成別的 session，側邊欄完全不更新
+  test('review Blocker (w8:pV): a stale agent_session from herdr does not stop one claude ancestor from updating the sidebar', () => {
+    const paneQueries = [];
+    const harness = createHarness({
+      queryPaneAgentSession: (binaryPath, paneId) => {
+        paneQueries.push(paneId);
+        return { agent: 'claude', sessionId: 'aaab440d-0000-4000-8000-000000000000' };
+      },
+      countClaudeAncestors: () => 1,
+    });
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(harness.herdrCalls.length, 1);
+    assert.deepEqual(paneQueries, [], 'one claude ancestor is enough; herdr is not asked');
+    const stateDirectory = join(harness.runtimeDirectory, 'subagent-watch');
+    const paneMapping = JSON.parse(readFileSync(join(stateDirectory, `pane-${testPaneId}.json`), 'utf8'));
+    assert.equal(paneMapping.sessionId, startPayload.session_id);
+    const sessionState = JSON.parse(readFileSync(join(stateDirectory, `session-${startPayload.session_id}.json`), 'utf8'));
+    assert.deepEqual(sessionState.subagents.map((entry) => entry.id), [startPayload.agent_id]);
+  });
+
+  test('without a session from herdr the ancestor scan decides', () => {
+    const single = createHarness({ countClaudeAncestors: () => 1 });
+    assert.equal(runHook(startPayloadText, single.environment, single.dependencies).action, 'reported');
+    const nested = createHarness({ countClaudeAncestors: () => 2 });
+    assert.equal(runHook(startPayloadText, nested.environment, nested.dependencies).reason, 'nested-claude');
+  });
+
+  test('the pane query gets the pane id and a timeout that leaves room for the report', () => {
+    const harness = createHarness({ deadlineMs: 1_000_250, countClaudeAncestors: () => 2 });
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.deepEqual(harness.paneQueries, [{ binaryPath: '/fake/herdr', paneId: testPaneId, timeoutMs: 150 }]);
+
+    const unbounded = createHarness({ countClaudeAncestors: () => 2 });
+    runHook(startPayloadText, unbounded.environment, unbounded.dependencies);
+    assert.equal(unbounded.paneQueries[0].timeoutMs, 300);
+
+    const outOfTime = createHarness({ deadlineMs: 1_000_100, countClaudeAncestors: () => 2 });
+    const result = runHook(startPayloadText, outOfTime.environment, outOfTime.dependencies);
+    assert.deepEqual(outOfTime.paneQueries, [], 'no time left: the query is skipped');
+    assert.equal(result.reason, 'nested-claude', 'without an answer from herdr a nested-looking event is skipped');
+  });
+
+  test('a claude wrapper directly above claude counts once; claude -p behind a shell still counts twice', () => {
+    const wrapperTable = {
+      50: { command: 'node', parentProcessId: 40 },
+      40: { command: 'sh', parentProcessId: 30 },
+      30: { command: 'claude', parentProcessId: 20 },
+      20: { command: 'claude', parentProcessId: 10 },
+      10: { command: 'fish', parentProcessId: 1 },
+    };
+    assert.equal(countClaudeAncestors(50, (processId) => wrapperTable[processId] ?? null), 1);
+    const nestedBehindWrapper = {
+      ...wrapperTable,
+      20: { command: 'claude', parentProcessId: 15 },
+      15: { command: 'bash', parentProcessId: 12 },
+      12: { command: 'claude', parentProcessId: 11 },
+      11: { command: 'claude', parentProcessId: 10 },
+    };
+    assert.equal(countClaudeAncestors(50, (processId) => nestedBehindWrapper[processId] ?? null), 2);
+  });
+});
+
+describe('invisible characters in agent_type', () => {
+  test('bidi controls and zero-width characters are removed along with control characters', () => {
+    assert.equal(sanitizeText('‮evil‬'), 'evil');
+    assert.equal(sanitizeText('a⁦b⁧c⁨d⁩'), 'abcd');
+    assert.equal(sanitizeText('x​y‌z‍‎‏'), 'xyz');
+    assert.equal(sanitizeText('‪‫‭plan﻿⁠'), 'plan');
+    assert.equal(sanitizeText('代理 Explore'), '代理 Explore');
+  });
+
+  test('the review PoC agent_type reaches herdr without any Cc or Cf character', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    const herdrCalls = [];
+    const result = runHook(
+      payloadWith({ agent_type: 'gp\u001b]52;c;QQ==\u0007\u009b2J‮evil⁦' }),
+      { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory },
+      {
+        now: () => 1_000_000,
+        isExecutable: () => true,
+        queryPaneAgentSession: () => null,
+        countClaudeAncestors: () => 1,
+        runHerdr: (binaryPath, argumentList) => {
+          herdrCalls.push(argumentList);
+        },
+        deadlineMs: Number.POSITIVE_INFINITY,
+      },
+    );
+    assert.equal(result.action, 'reported');
+    const tokens = herdrCalls[0].filter((argument) => argument.startsWith('sub1='));
+    assert.deepEqual(tokens, ['sub1=└─ gp]52;c;QQ==2Jevil ●']);
+    for (const argument of herdrCalls[0]) {
+      assert.doesNotMatch(argument, /[\p{Cc}\p{Cf}]/u);
+    }
+  });
+});
+
+describe('state folder in XDG_RUNTIME_DIR', () => {
+  const baseDependencies = {
+    now: () => 1_000_000,
+    isExecutable: () => true,
+    queryPaneAgentSession: () => null,
+    countClaudeAncestors: () => 1,
+    runHerdr: () => {},
+    deadlineMs: Number.POSITIVE_INFINITY,
+  };
+  const environmentFor = (runtimeDirectory) => ({ HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory });
+
+  test('a subagent-watch folder that is a symlink is not used', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    const elsewhere = createTemporaryDirectory();
+    chmodSync(elsewhere, 0o700);
+    symlinkSync(elsewhere, join(runtimeDirectory, 'subagent-watch'));
+    const result = runHook(startPayloadText, environmentFor(runtimeDirectory), baseDependencies);
+    assert.deepEqual(result, { action: 'skipped', reason: 'unsafe-state-directory' });
+    assert.deepEqual(readdirSync(elsewhere), []);
+  });
+
+  test('review PoC: a world-writable folder with a symlink planted at the old temp name is not written through', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+    mkdirSync(stateDirectory);
+    chmodSync(stateDirectory, 0o777);
+    const victimPath = join(createTemporaryDirectory(), 'victim.txt');
+    writeFileSync(victimPath, 'original\n');
+    symlinkSync(victimPath, join(stateDirectory, `pane-${testPaneId}.json.${process.pid}.tmp`));
+    const result = runHook(startPayloadText, environmentFor(runtimeDirectory), baseDependencies);
+    assert.equal(result.reason, 'unsafe-state-directory');
+    assert.equal(readFileSync(victimPath, 'utf8'), 'original\n');
+  });
+
+  test('a folder owned by another user is not used', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    const result = runHook(startPayloadText, environmentFor(runtimeDirectory), { ...baseDependencies, getUserId: () => process.getuid() + 1 });
+    assert.equal(result.reason, 'unsafe-state-directory');
+  });
+
+  test('prepareStateDirectory accepts only an own, real, 0700 folder', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    assert.equal(prepareStateDirectory(runtimeDirectory, process.getuid()), join(runtimeDirectory, 'subagent-watch'));
+    assert.equal(statSync(join(runtimeDirectory, 'subagent-watch')).mode & 0o777, 0o700);
+    chmodSync(join(runtimeDirectory, 'subagent-watch'), 0o750);
+    assert.equal(prepareStateDirectory(runtimeDirectory, process.getuid()), null);
+    assert.equal(prepareStateDirectory(join(runtimeDirectory, 'missing'), process.getuid()), null);
+    assert.equal(existsSync(join(runtimeDirectory, 'missing')), false, 'XDG_RUNTIME_DIR itself is never created');
+  });
+
+  test('symlinks planted at the old predictable temp names in an own folder are left alone', () => {
+    const runtimeDirectory = createTemporaryDirectory();
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+    mkdirSync(stateDirectory, { mode: 0o700 });
+    const victimPath = join(createTemporaryDirectory(), 'victim.txt');
+    writeFileSync(victimPath, 'original\n');
+    symlinkSync(victimPath, join(stateDirectory, `pane-${testPaneId}.json.${process.pid}.tmp`));
+    symlinkSync(victimPath, join(stateDirectory, `session-${startPayload.session_id}.json.${process.pid}.tmp`));
+    const result = runHook(startPayloadText, environmentFor(runtimeDirectory), baseDependencies);
+    assert.equal(result.action, 'reported');
+    assert.equal(readFileSync(victimPath, 'utf8'), 'original\n');
+    const leftovers = readdirSync(stateDirectory).filter((name) => /\.(lock|tmp)$|\.break-/.test(name) && !name.endsWith(`.${process.pid}.tmp`));
+    assert.deepEqual(leftovers, []);
+  });
+});
+
+describe('session lock', () => {
+  function createLockCase(overrides = {}) {
+    const runtimeDirectory = createTemporaryDirectory();
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+    mkdirSync(stateDirectory, { mode: 0o700 });
+    const lockPath = join(stateDirectory, `session-${startPayload.session_id}.json.lock`);
+    const herdrCalls = [];
+    const dependencies = {
+      now: () => Date.now(),
+      isExecutable: () => true,
+      queryPaneAgentSession: () => null,
+      countClaudeAncestors: () => 1,
+      runHerdr: (binaryPath, argumentList) => {
+        herdrCalls.push(argumentList);
+      },
+      deadlineMs: Date.now() + 400,
+      ...overrides,
+    };
+    const environment = { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory };
+    return { stateDirectory, lockPath, herdrCalls, dependencies, environment };
+  }
+
+  function makeOld(filePath, ageMs) {
+    const old = new Date(Date.now() - ageMs);
+    utimesSync(filePath, old, old);
+  }
+
+  function deadProcessId() {
+    return spawnSync(process.execPath, ['-e', '']).pid;
+  }
+
+  const ownStartTime = readProcessInfo(process.pid).startTime;
+
+  test('the lock holds the pid and start time of its holder while the state is updated', () => {
+    let lockOwner = null;
+    const lockCase = createLockCase({
+      runHerdr: () => {
+        lockOwner = JSON.parse(readFileSync(lockCase.lockPath, 'utf8'));
+      },
+    });
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
+    assert.equal(lockOwner.pid, process.pid);
+    assert.equal(lockOwner.startTime, ownStartTime);
+    assert.equal(typeof lockOwner.createdAtMs, 'number');
+    assert.equal(existsSync(lockCase.lockPath), false);
+  });
+
+  test('a lock whose holder has exited is taken over right away, even when it is brand new', () => {
+    const lockCase = createLockCase();
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const result = runHook(startPayloadText, lockCase.environment, lockCase.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.equal(existsSync(lockCase.lockPath), false);
+  });
+
+  test('a lock held by a live process is never removed: the hook gives up within its budget', () => {
+    const lockCase = createLockCase({ deadlineMs: Date.now() + 300 });
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() }));
+    makeOld(lockCase.lockPath, 5000);
+    const before = statSync(lockCase.lockPath);
+    const startedAtMs = Date.now();
+    const result = runHook(startPayloadText, lockCase.environment, lockCase.dependencies);
+    assert.deepEqual(result, { action: 'skipped', reason: 'lock-timeout' });
+    assert.ok(Date.now() - startedAtMs < 400, `took ${Date.now() - startedAtMs}ms`);
+    assert.equal(statSync(lockCase.lockPath).ino, before.ino);
+    assert.equal(lockCase.herdrCalls.length, 0);
+    rmSync(lockCase.lockPath);
+  });
+
+  test('a reused pid (same pid, different start time) counts as gone', () => {
+    const lockCase = createLockCase();
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: process.pid, startTime: `${ownStartTime}9`, createdAtMs: Date.now() }));
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
+  });
+
+  test('an empty lock from the previous version is stale only after 2 seconds', () => {
+    const fresh = createLockCase({ deadlineMs: Date.now() + 250 });
+    writeFileSync(fresh.lockPath, '');
+    assert.equal(runHook(startPayloadText, fresh.environment, fresh.dependencies).reason, 'lock-timeout');
+    assert.equal(existsSync(fresh.lockPath), true);
+    rmSync(fresh.lockPath);
+
+    const old = createLockCase();
+    writeFileSync(old.lockPath, '');
+    makeOld(old.lockPath, 3000);
+    assert.equal(runHook(startPayloadText, old.environment, old.dependencies).action, 'reported');
+  });
+
+  test('a .break file left by a killed process blocks takeover only until it is 2 seconds old', async () => {
+    const lockCase = createLockCase({ deadlineMs: Date.now() + 250 });
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const breakPath = `${lockCase.lockPath}.break-${statSync(lockCase.lockPath).ino}`;
+    linkSync(lockCase.lockPath, breakPath);
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).reason, 'lock-timeout');
+    await new Promise((resolvePromise) => {
+      setTimeout(resolvePromise, 2100);
+    });
+    const result = runHook(startPayloadText, lockCase.environment, { ...lockCase.dependencies, deadlineMs: Date.now() + 400 });
+    assert.equal(result.action, 'reported');
+    assert.equal(existsSync(breakPath), false);
+    assert.equal(existsSync(lockCase.lockPath), false);
+  });
+
+  // ext4 會把剛釋放的 inode 馬上給下一個新檔，tmpfs 不會：刪掉再建時 inode 同不同由檔案系統決定，兩種都要守住
+  test('review race: a lock judged stale but replaced by a fresh one before the takeover is left alone', () => {
+    const lockCase = createLockCase();
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
+    const staleInode = statSync(lockCase.lockPath).ino;
+    // 另一個 process 在這段時間接管了失效的 lock 並建好自己的
+    rmSync(lockCase.lockPath);
+    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, freshContent);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
+    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
+    rmSync(lockCase.lockPath);
+  });
+
+  // 刪掉再建不保證拿到同一個 inode；就地覆寫內容才能在任何檔案系統上穩定做出「inode 相同、內容不同」的新 lock
+  test('review race: a fresh lock that reuses the stale lock\'s inode is left alone', () => {
+    const lockCase = createLockCase();
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
+    const staleInode = statSync(lockCase.lockPath).ino;
+    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, freshContent);
+    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
+    assert.equal(existsSync(lockCase.lockPath), true, 'the fresh lock on the reused inode must survive');
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
+    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
+    rmSync(lockCase.lockPath);
+  });
+
+  test('only one of two takeovers of the same stale lock succeeds', () => {
+    const lockCase = createLockCase();
+    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(lockCase.lockPath, staleContent);
+    const staleInode = statSync(lockCase.lockPath).ino;
+    const breakPath = `${lockCase.lockPath}.break-${staleInode}`;
+    linkSync(lockCase.lockPath, breakPath);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false, 'someone else holds the .break name');
+    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
+    rmSync(breakPath);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), true);
+    assert.equal(existsSync(lockCase.lockPath), false);
+  });
+
+  test('a takeover without the content it judged stale removes nothing', () => {
+    const lockCase = createLockCase();
+    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
+    const staleInode = statSync(lockCase.lockPath).ino;
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), false);
+    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, null), false);
+    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
+    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
+    rmSync(lockCase.lockPath);
+  });
+
+  test('releasing never deletes another lock that reuses this run\'s inode', () => {
+    const otherContent = JSON.stringify({ pid: process.pid, startTime: `${ownStartTime}9`, createdAtMs: Date.now() });
+    let ownInode = null;
+    const lockCase = createLockCase({
+      runHerdr: () => {
+        ownInode = statSync(lockCase.lockPath).ino;
+        // 等同「這次的 lock 被當成失效接管、別人新建的 lock 拿到同一個 inode」
+        writeFileSync(lockCase.lockPath, otherContent);
+      },
+    });
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
+    assert.equal(existsSync(lockCase.lockPath), true, 'the lock on the reused inode must survive our release');
+    assert.equal(statSync(lockCase.lockPath).ino, ownInode);
+    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), otherContent);
+    rmSync(lockCase.lockPath);
+  });
+
+  test('releasing never deletes a lock that is no longer the one this run created', () => {
+    const lockCase = createLockCase({
+      runHerdr: () => {
+        const replacementPath = `${lockCase.lockPath}.replacement`;
+        writeFileSync(replacementPath, JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() }));
+        renameSync(replacementPath, lockCase.lockPath);
+      },
+    });
+    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
+    assert.equal(existsSync(lockCase.lockPath), true, 'the lock that replaced ours must survive our release');
+    rmSync(lockCase.lockPath);
+  });
+
+  test('lock owners: only positive integer pids are accepted, and a missing process is gone', () => {
+    assert.equal(parseLockOwner(''), null);
+    assert.equal(parseLockOwner(JSON.stringify({ pid: 0 })), null);
+    assert.equal(parseLockOwner(JSON.stringify({ pid: -1 })), null);
+    assert.equal(parseLockOwner(JSON.stringify({ pid: '12' })), null);
+    assert.deepEqual(parseLockOwner(JSON.stringify({ pid: 12, startTime: '34' })), { pid: 12, startTime: '34' });
+    assert.equal(isLockOwnerGone({ pid: deadProcessId(), startTime: null }), true);
+    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: ownStartTime }), false);
+    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: null }), false);
+    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: ownStartTime }, () => ({ state: 'Z', startTime: ownStartTime })), true);
   });
 });

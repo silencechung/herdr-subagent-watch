@@ -43,16 +43,16 @@ Then press `prefix+.` in a pane running Claude Code.
 The `subagent.watch.setup` action edits two of your own config files. The result is shown as a herdr notification; the details (including any snippet you need to paste by hand, and the plugin directory on the `plugin:` line) are in `herdr plugin log list --plugin subagent.watch`.
 
 1. **Claude Code**: in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, adds one entry each to `hooks.SubagentStart` and `hooks.SubagentStop`: `sh "<plugin dir>/bin/run.sh" "<plugin dir>/hooks/sidebar-hook.mjs"` (timeout 5 seconds).
-   - A hook that already points at `sidebar-hook.mjs` is replaced in place, not added twice.
+   - A hook this plugin added earlier (even from an older plugin folder), or the older hand-written form `<absolute node path> <absolute path>/hooks/sidebar-hook.mjs`, is replaced in place, not added twice. Another tool's hook that merely has a file named `sidebar-hook.mjs` does not count.
    - No other hook is touched.
 2. **herdr**: in `$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set. Everything added is wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`.
    - Key binding: a `[[keys.command]]` for `prefix+.` is added only when nothing else uses `prefix+.`. If another action already has it, setup skips it and the log includes a snippet you can use to bind a different key.
    - Sidebar rows: if there is no `[ui.sidebar.agents.rows_by_agent]`, the whole table is added; if the table exists but has no `claude =`, the rows are inserted right below the table header; if you already have your own `claude =` without `$sub1`, it is left alone and the log includes the five lines to paste yourself.
-   - After writing, setup runs `herdr config check`. If it reports new problems, the original file is restored and the error is reported; only when it passes does setup run `herdr server reload-config`.
+   - The new content is first written to a temporary file next to the config file and checked with `herdr config check`. If it reports new problems, the temporary file is deleted and the error is reported (the original file was never touched, so there is nothing to restore); only when it passes is the temporary file `rename`d into place and `herdr server reload-config` run.
 
 Notes:
 
-- Both files are backed up to `<file name>.subagent-watch.bak` in the same folder before being written (only when something actually changes).
+- Before a change, both files are backed up to `<file name>.subagent-watch.bak` in the same folder, **only the first time**: an existing `.bak` is never overwritten, so the earliest original is kept (delete the old `.bak` yourself if you want a fresh one).
 - Idempotent: running it again gives the same result, and nothing is written when everything is already set up.
 - To preview the changes, run `sh bin/run.sh scripts/setup.mjs --dry-run` in the plugin directory. It only prints the changes: no file is written and herdr is not called.
 - The config paths come from `CLAUDE_CONFIG_DIR`, `HERDR_CONFIG_PATH` and `XDG_CONFIG_HOME` in the environment that runs setup; the action runs with the herdr server's environment. If the paths are wrong, run `sh bin/run.sh scripts/setup.mjs` from your own shell in the plugin directory instead.
@@ -132,7 +132,7 @@ herdr plugin uninstall subagent.watch    # if you linked it: herdr plugin unlink
 ```
 
 - Run remove **before** uninstall: after uninstalling, the action no longer exists.
-- `subagent.watch.remove` only removes the hooks in `settings.json` that point at `sidebar-hook.mjs` (an event array left empty is removed entirely) and the content between the markers in `config.toml`. Like setup, it backs up first, runs `herdr config check`, then `herdr server reload-config`.
+- `subagent.watch.remove` only removes this plugin's hooks from `settings.json` (recognized the same way as in setup; an event array left empty is removed entirely) and the content between the markers in `config.toml`. Backups and `herdr config check` work the same way as in setup; then it runs `herdr server reload-config`.
 
 What remove does not touch:
 
@@ -200,7 +200,7 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
 - With mouse reporting on, selecting text by dragging inside the viewer is captured by the viewer, so nothing gets selected. Some terminals let you hold Shift while dragging to get around this; whether that works inside a herdr popup is not verified.
 - When reading the transcript, a summary keeps only its first 20 lines and at most 8000 columns in total (enough to fill 20 lines in a 400-column summary column). In `+N`, each cut original line counts as one line, so the real number of screen lines can be higher when an original line is very long.
 - In narrow windows the summaries stay; the tab bar shows only a few tabs around the selected one, and an arrow at either end turns magenta when tabs are hidden on that side. When a single tab is wider than the space left, only its name is cut (ending in `…`); the status symbol is always visible.
-- Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings, `rows_by_agent` written as an inline table, and so on) are skipped, or rejected by `herdr config check` and restored. In that case paste the snippet from the log by hand.
+- Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings, `rows_by_agent` written as an inline table, and so on) are skipped, or rejected by `herdr config check` (the original file is left untouched, so nothing needs restoring). In that case paste the snippet from the log by hand.
 - If the plugin directory path contains `"`, `$`, `` ` `` or `\`, setup does not write the hooks (they would break the shell command); set them up by hand.
 
 ## Development

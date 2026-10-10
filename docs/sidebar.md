@@ -43,7 +43,17 @@ The hook process inherits Claude Code's environment variables: `HERDR_PANE_ID` (
   - A `SubagentStart` for a sub agent that is still in the list keeps a single entry (with its original start order); a `SubagentStart` for one that has already been removed (resume) adds it again at the end.
 - `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads. **The contract is fixed**: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`.
 
-Both are written to a temporary file and then `rename`d, so the viewer never reads half-written JSON. Read-modify-write for one session is serialized with `session-<id>.json.lock` (`open` with the `wx` flag), so starting several sub agents in parallel loses no data; a lock held for more than 2 seconds is treated as stale.
+Before writing, the hook checks the `subagent-watch` folder: it must belong to your uid, must not be a symlink, and must have mode `0700`. Otherwise nothing is written (and `XDG_RUNTIME_DIR` itself is never created when it is missing).
+
+Both files are written to a temporary file and then `rename`d, so the viewer never reads half-written JSON. The temporary file has a random name and is created with `wx`, so a symlink planted in advance cannot redirect the write to another file.
+
+Read-modify-write for one session is serialized with `session-<id>.json.lock`, so starting several sub agents in parallel loses no data:
+
+- The lock holds the pid of its holder, its start time (field 22 of `/proc/<pid>/stat`) and when it was created. It is written to a temporary file first and then `link`ed into place (like `wx`, this only succeeds when the lock does not exist), so nobody reads a half-written lock.
+- A lock is stale when `process.kill(pid, 0)` finds no such process, the process is a zombie, or the pid now belongs to a process with a different start time (pid reuse). An empty lock left by an older version has no pid and becomes stale after 2 seconds; any lock older than 10 seconds is stale (a safety net for when the pid check cannot be trusted; the hook itself finishes in under 1 second).
+- A lock is identified by its inode together with its content (pid, start time, creation time). The inode alone is not enough: file systems such as ext4 hand a just-freed inode to the next new file, so a fresh lock created right after a stale one is removed can get the same inode. If the content cannot be read, the lock is not removed.
+- Taking over: the hook first claims the name `<lock>.break-<inode>` with `link`, and only removes the lock if it got that name and the lock it reads back through that name is still the inode and content it judged stale. It never removes a fresh lock someone else just created. A `.break-*` file left by a process killed in between is cleared once it is 2 seconds old.
+- On release, the lock is removed only if it is still the inode and content this run created.
 
 ### Reporting to herdr
 
@@ -58,8 +68,9 @@ When the last running sub agent ends, all five tokens are cleared with `--clear-
 - Only one source, `subagent.watch`, is used: herdr allows at most 32 sequenced sources per pane for its whole lifetime, and clearing one does not give it back.
 - `--seq` is `Date.now()`; for several events in the same millisecond it uses "previous + 1", so it always increases (herdr ignores an older seq).
 - Order: by start time. With more than 5 running, the fifth line becomes `└─ +N more`, where N counts only running sub agents that are not listed.
-- herdr limits a token to 80 characters and strips control characters: an `agent_type` that is too long is truncated with `…`, so `●` always stays at the end of the line.
-- herdr is called through `HERDR_BIN_PATH`; only when that is missing is `herdr` looked up on `PATH`.
+- herdr limits a token to 80 characters and strips control characters. The hook first removes control characters (`\p{Cc}`) and format characters (`\p{Cf}`, such as the bidi controls U+202A–202E and U+2066–2069 and the zero-width characters U+200B–200F), so an `agent_type` cannot reverse or hide text in the sidebar; one that is too long is truncated with `…`, so `●` always stays at the end of the line.
+- herdr is called through `HERDR_BIN_PATH`; only when that is missing is `herdr` looked up on `PATH`, and only in absolute `PATH` entries: an empty entry or a relative one such as `node_modules/.bin` is relative to the current folder, which is the repo the user has open, and a `herdr` placed there must never run. `open-action.mjs`, `scripts/setup.mjs` and the notification in `bin/run.sh` follow the same rule.
+- `bin/run.sh` goes further: before running any other command it drops empty and relative entries from `PATH` and exports the cleaned value, so `dirname`, `sed`, `sort`, `tail`, `cut` and the `node` it `exec`s are never taken from the current folder either. If no entry is left it uses `/usr/bin:/bin`, because bash (the `sh` on Fedora-based systems) treats an empty `PATH` as the current folder.
 
 ### Designed not to disturb Claude sessions
 
@@ -70,12 +81,22 @@ The hook is global and applies to every Claude session:
 - When `bin/run.sh` cannot find Node.js 22+, it always exits 0 silently for this hook (the other entry points print an error).
 - Events with an empty `agent_type` are skipped: Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`.
 - A `SubagentStop` without a matching `SubagentStart` seen earlier is skipped.
-- Two or more `claude` processes among the ancestors (for example the claude in the pane running `claude -p` through Bash) → skipped. Child processes inherit the same `HERDR_PANE_ID`; without this check they would overwrite the main session's tree and mapping file.
+- The `subagent-watch` folder is not yours, is a symlink, or is not `0700` → nothing is written.
+- Events from another Claude session in the same pane are skipped (for example the claude in the pane running `claude -p` through Bash). Child processes inherit the same `HERDR_PANE_ID`; without this check they would overwrite the main session's tree and mapping file. How it decides:
+  - It first counts the groups of `claude` processes among its ancestors. `claude` processes that are direct parent and child count as one group, so a wrapper script named claude that does not `exec` is still one group; commands run by the Bash tool always sit behind a shell, so a nested `claude -p` counts as a second group.
+  - One group (or none) → the event is accepted and herdr is not asked.
+  - Two or more groups → it asks `herdr pane get <pane>` for `agent_session` (reported by herdr's claude integration): only an event whose `session_id` matches updates the sidebar; a different session, a session of another agent, or no answer is skipped. It waits at most 300 ms and never eats into the minimum budget for reporting to herdr.
+  - herdr's `agent_session` alone never rejects an event, because it can be stale (see Known limitations).
 
 ### Known limitations
 
 - If a session ends or switches to another session while sub agents are still running, the old tree lines stay until the next sub agent event in that pane overwrites them (only `SubagentStart` / `SubagentStop` are hooked, not `SessionStart` / `SessionEnd`).
 - If a sub agent's `SubagentStop` is missed (for example the hook gives up on the event after waiting too long for the lock), its line does not go away by itself within the same session (it is removed only when that sub agent gets another `SubagentStop`); after switching sessions, the next sub agent event overwrites it.
+- herdr's `agent_session` can be stale: after the herdr server restarts it can stay on the session restored from `session.json`, the one from before the restart, and later `startup` reports from Claude Code do not overwrite it (seen with herdr 0.9.3; in the same test a `resume` report did not overwrite it either, for an unknown reason). So the hook does not rely on it to tell which session is the pane's main one, and only asks herdr when the ancestor scan finds two or more groups of `claude`. What is still not caught:
+  - A nested `claude -p --resume` / `claude -p -c`: if herdr accepts its report and makes it the pane's `agent_session`, its events are treated as the main session's.
+  - `exec claude -p`, or an `sh -c 'claude -p …'` that runs only that one command (for example a hook whose command is itself `claude -p …`; sh then execs into claude): the nested claude is a direct child of the main claude and counts as the same group, so it is taken as the main session and its events are accepted. How Claude Code actually starts the hook process is not verified.
+  - When Claude Code is installed through npm and its process name is `node` rather than `claude`, the ancestor scan finds 0 groups and every event is accepted, nested ones included (not verified).
+- The `sh` at the start of the hook command is looked up by Claude Code through your `PATH` before `bin/run.sh` runs, so the `PATH` cleanup in `bin/run.sh` does not cover it.
 - `●` and `─` are ambiguous width characters; their actual width depends on the terminal settings.
 
 ## What setup adds
@@ -100,6 +121,15 @@ Under `hooks` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (other settings
 ```
 
 `<plugin dir>` is the absolute path of the plugin when setup runs (the managed checkout from `herdr plugin install`, or the folder given to `herdr plugin link`). node is not written into the command; `bin/run.sh` looks it up every time.
+
+Setup and remove recognize their own hook by the whole `command`: it must be exactly the form above (`run.sh` and `hooks/sidebar-hook.mjs` under the same absolute plugin folder), or the older hand-written form from before the launcher, `<absolute node path> <absolute path>/hooks/sidebar-hook.mjs` (setup upgrades it in place). Another tool's hook that merely has a file named `sidebar-hook.mjs` is neither changed nor removed. None of the hook fields listed in the official Claude Code hooks docs can carry an identifier, so the command is the only thing to compare.
+
+How the files are written:
+
+- Before a change, each file is backed up to `<file name>.subagent-watch.bak` in the same folder, **only the first time**: an existing `.bak` is never overwritten, so the earliest original is kept (delete the old `.bak` yourself if you want a fresh one).
+- When a config file is a symlink (for example into a dotfiles repo), the real file it points to is written and the symlink stays; a symlink to a missing file is reported and left alone. Only the file itself counts: a symlinked folder on the way (such as `/home` → `/var/home` on Bazzite) is not reported.
+- The new `config.toml` is first written to a temporary file next to the real file and checked with `herdr config check` through `HERDR_CONFIG_PATH`; only when that passes is it `rename`d into place. If the check fails the temporary file is deleted and the original was never touched, so there is nothing to restore.
+- `settings.json` keeps its indentation, line endings (CRLF stays CRLF) and trailing newline; remove does not write the file when there is nothing to remove.
 
 Added to `config.toml` (`$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set), each block wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`:
 
@@ -133,7 +163,7 @@ Older versions of setup also wrote `rules = [{ contains = "✓", bold = false }]
 
 ## How to remove
 
-1. Run `herdr plugin action invoke subagent.watch.remove` (or `sh bin/run.sh scripts/setup.mjs --remove`): it removes the hooks in `settings.json` that point at `sidebar-hook.mjs` and the content between the markers in `config.toml`, then runs `herdr server reload-config`.
+1. Run `herdr plugin action invoke subagent.watch.remove` (or `sh bin/run.sh scripts/setup.mjs --remove`): it removes this plugin's hooks from `settings.json` (recognized as described in "What setup adds") and the content between the markers in `config.toml`, then runs `herdr server reload-config`.
 2. Settings added by hand without markers have to be removed yourself: in `settings.json`, delete the entry whose `command` points at `sidebar-hook.mjs` (if the array becomes empty, remove the whole key); in `config.toml`, delete the `[[keys.command]]` block for `prefix+.` and `$sub1`…`$sub5` from the `claude` rows, then run `herdr server reload-config`.
 3. Clear tokens left on panes (run once for each pane that has claude):
 
@@ -147,7 +177,7 @@ Older versions of setup also wrote `rules = [{ contains = "✓", bold = false }]
 ## Tests
 
 ```
-node --test test/sidebar*.test.mjs
+node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-Covers payload parsing, state updates (stop removes the entry, a stop without a seen start is skipped, old `done` entries are dropped), tree lines (start two → stop one leaves `└─` → stop all clears everything, `+N more` counts only running ones, 80-character truncation), increasing seq, staying silent outside herdr, falling back to herdr on `PATH` when `HERDR_BIN_PATH` is missing, skipping nested `claude -p`, no data loss with parallel starts, and running the script for real with a fake herdr executable (checking exit 0, empty stdout, and finishing within 1 second).
+Covers payload parsing, state updates (stop removes the entry, a stop without a seen start is skipped, old `done` entries are dropped), tree lines (start two → stop one leaves `└─` → stop all clears everything, `+N more` counts only running ones, 80-character truncation, bidi and zero-width characters removed), increasing seq, staying silent outside herdr, falling back to herdr on `PATH` when `HERDR_BIN_PATH` is missing (relative `PATH` entries excluded), `bin/run.sh` running no tool from a relative `PATH` entry, deciding the pane session (one `claude` ancestor updates even when herdr reports a stale `agent_session`, a wrapper named claude still updates, a nested `claude -p` is skipped unless herdr reports its session, tested with a real process tree), the state folder checks (symlink, mode, owner, planted symlinks), the lock (stale detection, taking over or releasing without removing someone else's fresh lock, even one that got the same inode, several hooks racing for one stale lock lose no data), no data loss with parallel starts, and running the script for real with a fake herdr executable (checking exit 0, empty stdout, and finishing within 1 second).

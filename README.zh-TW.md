@@ -22,14 +22,14 @@ herdr plugin action invoke subagent.watch.setup
 `subagent.watch.setup` 會改兩個使用者自己的設定檔，結果用 herdr 通知顯示，細節（包含要手動貼的片段）在 `herdr plugin log list --plugin subagent.watch`：
 
 1. Claude Code：`${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks.SubagentStart`、`hooks.SubagentStop` 各加一筆 `sh "<plugin 目錄>/bin/run.sh" "<plugin 目錄>/hooks/sidebar-hook.mjs"`（timeout 5 秒）。
-   - 已經有指向 `sidebar-hook.mjs` 的 hook 就原地換成新的寫法，不重複加。
+   - 本 plugin 之前加的 hook（plugin 目錄換過也算），或手動加的舊寫法 `<node 絕對路徑> <絕對路徑>/hooks/sidebar-hook.mjs`，會原地換成新的寫法，不重複加；別的工具的 hook 只是檔名剛好叫 `sidebar-hook.mjs` 不算。
    - 其他 hook 一個都不動。
 2. herdr：`$HERDR_CONFIG_PATH`，沒設就是 `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml`。加的內容都包在 `# >>> subagent.watch` ／ `# <<< subagent.watch` 之間。
    - 快捷鍵：沒有任何東西用 `prefix+.` 才加 `[[keys.command]]`；已被別的動作佔用就跳過，log 裡附上可以改成別的鍵的片段。
    - 側邊欄：沒有 `[ui.sidebar.agents.rows_by_agent]` 就整段加上；有這個表但沒有 `claude =` 就插在表頭下一行；已經有自己的 `claude =` 而且沒有 `$sub1` 就不動，log 裡附上要自己貼進去的五行。
-   - 寫完跑 `herdr config check`：多出新的問題就還原原檔並回報錯誤；通過才 `herdr server reload-config`。
+   - 新內容先寫成設定檔旁邊的暫存檔，跑 `herdr config check`：多出新的問題就刪掉暫存檔並回報錯誤（原檔完全沒動過，不需要還原）；通過才把暫存檔 `rename` 過去，再 `herdr server reload-config`。
 
-- 兩個檔案寫入前都會備份成同資料夾的 `<檔名>.subagent-watch.bak`（每次真的有改才備份）。
+- 兩個檔案改動前都備份成同資料夾的 `<檔名>.subagent-watch.bak`，**只備份第一次**：`.bak` 已經存在就不覆寫，保留最早的原始檔（想重新備份就自己刪掉舊的 `.bak`）。
 - 跑幾次結果都一樣；已經設定好就不會再寫檔。
 - 先看會改什麼：在 plugin 目錄跑 `sh bin/run.sh scripts/setup.mjs --dry-run`，只印出改動，不寫檔、不呼叫 herdr。
 - 設定檔路徑看的是執行 setup 那個環境的 `CLAUDE_CONFIG_DIR`、`HERDR_CONFIG_PATH`、`XDG_CONFIG_HOME`；action 用的是 herdr server 的環境。路徑不對時，改在自己的 shell 進 plugin 目錄跑 `sh bin/run.sh scripts/setup.mjs`。
@@ -43,7 +43,7 @@ herdr plugin uninstall subagent.watch    # link 的話用 herdr plugin unlink su
 ```
 
 - 要先跑 remove 再 uninstall：uninstall 之後就沒有這個 action 了。
-- remove 只拿掉 `settings.json` 裡指向 `sidebar-hook.mjs` 的 hook（event 陣列空了就整個 key 拿掉）和 `config.toml` 裡 marker 之間的內容，同樣先備份、跑 `herdr config check`、`herdr server reload-config`。
+- remove 只拿掉 `settings.json` 裡本 plugin 的 hook（認法跟 setup 一樣；event 陣列空了就整個 key 拿掉）和 `config.toml` 裡 marker 之間的內容；備份與 `herdr config check` 的做法跟 setup 一樣，最後 `herdr server reload-config`。
 - 不在 marker 裡、手動加的設定不會被刪，log 會列出行號。
 - 側邊欄已經顯示的樹狀行會留到那個 pane 下次回報或 herdr 重開；要馬上清掉見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md#怎麼移除) 的「怎麼移除」。
 
@@ -172,5 +172,5 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 - 開了 mouse reporting，在 viewer 裡用滑鼠拖曳選字會被 viewer 吃掉、選不到字。部分 terminal 按住 Shift 拖曳可以繞過，herdr popup 裡是否可行未驗證。
 - 摘要在讀 transcript 時只留前 20 行、總寬度 8000 欄（夠在 400 欄寬的摘要欄折滿 20 行）；被截掉的部分在 `+N` 裡每個原始行算一行，原始行很長時實際會更多。
 - 視窗窄時摘要照樣保留，tab 列只顯示選取的 tab 附近幾個，兩端箭頭變 magenta 代表那一側還有藏起來的 tab；單一 tab 比剩下的寬度還寬時只截名稱（結尾 `…`），狀態符號一定看得到。
-- setup 沒有 TOML parser，只做逐行文字處理：看不懂的寫法（多行字串、inline table 形式的 `rows_by_agent` 等）會跳過或被 `herdr config check` 擋下還原，這時照 log 的片段手動貼。
+- setup 沒有 TOML parser，只做逐行文字處理：看不懂的寫法（多行字串、inline table 形式的 `rows_by_agent` 等）會跳過或被 `herdr config check` 擋下（原檔完全沒動過，不需要還原），這時照 log 的片段手動貼。
 - plugin 目錄路徑含 `"`、`$`、`` ` ``、`\` 時 setup 不會寫 hook（會破壞 shell command），要手動設定。
