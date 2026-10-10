@@ -16,7 +16,7 @@ claude
 
 1. Claude Code 啟動／結束 sub agent 時觸發 `SubagentStart`／`SubagentStop` hook，執行 `hooks/sidebar-hook.mjs`，payload 從 stdin 進來。
 2. hook 更新狀態檔，再呼叫 `herdr pane report-metadata` 把樹狀行寫進 pane token `sub1`…`sub5`。
-3. `config.toml` 的 `rows_by_agent.claude` 多了 `["$sub1"]`…`["$sub5"]` 五行；herdr 文件寫明沒回報的 token 會讓那一行整行消失，所以平常看不到空行（畫面上實際效果尚待使用者確認）。
+3. `config.toml` 的 `rows_by_agent.claude` 多了 `$sub1`…`$sub5` 五行；herdr 文件寫明沒回報的 token 會讓那一行整行消失，所以平常看不到空行（畫面上實際效果尚待使用者確認）。
 
 ### hook 輸入（2026-10-10 用 `claude -p` 2.1.296 實測）
 
@@ -103,15 +103,20 @@ description = "sub agent viewer"
 claude = [
   ["state_icon", "machine", "workspace", "tab"],
   ["agent"],
-  ["$sub1"],
-  ["$sub2"],
-  ["$sub3"],
-  ["$sub4"],
-  ["$sub5"],
+  [{ token = "$sub1", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub2", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub3", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub4", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub5", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
 ]
 ```
 
 前兩行是 herdr 文件裡的預設 rows（使用者原本沒有自訂 `[ui.sidebar.agents]`）。`rows_by_agent` 會整個取代 `rows`，不是接在後面，所以預設的兩行要寫進來。
+
+`$sub*` 用 inline style table 加 `rules`，只用粗細區分狀態：跑中（`●`）`bold`，結束（`✓`，`contains = "✓"` 那條 rule）不 `bold`。
+
+- 不指定 `fg`：顏色全部跟著 herdr theme，換 theme 或別人拿去用都不用改這五行。
+- `dim = false`：herdr 文件寫明沒寫的欄位沿用 token 的 contextual style，明確寫 `false` 才會拿掉那個修飾，這裡確保樹狀行不會被畫成 dim。
 
 ## 怎麼移除
 

@@ -23,12 +23,28 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 | 按鍵 | 作用 |
 | --- | --- |
 | `←` / `→` | 切換 tab（循環） |
+| `↑` / `↓` | 捲一行 |
+| `PgUp` / `PgDn` | 捲一頁 |
+| `Home` | 捲到最舊 |
+| `End` | 回到最新、恢復 follow |
+| 滑鼠滾輪 | 一次捲 3 行（見下面的限制） |
 | `q` / `Esc` / `Ctrl+C` | 關閉 |
 
-- tab 列：`●` 跑中、`✓` 結束，不帶數字，沒有 1–9 直跳。結束的 tab 留著。
+- tab 列長這樣：`2 running · 3 done │ ◀ [● Explore] [● general-purpose] [✓ claude-code-guide] ▶`
+  - 顏色跟著 terminal theme：只用 bold、dim、reverse 和 ANSI 16 色，不寫死任何色碼。
+  - 最左邊固定是跑中／結束數量摘要，跑中數字是 ANSI magenta，其餘 dim。
+  - 狀態符號在每個 tab 最前面：`●` 跑中（預設字色＋magenta `●`）、`✓` 結束（整個 dim）。選取的 tab 是 reverse video＋bold。
+  - tab 本身不帶編號，沒有 1–9 直跳。結束的 tab 留著，順序照啟動時間，狀態改變不會重排。
+  - 不是 TTY（`--once` 導到檔案或 pipe）時輸出同樣結構的純文字。
 - tab 名稱用 meta 的 `agentType`；同一個 type 出現多次時接 `description` 片段區分。
 - 新的 `agent-*.jsonl` 出現就即時多一個 tab（`fs.watch` 監看 `subagents/`，每秒 polling 備援）。第一次有 tab 時選最新的跑中 sub，之後選取跟著 agent 走，新 tab 不會搶走目前看的。
-- 事件一行一個：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。超出高度捲到最新，resize 會重畫。
+- 事件一行一個：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。resize 會重畫。
+- 捲動：每個 sub 的事件整份留著（不限筆數，開啟時從頭讀整個 transcript），可以捲回最舊的一行。
+  - 預設 follow：新事件進來自動捲到最新。
+  - 往上捲就暫停 follow，底部提示列最前面顯示 `↓ N new`（暫停後新進來的行數）；按 `End` 或捲回最底恢復 follow。
+  - 每個 tab 各自記住捲動位置，切 tab 不會影響其他 tab。
+  - 底部提示列：`<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`，視窗窄時自動縮短。
+- 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、未預期的例外都會關）。
 - 還沒有 sub 時顯示 `No sub agents yet in this session`；完全找不到 session 時顯示 `No Claude Code session found for this pane` 和每一步失敗的原因。
 
 ## 怎麼找到 pane 對應的 session
@@ -78,6 +94,8 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 
 ## 已知限制
 
-- `◀ ▶ ● ✓ ─ …` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
+- `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
+- herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。
+- 開了 mouse reporting，在 viewer 裡用滑鼠拖曳選字會被 viewer 吃掉、選不到字。部分 terminal 按住 Shift 拖曳可以繞過，herdr popup 裡是否可行未驗證。
 - `SubagentHandback` 這類長 tool 名稱會把該行的參數往右推，不對齊。
-- 視窗窄時 tab 列只顯示選取的 tab 附近幾個，兩端箭頭變紫色代表那一側還有藏起來的 tab。
+- 視窗窄時摘要照樣保留，tab 列只顯示選取的 tab 附近幾個，兩端箭頭變 magenta 代表那一側還有藏起來的 tab；單一 tab 比剩下的寬度還寬時只截名稱（結尾 `…`），狀態符號一定看得到。

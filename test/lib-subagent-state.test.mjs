@@ -84,3 +84,13 @@ test('duplicate tool_use ids are only shown once', () => {
   applyRecord(state, toolUseRecord(1, 't1', 'Bash', { command: 'ls' }));
   assert.equal(state.events.length, 1);
 });
+
+test('every event is kept so the viewer can scroll back through the whole transcript', () => {
+  const state = freshState();
+  for (let index = 0; index < 2500; index += 1) {
+    applyRecord(state, toolUseRecord(index, `t${index}`, 'Bash', { command: `step ${index}` }));
+  }
+  assert.equal(state.events.length, 2500);
+  assert.equal(state.events[0].summary, 'step 0');
+  assert.equal(state.events.at(-1).summary, 'step 2499');
+});

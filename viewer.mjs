@@ -2,7 +2,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { createDemoSource } from './lib/demo.mjs';
 import { createKeyDecoder } from './lib/keys.mjs';
-import { ansi, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage } from './lib/render.mjs';
+import { ansi, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
+import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { defaultHerdrBinPath, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
 import { createSessionWatcher, getSessionPaths } from './lib/watcher.mjs';
@@ -87,6 +88,7 @@ function createController({ options, environment, onChange }) {
   let source = null;
   let selectedAgentId = null;
   let lastResolveAttemptMs = 0;
+  const scrollStatesByAgentId = new Map();
 
   function attachSource(nextSession) {
     const previousPath = session?.transcriptPath ?? null;
@@ -97,6 +99,7 @@ function createController({ options, environment, onChange }) {
     source?.stop();
     source = null;
     selectedAgentId = null;
+    scrollStatesByAgentId.clear();
     if (session.transcriptPath !== null) {
       source = createSessionWatcher({ transcriptPath: session.transcriptPath, onChange });
     }
@@ -155,6 +158,15 @@ function createController({ options, environment, onChange }) {
     return index;
   }
 
+  function getScrollState(agentId) {
+    let scrollState = scrollStatesByAgentId.get(agentId);
+    if (scrollState === undefined) {
+      scrollState = createScrollState();
+      scrollStatesByAgentId.set(agentId, scrollState);
+    }
+    return scrollState;
+  }
+
   return {
     start() {
       source?.start();
@@ -184,13 +196,27 @@ function createController({ options, environment, onChange }) {
       selectedAgentId = tabs[(index + step + tabs.length) % tabs.length].agentId;
       return true;
     },
+    // 回傳 key 是不是捲動鍵；只動目前選取的 tab，其他 tab 的位置各自留著
+    scroll(key, height) {
+      const tabs = getTabs(Date.now());
+      if (tabs.length === 0) {
+        return false;
+      }
+      const tab = tabs[getSelectedIndex(tabs)];
+      return applyScrollKey(getScrollState(tab.agentId), key, tab.events.length, getBodyHeight(height));
+    },
     buildLines(width, height, useColor) {
       const nowMs = Date.now();
       const tabs = getTabs(nowMs);
       const selectedIndex = getSelectedIndex(tabs);
       const hasSession = options.isDemo || (session !== null && session.transcriptPath !== null);
       const messages = hasSession ? [emptySessionMessage] : [unresolvedMessage, ...(session?.notes ?? [])];
-      return buildFrame({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages });
+      let scrollView = null;
+      if (tabs.length > 0) {
+        const tab = tabs[selectedIndex];
+        scrollView = resolveScrollView(getScrollState(tab.agentId), tab.events.length, getBodyHeight(height));
+      }
+      return buildFrame({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages, scrollView });
     },
   };
 }
@@ -244,7 +270,8 @@ function runInteractive(controller, setOnChange) {
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false);
     }
-    process.stdout.write(ansi.reset + ansi.showCursor + ansi.leaveAlternateScreen);
+    // mouse reporting 沒關的話，離開後 shell 會收到一堆滾輪／點擊的 escape sequence
+    process.stdout.write(ansi.disableMouse + ansi.reset + ansi.showCursor + ansi.leaveAlternateScreen);
   }
 
   function shutdown(exitCode) {
@@ -267,6 +294,10 @@ function runInteractive(controller, setOnChange) {
     }
     if (key === 'right' && controller.moveSelection(1)) {
       render();
+      return;
+    }
+    if (controller.scroll(key, process.stdout.rows || defaultHeight)) {
+      render();
     }
   });
 
@@ -283,7 +314,7 @@ function runInteractive(controller, setOnChange) {
     process.exit(1);
   });
 
-  process.stdout.write(ansi.enterAlternateScreen + ansi.hideCursor);
+  process.stdout.write(ansi.enterAlternateScreen + ansi.hideCursor + ansi.enableMouse);
   process.stdin.setRawMode(true);
   process.stdin.on('data', (chunk) => {
     keyDecoder.feed(chunk);

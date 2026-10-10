@@ -104,3 +104,9 @@ test('parseTaskNotifications reads agent id and terminal status from the main tr
   assert.deepEqual(parseTaskNotifications(running), []);
   assert.deepEqual(parseTaskNotifications('{"type":"user"}'), []);
 });
+
+test('a very long summary is cut to a bounded width', () => {
+  const summary = summarizeToolInput('Bash', { command: `cat <<'EOF'\n${'x'.repeat(5000)}\nEOF` });
+  assert.equal(summary.length, 1000);
+  assert.ok(summary.startsWith("cat <<'EOF' xxx"));
+});
