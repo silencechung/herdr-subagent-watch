@@ -528,7 +528,9 @@ test('--once strips every escape sequence, C1 control and bidi character that ca
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, foreignControlPattern);
   assert.match(result.stdout, /\[● Exp click\]/);
-  assert.match(result.stdout, /Bash {8}echo {3}red/);
+  // 8-bit CSI（U+009B）只剝它自己，後面的 2J、31m 是普通文字
+  assert.match(result.stdout, /Bash {8}echo {3}2J red/);
+  assert.match(result.stdout, /\[● general-purpose: 31mevil\]/);
   assert.match(result.stdout, /session aaaaaaaa/);
 });
 
@@ -546,6 +548,28 @@ test('--once that fails prints a sanitized error to stderr and exits 1', () => {
   });
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /stdout broke/);
+  assert.doesNotMatch(result.stderr, foreignControlPattern, JSON.stringify(result.stderr.match(foreignControlPattern)?.[0]));
+});
+
+test('--once whose cleanup throws prints a sanitized error to stderr and exits 1', () => {
+  // 用 --import 預載：watcher 關掉資料夾監看時丟例外，stop() 會在畫面印出後丟出來
+  const preloadPath = path.join(temporaryRoot, 'throwing-watch-close.mjs');
+  fs.writeFileSync(preloadPath, `import fs from 'node:fs';
+const realWatch = fs.watch;
+fs.watch = (...argumentList) => {
+  const watcher = realWatch(...argumentList);
+  watcher.close = () => {
+    throw new Error('close broke \\u001b]52;c;cHduZWQ=\\u0007 \\u009b2J \\u202eevil');
+  };
+  return watcher;
+};
+`);
+  const result = runViewer(['--once', '--session', copyFixtureSession()], {
+    environment: isolatedEnvironment({ NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` }),
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /\[● Explore\]/);
+  assert.match(result.stderr, /close broke/);
   assert.doesNotMatch(result.stderr, foreignControlPattern, JSON.stringify(result.stderr.match(foreignControlPattern)?.[0]));
 });
 
@@ -642,7 +666,7 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const pty = startInPty(['--session', writeHostileSession('hostile-pty')]);
     try {
       await pty.waitForOutput(/\[● Exp click\]/);
-      await pty.waitForOutput(/echo {3}red/);
+      await pty.waitForOutput(/echo {3}2J red/);
       pty.send('q');
       assert.equal(await pty.exited, 0);
       const ownSequencePattern = /\x1b\[(?:[0-9;]*m|H|2K|2J|\?25[hl]|\?1049[hl]|\?100[06][hl])/g;
@@ -659,9 +683,8 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const pty = startInPty([], { columns: 160, environment: popupEnvironment(herdr.binPath, sessions) });
     try {
       await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'first session');
+      // herdr 回報的值變了就換，不看 transcript 寫入時間
       fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, secondSessionId)));
-      // 換過去的 session 正在寫 transcript；viewer 只換到寫得比現在的更近的 session（tmpfs 上剛複製的兩個檔 mtime 常常一樣）
-      appendUserLine(path.join(sessions.projectDirectory, `${secondSessionId}.jsonl`), 'resumed');
       const screen = await pty.waitForScreen((lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 ─/.test(line)), 'second session');
       assert.doesNotMatch(screen[0], /Explore/);
       pty.send('q');
@@ -722,6 +745,47 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
       assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
       // herdr 與 pane map 說法不同時，狀態列看得出來
       assert.ok(screen.some((line) => /session 22222222 · herdr says session 22222222, pane map says 11111111/.test(line)), screen.join('\n'));
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('a stale pane map naming a session another pane keeps writing does not make the screen flap', { timeout: 30_000 }, async () => {
+    const sessions = writeTwoSessions('stale-writer');
+    // pane map 停在 fixture session，而 fixture session 在別的 pane 被 \`claude -c\` 接著寫；herdr 正確回報第二個 session
+    const olderDate = new Date(Date.now() - 60_000);
+    const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
+    const secondTranscriptPath = path.join(sessions.projectDirectory, `${secondSessionId}.jsonl`);
+    fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
+    const runtimeDirectory = path.join(temporaryRoot, 'stale-writer-runtime');
+    fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
+    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
+      sessionId: fixtureSessionId,
+      transcriptPath: fixtureTranscriptPath,
+      cwd: sessions.workDirectory,
+      updatedAtMs: olderDate.getTime(),
+    }));
+    const herdr = writeScriptedHerdr('stale-writer-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
+    const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
+    const pty = startInPty([], { columns: 160, environment });
+    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
+    try {
+      await pty.waitForScreen(isSecondSession, 'second session');
+      // 每次查詢之間輪流寫兩個 transcript：下一次查詢時，剛寫的那個 mtime 一定比較新
+      for (let round = 0; round < 4; round += 1) {
+        const finishedLookups = countFinishedLookups();
+        appendUserLine(round % 2 === 0 ? fixtureTranscriptPath : secondTranscriptPath, `round ${round}`);
+        await waitUntil(() => countFinishedLookups() > finishedLookups, `lookup after round ${round}`, 10_000);
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 300);
+      });
+      const screen = pty.getScreenLines();
+      assert.ok(isSecondSession(screen), screen.join('\n'));
+      assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
       pty.send('q');
       assert.equal(await pty.exited, 0);
     } finally {

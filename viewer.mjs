@@ -5,7 +5,7 @@ import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder } from './lib/keys.mjs';
 import { ansi, buildEventLayout, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
-import { describeNonClaudePane, parseContextJson, resolveSession, shouldReplaceSession } from './lib/session.mjs';
+import { chooseSession, describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
 import { sanitizeMultilineText, sanitizeText } from './lib/text.mjs';
 import { createSessionWatcher, getSessionPaths } from './lib/watcher.mjs';
@@ -93,6 +93,8 @@ function describeSession(session) {
 
 function createController({ options, environment, onChange }) {
   let session = null;
+  // herdr、pane map 上一次查詢成功時回報的 session：已經接上 session 之後，只有來源的值變了才換（見 chooseSession）
+  let lastSeenSessionIds = { herdr: null, paneMap: null };
   let source = null;
   let selectedAgentId = null;
   let lastResolveAttemptMs = 0;
@@ -122,14 +124,19 @@ function createController({ options, environment, onChange }) {
   }
 
   function applyResolvedSession(nextSession) {
-    if (isStopped || !shouldReplaceSession(session, nextSession)) {
+    if (isStopped) {
       return;
     }
-    attachSource(nextSession);
+    const choice = chooseSession(session, nextSession, { lastSeenSessionIds });
+    lastSeenSessionIds = choice.lastSeenSessionIds;
+    if (choice.session === session) {
+      return;
+    }
+    attachSource(choice.session);
     onChange();
   }
 
-  // 已經接上 session 時，查詢失敗的結果不會取代它（shouldReplaceSession），錯誤只能另外顯示在狀態列
+  // 已經接上 session 時，查詢失敗的結果不會取代它（chooseSession），錯誤只能另外顯示在狀態列
   // 狀態列是固定位置、同一個訊息不重畫：每 2 秒重試失敗也不會洗版；下一次查詢成功就清掉
   function setLookupError(message) {
     if (isStopped || message === lookupError) {
@@ -432,9 +439,10 @@ function main() {
     },
   });
   if (options.isOnce) {
+    // stop() 丟的例外也要接住，和 runOnce 失敗一樣處理
     runOnce(controller).then(() => {
       controller.stop();
-    }, (error) => {
+    }).catch((error) => {
       // 不能交給 Node 預設的 unhandled rejection 輸出：會把錯誤訊息原樣印出，訊息可能夾著 transcript 或路徑裡的 escape
       process.stderr.write(`${sanitizeMultilineText(String(error?.stack ?? error))}\n`);
       process.exit(1);

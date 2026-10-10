@@ -5,6 +5,7 @@ import path from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  chooseSession,
   describeNonClaudePane,
   encodeProjectDirectoryName,
   findLatestTranscript,
@@ -297,7 +298,12 @@ test('resolveSession hands its abort signal to the herdr command', async () => {
   assert.equal(receivedSignal, abortController.signal);
 });
 
-test('shouldReplaceSession follows the most recently written transcript and never downgrades to a guess or to nothing', () => {
+// resolveSession 走 pane 那條路的結果：top-level 是照 mtime 選的候選，paneCandidates 是兩個來源各自回報的候選
+function lookupResult(chosen, { herdr = null, paneMap = null } = {}) {
+  return { ...chosen, statusNote: null, notes: [], paneCandidates: { herdr, paneMap } };
+}
+
+test('shouldReplaceSession switches only when a source reports a new session, and never downgrades to a guess or to nothing', () => {
   const { projectsDirectory } = createCase();
   const nowMs = Date.now();
   const session = (sessionId, source, modifiedMs) => ({
@@ -305,6 +311,7 @@ test('shouldReplaceSession follows the most recently written transcript and neve
     sessionId,
     source,
     isGuessed: source === 'guessed',
+    isTranscriptMissing: false,
   });
   const herdrOld = session('a0000000-0000-4000-8000-000000000001', 'herdr', nowMs - 60_000);
   const herdrNew = session('b0000000-0000-4000-8000-000000000002', 'herdr', nowMs);
@@ -312,33 +319,65 @@ test('shouldReplaceSession follows the most recently written transcript and neve
   const guessedC = session('c0000000-0000-4000-8000-000000000003', 'guessed', nowMs + 60_000);
   const guessedD = session('d0000000-0000-4000-8000-000000000004', 'guessed', nowMs + 120_000);
   const unresolved = { transcriptPath: null, sessionId: null, source: null, isGuessed: false };
+  const fromHerdr = (candidate) => lookupResult(candidate, { herdr: candidate });
+  const fromPaneMap = (candidate) => lookupResult(candidate, { paneMap: candidate });
   assert.equal(shouldReplaceSession(null, unresolved), true);
   assert.equal(shouldReplaceSession(unresolved, unresolved), true);
   assert.equal(shouldReplaceSession(unresolved, guessedC), true);
-  // /resume、重開 claude：新 session 的 transcript 正在寫，比較新
-  assert.equal(shouldReplaceSession(herdrOld, herdrNew), true);
-  // herdr 逾時退回 /resume 前寫的 pane map：那個 transcript 比較舊，不能跳回去
-  assert.equal(shouldReplaceSession(herdrNew, paneMapOld), false);
-  assert.equal(shouldReplaceSession(herdrNew, { ...herdrOld }), false);
-  // 同一個 transcript 換成新的結果（例 isTranscriptMissing 變了）
-  assert.equal(shouldReplaceSession(herdrNew, { ...herdrNew, source: 'pane-map' }), true);
+  // /resume、重開 claude：herdr 回報的值變了
+  assert.equal(shouldReplaceSession(fromHerdr(herdrOld), fromHerdr(herdrNew)), true);
+  // 值變了就換，不看 mtime：過期的 session 可能正被別的 pane 寫，mtime 分不出誰才是這個 pane 的
+  assert.equal(shouldReplaceSession(fromHerdr(herdrNew), fromHerdr(herdrOld)), true);
+  // herdr 逾時退回 pane map：pane map 第一次有值、transcript 比 current 舊，不換
+  assert.equal(shouldReplaceSession(fromHerdr(herdrNew), fromPaneMap(paneMapOld)), false);
+  // 兩個來源的值都沒變：next 照 mtime 選到另一個 transcript 也不換
+  const bothSources = { herdr: herdrNew, paneMap: paneMapOld };
+  assert.equal(shouldReplaceSession(lookupResult(herdrNew, bothSources), lookupResult(paneMapOld, bothSources)), false);
+  // 同一個 transcript 換成新的結果（例 isTranscriptMissing、statusNote 變了）
+  assert.equal(shouldReplaceSession(fromHerdr(herdrNew), fromPaneMap({ ...herdrNew, source: 'pane-map' })), true);
   // 猜的被 herdr／pane map 給的取代，就算猜的寫得比較近
-  assert.equal(shouldReplaceSession(guessedC, paneMapOld), true);
+  assert.equal(shouldReplaceSession(guessedC, fromPaneMap(paneMapOld)), true);
   // 猜的不能取代 herdr／pane map 給的，同一個 transcript 也不行
-  assert.equal(shouldReplaceSession(herdrOld, guessedC), false);
-  assert.equal(shouldReplaceSession(herdrOld, { ...herdrOld, source: 'guessed', isGuessed: true }), false);
-  assert.equal(shouldReplaceSession(herdrOld, unresolved), false);
+  assert.equal(shouldReplaceSession(fromHerdr(herdrOld), guessedC), false);
+  assert.equal(shouldReplaceSession(fromHerdr(herdrOld), { ...herdrOld, source: 'guessed', isGuessed: true }), false);
+  assert.equal(shouldReplaceSession(fromHerdr(herdrOld), unresolved), false);
   // 猜的換猜的：現在的 transcript 還在就不換，就算另一個寫得比較近
   assert.equal(shouldReplaceSession(guessedC, guessedD), false);
-  // 寫入時間相同（tmpfs 的 mtime 是 coarse clock，常常一樣）時留著現在的
-  assert.equal(shouldReplaceSession(herdrNew, { ...herdrNew, transcriptPath: '/elsewhere/x.jsonl' }, { getModifiedMs: () => nowMs }), false);
+  // 同一個 session id 只是路徑不同：值沒變，不換
+  assert.equal(shouldReplaceSession(fromHerdr(herdrNew), fromHerdr({ ...herdrNew, transcriptPath: '/elsewhere/x.jsonl' }), { getModifiedMs: () => nowMs }), false);
 
   fs.rmSync(guessedC.transcriptPath);
   fs.rmSync(herdrNew.transcriptPath);
   // 現在的 transcript 不見了：換成任何還在的 session
   assert.equal(shouldReplaceSession(guessedC, guessedD), true);
-  assert.equal(shouldReplaceSession(herdrNew, paneMapOld), true);
+  assert.equal(shouldReplaceSession(fromHerdr(herdrNew), fromPaneMap(paneMapOld)), true);
 });
+
+// 照 viewer 的用法保存 current 與 lastSeen；switches 只算換到別的 transcript（viewer 會重建 tab、清掉選取與捲動位置）
+function createSessionFollower() {
+  const follower = {
+    current: null,
+    lastSeenSessionIds: undefined,
+    switches: 0,
+    offer(next) {
+      const choice = chooseSession(follower.current, next, { lastSeenSessionIds: follower.lastSeenSessionIds });
+      follower.lastSeenSessionIds = choice.lastSeenSessionIds;
+      if (choice.session !== follower.current) {
+        if (follower.current !== null && follower.current.transcriptPath !== choice.session.transcriptPath) {
+          follower.switches += 1;
+        }
+        follower.current = choice.session;
+      }
+      return follower.current;
+    },
+  };
+  return follower;
+}
+
+function touch(filePath, modifiedMs) {
+  const modifiedDate = new Date(modifiedMs);
+  fs.utimesSync(filePath, modifiedDate, modifiedDate);
+}
 
 function writePaneMap(runtimeDirectory, paneId, mapping) {
   fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
@@ -452,6 +491,162 @@ test('with two sessions writing in turn in the same folder, a guessed session st
   const next = await resolveSession(base);
   assert.equal(next.transcriptPath, secondPath);
   assert.equal(shouldReplaceSession(current, next), true);
+});
+
+for (const staleSource of ['pane map', 'herdr']) {
+  test(`a stale ${staleSource} naming a session another pane keeps writing does not make the viewer flap`, async () => {
+    const { projectsDirectory, runtimeDirectory } = createCase();
+    // 這個 pane 現在跑的是 ownId；過期的來源指向 otherId，它在別的 pane 被 \`claude -c\` 接著寫
+    const ownId = 'bbbbbbbb-0000-4000-8000-000000000002';
+    const otherId = 'aaaaaaaa-0000-4000-8000-000000000001';
+    const startMs = Date.now();
+    const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, startMs);
+    const otherPath = writeTranscript(projectsDirectory, '/srv/work', otherId, startMs - 1_000);
+    const [herdrId, paneMapId, paneMapPath] = staleSource === 'pane map' ? [ownId, otherId, otherPath] : [otherId, ownId, ownPath];
+    writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: paneMapId, transcriptPath: paneMapPath, cwd: '/srv/work', updatedAtMs: 0 });
+    const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(herdrId)).runCommand };
+    const follower = createSessionFollower();
+    let statelessCurrent = null;
+    let statelessSwitches = 0;
+    for (let round = 0; round < 10; round += 1) {
+      // 兩個 session 在兩次查詢之間輪流寫
+      touch(round % 2 === 0 ? ownPath : otherPath, startMs + (round + 1) * 2_000);
+      const next = await resolveSession(base);
+      assert.equal(follower.offer(next).transcriptPath, ownPath, `round ${round}`);
+      // 不保存 lastSeen 的用法（shouldReplaceSession）也一樣不能來回切
+      if (shouldReplaceSession(statelessCurrent, next)) {
+        if (statelessCurrent !== null && statelessCurrent.transcriptPath !== next.transcriptPath) {
+          statelessSwitches += 1;
+        }
+        statelessCurrent = next;
+      }
+    }
+    assert.equal(follower.switches, 0);
+    assert.equal(statelessSwitches, 0);
+    assert.equal(statelessCurrent.transcriptPath, ownPath);
+  });
+}
+
+test('herdr timing out and coming back with the same stale value does not switch to the session it names', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const ownId = 'c1c1c1c1-0000-4000-8000-000000000001';
+  const otherId = 'd2d2d2d2-0000-4000-8000-000000000002';
+  const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, Date.now());
+  const otherPath = writeTranscript(projectsDirectory, '/srv/work', otherId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: ownId, transcriptPath: ownPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(otherId)).runCommand })).transcriptPath, ownPath);
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrTimingOut() })).transcriptPath, ownPath);
+  // 逾時期間 herdr 指向的 session 在別的 pane 被寫，寫得比較近
+  touch(otherPath, Date.now() + 10_000);
+  const recovered = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(otherId)).runCommand });
+  assert.equal(recovered.transcriptPath, otherPath);
+  assert.equal(follower.offer(recovered).transcriptPath, ownPath);
+  assert.equal(follower.switches, 0);
+});
+
+test('the pane map changing to a new session switches to it even when the stale herdr session was written more recently', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  // herdr 過期、一直說 staleId；這個 pane 開了新 session，開第一個 sub 時 hook 才把 pane map 改成 newId
+  const staleId = 'e3e3e3e3-0000-4000-8000-000000000003';
+  const newId = 'f4f4f4f4-0000-4000-8000-000000000004';
+  const stalePath = writeTranscript(projectsDirectory, '/srv/work', staleId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: staleId, transcriptPath: stalePath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(staleId)).runCommand };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession(base)).transcriptPath, stalePath);
+  const newPath = writeTranscript(projectsDirectory, '/srv/work', newId, Date.now() + 1_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: newId, transcriptPath: newPath, cwd: '/srv/work', updatedAtMs: 0 });
+  touch(stalePath, Date.now() + 5_000);
+  const next = await resolveSession(base);
+  assert.equal(next.transcriptPath, stalePath);
+  const current = follower.offer(next);
+  assert.equal(current.transcriptPath, newPath);
+  assert.equal(current.source, 'pane-map');
+  assert.equal(current.isGuessed, false);
+  assert.equal(current.statusNote, next.statusNote);
+  assert.equal(follower.switches, 1);
+  // 之後兩邊輪流寫也不會換回去
+  touch(newPath, Date.now() + 10_000);
+  follower.offer(await resolveSession(base));
+  touch(stalePath, Date.now() + 15_000);
+  assert.equal(follower.offer(await resolveSession(base)).transcriptPath, newPath);
+  assert.equal(follower.switches, 1);
+});
+
+test('herdr changing to a new session switches to it, also once a transcript that did not exist yet appears', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const oldId = 'a5a5a5a5-0000-4000-8000-000000000005';
+  const newId = 'b6b6b6b6-0000-4000-8000-000000000006';
+  const staleMapId = 'c7c7c7c7-0000-4000-8000-000000000007';
+  const oldPath = writeTranscript(projectsDirectory, '/srv/work', oldId, Date.now());
+  // pane map 過期，指向的 session 在別的 pane 被寫
+  const staleMapPath = writeTranscript(projectsDirectory, '/srv/work', staleMapId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: staleMapId, transcriptPath: staleMapPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(oldId)).runCommand })).transcriptPath, oldPath);
+  // 新 session 還沒寫第一行：不換，也不能把這次回報記成看過
+  const waiting = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(follower.offer(waiting).transcriptPath, oldPath);
+  const newPath = writeTranscript(projectsDirectory, '/srv/work', newId, Date.now() + 1_000);
+  touch(staleMapPath, Date.now() + 5_000);
+  const next = await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(newId)).runCommand });
+  assert.equal(next.transcriptPath, staleMapPath);
+  assert.equal(follower.offer(next).transcriptPath, newPath);
+  assert.equal(follower.switches, 1);
+});
+
+test('a source reporting for the first time only wins when its transcript is newer, and only that once', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const ownId = 'd8d8d8d8-0000-4000-8000-000000000008';
+  const staleId = 'e9e9e9e9-0000-4000-8000-000000000009';
+  const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, Date.now());
+  const stalePath = writeTranscript(projectsDirectory, '/srv/work', staleId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: ownId, transcriptPath: ownPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', contextCwd: '/srv/work', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const follower = createSessionFollower();
+  // herdr 一開始就失敗：只有 pane map
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrFailing() })).transcriptPath, ownPath);
+  // herdr 恢復，第一次回報的 session 比 current 舊：不換
+  const herdrStale = herdrReturning(herdrClaudePane(staleId)).runCommand;
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrStale })).transcriptPath, ownPath);
+  // 之後它在別的 pane 被寫得比較近：herdr 的值沒變，還是不換
+  touch(stalePath, Date.now() + 10_000);
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrStale })).transcriptPath, ownPath);
+  assert.equal(follower.switches, 0);
+});
+
+test('both sources changing in the same lookup follow the more recently written transcript', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const firstId = 'a1b2c3d4-0000-4000-8000-000000000001';
+  const herdrNextId = 'a1b2c3d4-0000-4000-8000-000000000002';
+  const paneMapNextId = 'a1b2c3d4-0000-4000-8000-000000000003';
+  const firstPath = writeTranscript(projectsDirectory, '/srv/work', firstId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: firstId, transcriptPath: firstPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(firstId)).runCommand })).transcriptPath, firstPath);
+  writeTranscript(projectsDirectory, '/srv/work', herdrNextId, Date.now() - 30_000);
+  const paneMapNextPath = writeTranscript(projectsDirectory, '/srv/work', paneMapNextId, Date.now());
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: paneMapNextId, transcriptPath: paneMapNextPath, cwd: '/srv/work', updatedAtMs: 0 });
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(herdrNextId)).runCommand })).transcriptPath, paneMapNextPath);
+});
+
+test('a current session whose transcript was deleted is picked again from scratch', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const ownId = 'f0f0f0f0-0000-4000-8000-000000000001';
+  const otherId = 'f0f0f0f0-0000-4000-8000-000000000002';
+  const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, Date.now());
+  const otherPath = writeTranscript(projectsDirectory, '/srv/work', otherId, Date.now() - 60_000);
+  writePaneMap(runtimeDirectory, 'w1:p1', { sessionId: otherId, transcriptPath: otherPath, cwd: '/srv/work', updatedAtMs: 0 });
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(ownId)).runCommand };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession(base)).transcriptPath, ownPath);
+  fs.rmSync(ownPath);
+  // 兩個來源的值都沒變，但 current 的 transcript 不見了：照初次選擇重選
+  assert.equal(follower.offer(await resolveSession(base)).transcriptPath, otherPath);
 });
 
 test('the herdr / pane map disagreement note carries no terminal escapes', async () => {

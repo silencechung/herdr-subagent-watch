@@ -96,8 +96,9 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 - 事件格式：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。
   - 摘要太長時自動折行，續行縮排對齊摘要欄（時間與 tool 欄留白）；寬度照 display width 算：Unicode East Asian Width 為 W 或 F 的字元（CJK、全形、`✅` `🚀` 等 emoji）算 2 格，寬字不會被切半。
   - 多行內容（例 Bash heredoc）保留原本的換行與縮排，每一行各自折行；tab 換成 4 個空白。
-  - transcript、meta、herdr 回傳內容裡的 escape sequence（CSI、OSC 52／OSC 8 等 OSC、DCS，以及 8-bit C1 寫法）、其他控制字元與 Unicode format 字元（bidi override、zero-width space、BOM）畫出來之前全部拿掉，transcript 沒辦法寫剪貼簿、加連結或清畫面。
-    - 字串型序列（OSC、DCS、SOS、PM、APC）連同結尾（BEL 或 ST）整段拿掉；沒有結尾時只拿掉 introducer，後面的文字留著，單獨的 `U+009D`（cp1252 亂碼常見）不會把摘要後面整段吃掉。
+  - transcript、meta、herdr 回傳內容裡的 escape sequence（CSI、OSC 52／OSC 8 等 OSC、DCS）、其他控制字元（含 8-bit C1）與 Unicode format 字元（bidi override、zero-width space、BOM）畫出來之前全部拿掉，transcript 沒辦法寫剪貼簿、加連結或清畫面。
+    - ESC 開頭的字串型序列（OSC、DCS、SOS、PM、APC）連同結尾（BEL 或 ST）整段拿掉；沒有結尾時只拿掉 introducer，後面的文字留著，不會把摘要後面整段吃掉。
+    - 8-bit C1（`U+0080`–`U+009F`，含 CSI、OSC、DCS 的 8-bit 寫法）只拿掉它自己，不會連後面的文字一起拿：C1 拿掉之後 terminal 看不到序列；latin1／cp1252 亂碼常在一般文字兩邊出現成對的 `U+009D` … `U+009C`（`“a” and “b”` 用 latin1 讀）。
     - ZWJ（`U+200D`）、ZWNJ（`U+200C`）保留、寬度算 0，👨‍👩‍👧 這類 emoji 序列和波斯文等文字不會被拆開。
   - tool 名稱比 tool 欄（10 格）寬時（例 `SubagentHandback`），tool 名稱自己佔一行、摘要從下一行的摘要欄開始，所有事件的摘要都對齊同一欄。
   - 一個事件最多 20 行，超過時第 20 行顯示 `… (+N more lines)`（dim）。
@@ -126,17 +127,18 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。只在 `SubagentStart`／`SubagentStop` 時寫，`/resume` 或重開 `claude` 之後、開下一個 sub 之前都指向上一個 session。
 3. **猜**（herdr 和 pane map 都沒有 session 時才用）：用 pane 的 cwd 對到 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd 的 / 換成 ->/`，取最新修改的 `<session-id>.jsonl`。底部分隔線會標 `(guessed: latest session)`：同一個資料夾開多個 Claude Code 時可能猜錯。`/var/home/...` 與 `/home/...` 兩種寫法都會試（Fedora Atomic 的 home 在 `/var/home`）；另外也試把所有非英數字元換成 `-` 的寫法（未驗證 Claude Code 是否這樣編碼含 `.` 的路徑）。
 
-前兩個都可能過期，所以不固定哪一個優先。兩個都是這個 pane 專屬的，而同一個 pane 同時只有一個 Claude Code 在寫 transcript，因此取 transcript 存在、而且最近寫入的那個 session（同時間取 herdr 的）。兩邊說的 session 不同時，底部分隔線會多一段 `herdr says session <id>, pane map says <id>`。兩個的 transcript 都還不存在時（session 剛開、還沒寫任何東西），等 herdr 回報的 session 出現（herdr 沒有就等 pane map 的），不會退回去猜。
+前兩個都可能過期，所以不固定哪一個優先。viewer 還沒有 session（或畫面上的 transcript 被刪掉）時，取 transcript 存在、而且最近寫入的那個 session（同時間取 herdr 的）：兩個都是這個 pane 專屬的，過期的值通常指向已經沒人在寫的舊 session。兩邊說的 session 不同時，底部分隔線會多一段 `herdr says session <id>, pane map says <id>`。兩個的 transcript 都還不存在時（session 剛開、還沒寫任何東西），等 herdr 回報的 session 出現（herdr 沒有就等 pane map 的），不會退回去猜。
 
 問不到 herdr（找不到 herdr、`herdr pane get` 失敗）時，猜之前只剩 pane map；完全沒有 pane id 時跳過 pane map，只能用猜的（3）。都找不到時顯示 `No Claude Code session found for this pane` 和每一步失敗的原因。
 
-找到 session 之後仍然每 2 秒重查一次。查到不同的 session 時，只有下面幾種情況才換掉畫面上的：
+找到 session 之後仍然每 2 秒重查一次，但之後不再只看寫入時間決定換不換。過期的值可能指向別的 pane 正在寫的 session（`claude -c`、`--resume` 沿用同一個 session id），兩個 transcript 會輪流變成最新的；跟著最新的走，popup 會每幾秒來回切一次，選取的 tab 與捲動位置都被清掉。所以 viewer 記住 herdr、pane map 各自上一次查詢成功時回報的 session，只有下面幾種情況才換掉畫面上的：
 
 - 現在的是猜的，新的來自 herdr 或 pane map；
-- 兩個都不是猜的，新的 transcript 比現在的寫得更近，或現在的 transcript 已經不存在；
+- 兩個都不是猜的，herdr 或 pane map 現在回報的 session 跟之前不同（值變了）、不是畫面上的那個、transcript 存在。兩個同一輪都變了，取寫得比較近的。某個來源第一次回報 session（例：herdr 一開始失敗、後來恢復）時，只有那個 transcript 比現在的寫得更近才換，而且只會發生這一次；
+- 現在的 transcript 已經不存在（照上面的方式重選）；
 - 兩個都是猜的，而且現在的 transcript 已經不存在。
 
-所以 `/resume` 或重開 `claude` 之後，新 session 一寫 transcript，popup 就換過去（重建 tab、底部的 session 標籤跟著換）；herdr 暫時失敗、退回較舊的 pane map 時不會跳回上一個 session。猜的不會取代來自 herdr 或 pane map 的 session，查不到也會留著畫面上的 session；同一個資料夾兩個 session 輪流寫入時，猜到的 session 留在原地，不會來回切換。已經顯示 session 時，查詢本身出錯的話，錯誤顯示在底部分隔線，下一次查詢成功就清掉。查詢是非同步、同時只跑一個，`herdr pane get` 3 秒逾時；herdr 卡住時 `q`／`Esc` 一樣立即關閉。
+所以 `/resume` 或重開 `claude` 之後，herdr 或 pane map 一回報新 session、它的 transcript 一出現，popup 就換過去（重建 tab、底部的 session 標籤跟著換）。查詢失敗不會改 viewer 記住的值，herdr 暫時失敗、或恢復後回報同一個過期的值，都不會跳回上一個 session。猜的不會取代來自 herdr 或 pane map 的 session，查不到也會留著畫面上的 session；同一個資料夾兩個 session 輪流寫入時，猜到的 session 留在原地，不會來回切換。已經顯示 session 時，查詢本身出錯的話，錯誤顯示在底部分隔線，下一次查詢成功就清掉。查詢是非同步、同時只跑一個，`herdr pane get` 3 秒逾時；herdr 卡住時 `q`／`Esc` 一樣立即關閉。
 
 ## 資料來源與結束判斷
 
@@ -180,6 +182,7 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 
 ## 已知限制
 
+- 開了新 session 之後 popup 還停在上一個 session：herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它，直到 herdr 或 pane map 回報新的 session（見「怎麼找到 pane 對應的 session」）。
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
 - 只有 East Asian Width 為 W 或 F（Unicode 16.0）的字元算 2 格。有些 terminal 只在加了 variation selector 時才畫成 2 格的符號（例 `❤️`），量出來的寬度可能和 terminal 實際畫的不同。emoji ZWJ 序列量的是各部分加總（👨‍👩‍👧 算 6 格），terminal 把它合成一個字畫的話會比量的窄。
 - herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。

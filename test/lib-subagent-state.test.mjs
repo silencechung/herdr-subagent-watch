@@ -148,7 +148,7 @@ test('meta agentType and description are stored without escapes or control chara
   const state = freshState();
   applyMeta(state, { agentType: 'Exp\u001b]8;;https://evil.example/\u001b\\click\u001b]8;;\u001b\\', description: 'X\u001b]52;c;cHduZWQ=\u0007Y \u009b31m‮evil\nline' });
   assert.equal(state.agentType, 'Exp click');
-  assert.equal(state.description, 'X Y evil line');
+  assert.equal(state.description, 'X Y 31mevil line');
   applyMeta(state, { agentType: '\u001b[2J' });
   assert.equal(state.agentType, null);
 });

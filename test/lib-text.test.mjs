@@ -90,8 +90,8 @@ const hostileSamples = [
   ['OSC 52 clipboard write ended by BEL', 'X\x1b]52;c;cHduZWQ=\x07Y', 'XY'],
   ['OSC 8 hyperlink ended by ST', 'Exp\x1b]8;;https://evil.example/\x1b\\click\x1b]8;;\x1b\\', 'Expclick'],
   ['CSI clear screen', 'a\x1b[2Jb', 'ab'],
-  ['8-bit CSI', 'a\x9b31mb', 'ab'],
-  ['8-bit OSC ended by 8-bit ST', 'a\x9d0;title\x9cb', 'ab'],
+  ['8-bit CSI drops only the introducer', 'a\x9b31mb', 'a31mb'],
+  ['8-bit OSC and ST drop only themselves', 'a\x9d0;title\x9cb', 'a0;titleb'],
   ['DCS string', 'a\x1bPq#0;2;0;0;0\x1b\\b', 'ab'],
   ['charset designation and save cursor', '\x1b(Ba\x1b7b', 'ab'],
   ['unterminated OSC loses only its introducer', 'tail \x1b]52;c;QUJD', 'tail 52;c;QUJD'],
@@ -126,14 +126,15 @@ test('sanitizeText and sanitizeMultilineText also strip 8-bit controls and bidi 
     assert.doesNotMatch(sanitizeMultilineText(`${input}\n${input}`).replaceAll('\n', ''), terminalControlPattern, name);
   }
   assert.equal(sanitizeText('general-\u202epurpose'), 'general-purpose');
-  assert.equal(sanitizeMultilineText('line 1\x9b2J\nline 2'), 'line 1\nline 2');
+  assert.equal(sanitizeMultilineText('line 1\x1b[2J\nline 2'), 'line 1\nline 2');
+  assert.equal(sanitizeMultilineText('line 1\x9b2J\nline 2'), 'line 1 2J\nline 2');
 });
 
-test('an unterminated OSC / DCS / 8-bit C1 string drops only its introducer and keeps the text after it', () => {
+test('an unterminated OSC / DCS drops only its introducer, and a lone 8-bit C1 never swallows the text after it', () => {
   // cp1252 亂碼：” 的 UTF-8 bytes E2 80 9D 被當成 cp1252 讀，0x9D 沒有對應字元，變成單獨的 U+009D
   assert.equal(sanitizeText('he said â€\x9dhello world, more text'), 'he said â€ hello world, more text');
   assert.equal(stripTerminalControls('he said â€\x9dhello'), 'he said â€hello');
-  assert.equal(sanitizeMultilineText('line1 \x9d tail\nline2\nline3'), 'line1  tail\nline2\nline3');
+  assert.equal(sanitizeMultilineText('line1 \x9d tail\nline2\nline3'), 'line1   tail\nline2\nline3');
   assert.equal(sanitizeMultilineText("printf '\x1b]0;title'\necho next\necho last"), "printf '0;title'\necho next\necho last");
   assert.equal(truncateToWidth('abc\x1bPdef ghi', 80).text, 'abcdef ghi');
   assert.equal(sanitizeText('a\x90b \x98c \x9ed \x9fe'), 'a b c d e');
@@ -141,7 +142,22 @@ test('an unterminated OSC / DCS / 8-bit C1 string drops only its introducer and 
   assert.equal(stripTerminalControls('a\x1b]0;x\x1b[31mb'), 'a0;xb');
   // 有結尾的照舊整段剝掉，跨行也一樣
   assert.equal(sanitizeMultilineText('a\x1b]0;x\ny\x07b\nnext'), 'ab\nnext');
-  assert.equal(stripTerminalControls('a\x9d0;title\x9cb\x90q\x1b\\c'), 'abc');
+  assert.equal(stripTerminalControls('a\x1bP0;title\x9cb\x1b]q\x1b\\c'), 'abc');
+});
+
+test('8-bit C1 introducers are stripped one character at a time and never start a string sequence', () => {
+  // latin1 亂碼：“ ” 的 UTF-8 bytes（E2 80 9C／E2 80 9D）被當成 latin1 讀，U+009D … U+009C 成對出現
+  const mojibake = '\xe2\x80\x9ca\xe2\x80\x9d and \xe2\x80\x9cb\xe2\x80\x9d end';
+  assert.equal(sanitizeText(mojibake), '\xe2 a\xe2 and \xe2 b\xe2 end');
+  assert.equal(stripTerminalControls(mojibake), '\xe2a\xe2 and \xe2b\xe2 end');
+  assert.equal(sanitizeMultilineText(mojibake + '\nnext'), '\xe2  a\xe2   and \xe2  b\xe2   end\nnext');
+  // 8-bit CSI／OSC／DCS／SOS／PM／APC 都只拿掉自己，後面的參數與內容是普通文字
+  assert.equal(stripTerminalControls('a\x9b2Jb'), 'a2Jb');
+  assert.equal(stripTerminalControls('a\x9d0;title\x07b'), 'a0;titleb');
+  assert.equal(stripTerminalControls('a\x90q#0\x9cb \x98s\x9c \x9ep\x9c \x9fx\x9c'), 'aq#0b s p x');
+  // 7-bit 照舊：有結尾的整段剝掉，結尾也可以是 8-bit ST
+  assert.equal(stripTerminalControls('a\x1b]0;title\x9cb'), 'ab');
+  assert.equal(stripTerminalControls('a\x1b[2Jb'), 'ab');
 });
 
 test('stripping unterminated string sequences stays linear on adversarial input', () => {
