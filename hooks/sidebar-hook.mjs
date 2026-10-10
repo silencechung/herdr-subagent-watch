@@ -1,4 +1,4 @@
-// Claude Code SubagentStart／SubagentStop hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行。
+// Claude Code SubagentStart／SubagentStop hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer）。
 // 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、1 秒內結束。
 import { spawnSync } from 'node:child_process';
 import {
@@ -19,7 +19,6 @@ export const metadataSource = 'subagent.watch';
 export const maximumTreeLines = 5;
 export const maximumTokenLength = 80;
 export const runningIcon = '●';
-export const doneIcon = '✓';
 
 // 加上 node 啟動與 herdr 最低預算後仍要在 1 秒內結束
 const totalBudgetMs = 800;
@@ -87,7 +86,8 @@ export function normalizeSessionState(candidate, sessionId) {
     return createEmptySessionState(sessionId);
   }
   const subagents = candidate.subagents.filter((subagent) => {
-    return subagent && typeof subagent === 'object' && typeof subagent.id === 'string';
+    // 舊版狀態檔會留著 status 為 done 的 sub；不丟掉的話升級後它們會被當成跑中
+    return subagent && typeof subagent === 'object' && typeof subagent.id === 'string' && subagent.status !== 'done';
   });
   return {
     sessionId,
@@ -96,38 +96,26 @@ export function normalizeSessionState(candidate, sessionId) {
   };
 }
 
+// 狀態檔只記跑中的 sub：stop 直接移除，檔案大小只跟同時跑的數量有關
 export function applyEvent(state, event, nowMs) {
-  const subagents = state.subagents.map((subagent) => ({ ...subagent }));
-  const existing = subagents.find((subagent) => subagent.id === event.agentId);
+  const existing = state.subagents.find((subagent) => subagent.id === event.agentId);
   if (event.eventName === 'SubagentStart') {
-    // SubagentStart 在 resume 同一個 sub 時也會再觸發：改回 running，不新增一筆
-    if (existing) {
-      existing.status = 'running';
-      existing.agentType = event.agentType;
-      existing.endedAtMs = null;
-    } else {
-      subagents.push({
-        id: event.agentId,
-        agentType: event.agentType,
-        status: 'running',
-        startedAtMs: nowMs,
-        endedAtMs: null,
-      });
-    }
-    return { changed: true, state: { ...state, subagents } };
+    // 同一個 sub 還在清單裡又收到 start（例如前一次的 stop 因 lock 逾時沒記到）：只留一筆，保留原本的啟動順序
+    const others = state.subagents.filter((subagent) => subagent.id !== event.agentId);
+    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: existing?.startedAtMs ?? nowMs };
+    return { changed: true, state: { ...state, subagents: [...others, started] } };
   }
   // 沒看過 start 的 stop 不收：可能是內部 agent，或 hook 安裝前就啟動的 sub
   if (!existing) {
     return { changed: false, state };
   }
-  existing.status = 'done';
-  existing.endedAtMs = nowMs;
+  const subagents = state.subagents.filter((subagent) => subagent.id !== event.agentId);
   return { changed: true, state: { ...state, subagents } };
 }
 
-export function formatTreeLine(branch, agentType, icon) {
+export function formatTreeLine(branch, agentType) {
   const prefix = `${branch} `;
-  const suffix = ` ${icon}`;
+  const suffix = ` ${runningIcon}`;
   const nameBudget = maximumTokenLength - Array.from(prefix).length - Array.from(suffix).length;
   const nameCharacters = Array.from(agentType);
   const name = nameCharacters.length > nameBudget
@@ -136,24 +124,13 @@ export function formatTreeLine(branch, agentType, icon) {
   return `${prefix}${name}${suffix}`;
 }
 
-export function orderSubagents(subagents) {
-  const running = subagents
-    .filter((subagent) => subagent.status === 'running')
-    .sort((first, second) => (first.startedAtMs ?? 0) - (second.startedAtMs ?? 0));
-  const finished = subagents
-    .filter((subagent) => subagent.status !== 'running')
-    .sort((first, second) => (second.endedAtMs ?? 0) - (first.endedAtMs ?? 0));
-  return [...running, ...finished];
-}
-
-export function buildTreeLines(subagents) {
-  const ordered = orderSubagents(subagents);
+export function buildTreeLines(runningSubagents) {
+  const ordered = [...runningSubagents].sort((first, second) => (first.startedAtMs ?? 0) - (second.startedAtMs ?? 0));
   const overflows = ordered.length > maximumTreeLines;
   const visible = overflows ? ordered.slice(0, maximumTreeLines - 1) : ordered;
   const lines = visible.map((subagent, index) => {
     const isLastLine = !overflows && index === visible.length - 1;
-    const icon = subagent.status === 'running' ? runningIcon : doneIcon;
-    return formatTreeLine(isLastLine ? '└─' : '├─', sanitizeText(subagent.agentType), icon);
+    return formatTreeLine(isLastLine ? '└─' : '├─', sanitizeText(subagent.agentType));
   });
   if (overflows) {
     lines.push(`└─ +${ordered.length - visible.length} more`);

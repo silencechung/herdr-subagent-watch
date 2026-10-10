@@ -1,6 +1,6 @@
 # herdr-subagent-watch
 
-herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出 sub agent（見 `docs/sidebar.md`）。純 Node 內建模組，不需要 `npm install`。
+herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出還在跑的 sub agent（見 `docs/sidebar.md`）。側邊欄不留歷程，sub 一結束那一行就消失；結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。純 Node 內建模組，不需要 `npm install`。
 
 - **只支援 Claude Code**：讀的是 Claude Code 的 transcript 與 `SubagentStart`／`SubagentStop` hook，其他 agent 的 pane 會顯示 `This pane is not running Claude Code (detected: <agent>)`。
 - 需求：herdr ≥ 0.9.3、Node.js ≥ 22、Linux（sidebar hook 靠 `/proc` 與 `XDG_RUNTIME_DIR`）。

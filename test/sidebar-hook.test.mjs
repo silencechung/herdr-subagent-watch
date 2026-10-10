@@ -15,6 +15,7 @@ import {
   formatTreeLine,
   maximumTokenLength,
   nextSequence,
+  normalizeSessionState,
   parseHookPayload,
   runHook,
 } from '../hooks/sidebar-hook.mjs';
@@ -26,6 +27,13 @@ const startPayloadText = readFileSync(join(fixtureDirectory, 'subagent-start.jso
 const stopPayloadText = readFileSync(join(fixtureDirectory, 'subagent-stop.json'), 'utf8');
 const startPayload = JSON.parse(startPayloadText);
 const testPaneId = 'w1:pTest';
+const allTokensCleared = [
+  '--clear-token', 'sub1',
+  '--clear-token', 'sub2',
+  '--clear-token', 'sub3',
+  '--clear-token', 'sub4',
+  '--clear-token', 'sub5',
+];
 
 const temporaryDirectories = [];
 function createTemporaryDirectory() {
@@ -43,8 +51,8 @@ function payloadWith(overrides) {
   return JSON.stringify({ ...startPayload, ...overrides });
 }
 
-function subagent(id, status, startedAtMs, endedAtMs = null, agentType = `type-${id}`) {
-  return { id, agentType, status, startedAtMs, endedAtMs };
+function subagent(id, startedAtMs, agentType = `type-${id}`) {
+  return { id, agentType, startedAtMs };
 }
 
 describe('parseHookPayload', () => {
@@ -90,16 +98,15 @@ describe('applyEvent', () => {
   test('start adds a running sub agent', () => {
     const { changed, state } = applyEvent(createEmptySessionState('session'), startEvent, 1000);
     assert.equal(changed, true);
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 'running', 1000, null, 'general-purpose')]);
+    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 1000, 'general-purpose')]);
   });
 
-  test('stop marks the sub agent done', () => {
+  test('stop removes the sub agent from the state', () => {
     const started = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
     const { changed, state } = applyEvent(started, stopEvent, 2500);
     assert.equal(changed, true);
-    assert.equal(state.subagents[0].status, 'done');
-    assert.equal(state.subagents[0].endedAtMs, 2500);
-    assert.equal(started.subagents[0].status, 'running');
+    assert.deepEqual(state.subagents, []);
+    assert.equal(started.subagents.length, 1);
   });
 
   test('stop for a sub agent that never started is ignored', () => {
@@ -109,50 +116,69 @@ describe('applyEvent', () => {
     assert.equal(state, emptyState);
   });
 
-  test('start again (resume) flips back to running without duplicating', () => {
+  test('start again after stop (resume) shows it once more', () => {
     let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
     state = applyEvent(state, stopEvent, 2000).state;
     state = applyEvent(state, startEvent, 3000).state;
-    assert.equal(state.subagents.length, 1);
-    assert.equal(state.subagents[0].status, 'running');
-    assert.equal(state.subagents[0].endedAtMs, null);
+    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
+  });
+
+  test('a repeated start without stop keeps one entry and its original start time', () => {
+    let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
+    state = applyEvent(state, startEvent, 3000).state;
+    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 1000, 'general-purpose')]);
+  });
+});
+
+describe('normalizeSessionState', () => {
+  test('drops finished entries left by the previous version', () => {
+    const state = normalizeSessionState({
+      sessionId: 'session',
+      lastSequence: 42,
+      subagents: [
+        { id: 'old-done', agentType: 'Plan', status: 'done', startedAtMs: 1, endedAtMs: 2 },
+        { id: 'old-running', agentType: 'Explore', status: 'running', startedAtMs: 3, endedAtMs: null },
+        subagent('new', 4),
+        null,
+        { agentType: 'no-id' },
+      ],
+    }, 'session');
+    assert.equal(state.lastSequence, 42);
+    assert.deepEqual(state.subagents.map((entry) => entry.id), ['old-running', 'new']);
   });
 });
 
 describe('buildTreeLines', () => {
-  test('no sub agents gives no lines', () => {
+  test('no running sub agents gives no lines', () => {
     assert.deepEqual(buildTreeLines([]), []);
   });
 
   test('single sub agent uses the last-branch glyph', () => {
-    assert.deepEqual(buildTreeLines([subagent('a', 'running', 1, null, 'general-purpose')]), ['└─ general-purpose ●']);
-    assert.deepEqual(buildTreeLines([subagent('a', 'done', 1, 2, 'Explore')]), ['└─ Explore ✓']);
+    assert.deepEqual(buildTreeLines([subagent('a', 1, 'general-purpose')]), ['└─ general-purpose ●']);
   });
 
-  test('running first by start time, then most recently finished', () => {
+  test('ordered by start time', () => {
     const lines = buildTreeLines([
-      subagent('old-done', 'done', 1, 10, 'old-done'),
-      subagent('late-run', 'running', 30, null, 'late-run'),
-      subagent('new-done', 'done', 2, 20, 'new-done'),
-      subagent('early-run', 'running', 5, null, 'early-run'),
+      subagent('late', 30, 'late'),
+      subagent('early', 5, 'early'),
+      subagent('middle', 10, 'middle'),
     ]);
     assert.deepEqual(lines, [
-      '├─ early-run ●',
-      '├─ late-run ●',
-      '├─ new-done ✓',
-      '└─ old-done ✓',
+      '├─ early ●',
+      '├─ middle ●',
+      '└─ late ●',
     ]);
   });
 
   test('exactly five fit without a more line', () => {
-    const subagents = [1, 2, 3, 4, 5].map((index) => subagent(`s${index}`, 'running', index));
+    const subagents = [1, 2, 3, 4, 5].map((index) => subagent(`s${index}`, index));
     const lines = buildTreeLines(subagents);
     assert.equal(lines.length, 5);
     assert.equal(lines[4], '└─ type-s5 ●');
   });
 
   test('overflow collapses the last line into +N more', () => {
-    const subagents = [1, 2, 3, 4, 5, 6, 7].map((index) => subagent(`s${index}`, 'running', index));
+    const subagents = [1, 2, 3, 4, 5, 6, 7].map((index) => subagent(`s${index}`, index));
     const lines = buildTreeLines(subagents);
     assert.deepEqual(lines, [
       '├─ type-s1 ●',
@@ -163,46 +189,50 @@ describe('buildTreeLines', () => {
     ]);
   });
 
-  test('lines never contain numbering', () => {
-    const lines = buildTreeLines([subagent('a', 'running', 1, null, 'Plan'), subagent('b', 'done', 1, 2, 'Explore')]);
+  test('lines never contain numbering or a finished mark', () => {
+    const lines = buildTreeLines([subagent('a', 1, 'Plan'), subagent('b', 2, 'Explore')]);
     for (const line of lines) {
-      assert.match(line, /^(├─|└─) [A-Za-z]+ (●|✓)$/);
+      assert.match(line, /^(├─|└─) [A-Za-z]+ ●$/);
     }
   });
 });
 
 describe('formatTreeLine', () => {
   test('truncates long agent types to 80 characters and keeps the icon', () => {
-    const line = formatTreeLine('├─', 'x'.repeat(200), '●');
+    const line = formatTreeLine('├─', 'x'.repeat(200));
     assert.equal(Array.from(line).length, maximumTokenLength);
     assert.ok(line.endsWith('x… ●'));
   });
 
   test('counts characters, not UTF-16 units', () => {
-    const line = formatTreeLine('└─', '代'.repeat(100), '✓');
+    const line = formatTreeLine('└─', '代'.repeat(100));
     assert.equal(Array.from(line).length, maximumTokenLength);
     assert.ok(line.startsWith('└─ 代'));
-    assert.ok(line.endsWith('… ✓'));
+    assert.ok(line.endsWith('… ●'));
   });
 
   test('short agent types are untouched', () => {
-    assert.equal(formatTreeLine('├─', 'Explore', '●'), '├─ Explore ●');
+    assert.equal(formatTreeLine('├─', 'Explore'), '├─ Explore ●');
   });
 });
 
 describe('buildMetadataArguments', () => {
   test('sets used tokens and clears the rest under one source', () => {
-    const argumentList = buildMetadataArguments('w8:pV', ['├─ Plan ●', '└─ Explore ✓'], 1234);
+    const argumentList = buildMetadataArguments('w8:pV', ['├─ Plan ●', '└─ Explore ●'], 1234);
     assert.deepEqual(argumentList, [
       'pane', 'report-metadata', 'w8:pV',
       '--source', 'subagent.watch',
       '--seq', '1234',
       '--token', 'sub1=├─ Plan ●',
-      '--token', 'sub2=└─ Explore ✓',
+      '--token', 'sub2=└─ Explore ●',
       '--clear-token', 'sub3',
       '--clear-token', 'sub4',
       '--clear-token', 'sub5',
     ]);
+  });
+
+  test('no lines clears all five tokens', () => {
+    assert.deepEqual(buildMetadataArguments('w8:pV', [], 1234).slice(7), allTokensCleared);
   });
 });
 
@@ -290,20 +320,102 @@ describe('runHook', () => {
     const sessionStatePath = join(harness.stateDirectory, `session-${startPayload.session_id}.json`);
     let sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
     assert.deepEqual(sessionState.subagents, [
-      subagent('a12e8c491ce2f7f4a', 'running', 1_000_000, null, 'general-purpose'),
+      subagent('a12e8c491ce2f7f4a', 1_000_000, 'general-purpose'),
     ]);
 
     harness.advanceClock(2000);
     const stopResult = runHook(stopPayloadText, harness.environment, harness.dependencies);
     assert.equal(stopResult.action, 'reported');
-    assert.deepEqual(stopResult.lines, ['└─ general-purpose ✓']);
+    assert.deepEqual(stopResult.lines, []);
     assert.equal(harness.herdrCalls[1].argumentList[6], '1002000');
+    assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7), allTokensCleared);
     sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
-    assert.equal(sessionState.subagents[0].status, 'done');
-    assert.equal(sessionState.subagents[0].endedAtMs, 1_002_000);
+    assert.deepEqual(sessionState.subagents, []);
+    assert.equal(sessionState.lastSequence, 1_002_000);
 
     const leftovers = readdirSync(harness.stateDirectory).filter((name) => name.endsWith('.lock') || name.endsWith('.tmp'));
     assert.deepEqual(leftovers, []);
+  });
+
+  test('start two, stop one, stop the other: two lines, then one └─ line, then everything cleared', () => {
+    const harness = createHarness();
+    const firstStart = payloadWith({ agent_id: 'first', agent_type: 'Explore' });
+    const secondStart = payloadWith({ agent_id: 'second', agent_type: 'Plan' });
+    const firstStop = payloadWith({ hook_event_name: 'SubagentStop', agent_id: 'first', agent_type: 'Explore' });
+    const secondStop = payloadWith({ hook_event_name: 'SubagentStop', agent_id: 'second', agent_type: 'Plan' });
+
+    runHook(firstStart, harness.environment, harness.dependencies);
+    harness.advanceClock(10);
+    const bothRunning = runHook(secondStart, harness.environment, harness.dependencies);
+    assert.deepEqual(bothRunning.lines, ['├─ Explore ●', '└─ Plan ●']);
+
+    harness.advanceClock(10);
+    const oneLeft = runHook(firstStop, harness.environment, harness.dependencies);
+    assert.deepEqual(oneLeft.lines, ['└─ Plan ●']);
+    assert.deepEqual(oneLeft.argumentList.slice(7), [
+      '--token', 'sub1=└─ Plan ●',
+      '--clear-token', 'sub2',
+      '--clear-token', 'sub3',
+      '--clear-token', 'sub4',
+      '--clear-token', 'sub5',
+    ]);
+
+    harness.advanceClock(10);
+    const noneLeft = runHook(secondStop, harness.environment, harness.dependencies);
+    assert.deepEqual(noneLeft.lines, []);
+    assert.deepEqual(noneLeft.argumentList.slice(7), allTokensCleared);
+    assert.equal(harness.herdrCalls.length, 4);
+  });
+
+  test('+N more only counts sub agents that are still running', () => {
+    const harness = createHarness();
+    for (let index = 1; index <= 7; index += 1) {
+      harness.advanceClock(10);
+      runHook(payloadWith({ agent_id: `s${index}`, agent_type: `worker${index}` }), harness.environment, harness.dependencies);
+    }
+    assert.equal(harness.herdrCalls.at(-1).argumentList.at(-1), 'sub5=└─ +3 more');
+
+    const stop = (index) => {
+      harness.advanceClock(10);
+      return runHook(
+        payloadWith({ hook_event_name: 'SubagentStop', agent_id: `s${index}`, agent_type: `worker${index}` }),
+        harness.environment,
+        harness.dependencies,
+      );
+    };
+    assert.deepEqual(stop(1).lines, [
+      '├─ worker2 ●',
+      '├─ worker3 ●',
+      '├─ worker4 ●',
+      '├─ worker5 ●',
+      '└─ +2 more',
+    ]);
+    assert.deepEqual(stop(4).lines, [
+      '├─ worker2 ●',
+      '├─ worker3 ●',
+      '├─ worker5 ●',
+      '├─ worker6 ●',
+      '└─ worker7 ●',
+    ]);
+  });
+
+  test('a state file from the previous version drops its finished sub agents on the next event', () => {
+    const harness = createHarness();
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    const sessionStatePath = join(harness.stateDirectory, `session-${startPayload.session_id}.json`);
+    writeFileSync(sessionStatePath, JSON.stringify({
+      sessionId: startPayload.session_id,
+      lastSequence: 1_000_000,
+      subagents: [
+        { id: 'a12e8c491ce2f7f4a', agentType: 'general-purpose', status: 'running', startedAtMs: 1_000_000, endedAtMs: null },
+        { id: 'finished', agentType: 'Plan', status: 'done', startedAtMs: 900_000, endedAtMs: 950_000 },
+      ],
+    }));
+    harness.advanceClock(10);
+    const result = runHook(payloadWith({ agent_id: 'second', agent_type: 'Explore' }), harness.environment, harness.dependencies);
+    assert.deepEqual(result.lines, ['├─ general-purpose ●', '└─ Explore ●']);
+    const sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
+    assert.deepEqual(sessionState.subagents.map((entry) => entry.id), ['a12e8c491ce2f7f4a', 'second']);
   });
 
   test('two events in the same millisecond still get increasing seq', () => {

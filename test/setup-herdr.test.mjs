@@ -57,9 +57,14 @@ description = "sub agent viewer"
 claude = [
   ["state_icon", "machine", "workspace", "tab"],
   ["agent"],
-  [{ token = "$sub1", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub1", bold = true, dim = false }],
 ]
 `;
+
+const configuredByOlderVersion = alreadyConfigured.replace(
+  '[{ token = "$sub1", bold = true, dim = false }]',
+  '[{ token = "$sub1", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }]',
+);
 
 function countMarkers(text) {
   return text.split('\n').filter((line) => line.startsWith(markerStart)).length;
@@ -97,9 +102,10 @@ describe('setup', () => {
     assert.match(text, /\[\[keys\.command\]\]\nkey = "prefix\+\."\ntype = "plugin_action"\ncommand = "subagent\.watch\.open"/);
     assert.match(text, /\[ui\.sidebar\.agents\.rows_by_agent\]\nclaude = \[\n {2}\["state_icon", "machine", "workspace", "tab"\],\n {2}\["agent"\],/);
     for (let index = 1; index <= 5; index += 1) {
-      assert.ok(text.includes(`[{ token = "$sub${index}", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],`));
+      assert.ok(text.includes(`[{ token = "$sub${index}", bold = true, dim = false }],`));
     }
     assert.doesNotMatch(text, /\bfg\s*=/);
+    assert.doesNotMatch(text, /\brules\s*=|✓/);
   });
 
   test('rows table without claude: claude rows go right under the table header', () => {
@@ -126,6 +132,13 @@ describe('setup', () => {
     assert.equal(analysis.rows.state, 'configured');
     assert.deepEqual(operations, []);
     assert.equal(text, alreadyConfigured);
+  });
+
+  test('rows written by an older version (with the ✓ rule) still count as configured and are not rewritten', () => {
+    const { text, analysis, operations } = applyHerdrSetup(configuredByOlderVersion);
+    assert.equal(analysis.rows.state, 'configured');
+    assert.deepEqual(operations, []);
+    assert.equal(text, configuredByOlderVersion);
   });
 
   test('prefix+. bound to something else is reported and not touched', () => {

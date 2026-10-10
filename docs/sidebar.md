@@ -1,16 +1,18 @@
 # 側邊欄 sub agent 樹狀行
 
-herdr 側邊欄 claude 那一列底下，用最多 5 行顯示這個 session 的 sub agent：
+herdr 側邊欄 claude 那一列底下，用最多 5 行顯示這個 session **還在跑**的 sub agent：
 
 ```
 <state_icon> <workspace> · <tab>
 claude
 ├─ Explore ●
 ├─ general-purpose ●
-└─ Plan ✓
+└─ Plan ●
 ```
 
-`●` 跑中、`✓` 結束，不帶編號。popup viewer（`prefix+.`）是另一回事，見 `herdr-plugin.toml`。
+- 只列跑中的（`●`），不帶編號。sub 一結束（`SubagentStop`）那一行就拿掉，其餘的重排，`├─`／`└─` 每次都重算。
+- 沒有任何跑中的 sub 時，側邊欄只剩 claude 那一列。
+- 側邊欄不留歷程：結束的 sub 和它做過什麼，用 popup viewer（`prefix+.`）看，見 README。
 
 ## 原理
 
@@ -34,7 +36,9 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 
 ### 寫出的檔案（`$XDG_RUNTIME_DIR/subagent-watch/`，tmpfs，重開機就清）
 
-- `session-<sessionId>.json`：`{ sessionId, lastSequence, subagents: [{ id, agentType, status: "running" | "done", startedAtMs, endedAtMs }] }`
+- `session-<sessionId>.json`：`{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`，`subagents` 只放跑中的。`SubagentStop` 直接把那筆移除，檔案大小只跟同時在跑的 sub 數量有關，不會越長越大。
+  - 舊版留下、`status` 是 `"done"` 的項目，下一次事件讀檔時就丟掉。
+  - 同一個 sub 還在清單裡又收到 `SubagentStart` 時只留一筆（保留原本的啟動順序）；已經移除後再收到它的 `SubagentStart`（resume）就重新列在最後面。
 - `pane-<HERDR_PANE_ID>.json`：給 popup viewer 讀的對照檔，**合約固定**：`{"sessionId","transcriptPath","cwd","updatedAtMs"}`。
 
 兩個都用「寫暫存檔再 `rename`」，viewer 不會讀到寫一半的 JSON。同一個 session 的 read-modify-write 用 `session-<id>.json.lock`（`open` 的 `wx` flag）串起來，平行啟動多個 sub 也不會掉資料；lock 超過 2 秒沒放視為失效。
@@ -43,14 +47,16 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 
 ```
 herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
-  --token sub1=├─ Explore ● --token sub2=└─ Plan ✓ \
+  --token sub1=├─ Explore ● --token sub2=└─ Plan ● \
   --clear-token sub3 --clear-token sub4 --clear-token sub5
 ```
 
+最後一個跑中的 sub 結束時，五個 token 全部用 `--clear-token` 清掉。
+
 - 只用一個 source `subagent.watch`：herdr 每個 pane 一生最多 32 個 sequenced source，清掉也不會還。
 - `--seq` 用 `Date.now()`，同一毫秒連發時取「上一筆 + 1」，保證遞增（herdr 會忽略比較舊的 seq）。
-- 排序：跑中的照啟動時間排前面，再來是最近結束的。超過 5 個時第 5 行改成 `└─ +N more`。
-- herdr token 上限 80 字、會移除控制字元：`agent_type` 太長時截斷成 `…`，保證 `●`／`✓` 留在行尾。
+- 排序：照啟動時間。跑中的超過 5 個時第 5 行改成 `└─ +N more`，N 只算跑中、沒列出來的。
+- herdr token 上限 80 字、會移除控制字元：`agent_type` 太長時截斷成 `…`，保證 `●` 留在行尾。
 - herdr 路徑用 `HERDR_BIN_PATH`，沒有才找 PATH 上的 `herdr`。
 
 ### 不干擾 Claude session 的設計
@@ -66,9 +72,9 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 
 ### 已知限制
 
-- session 結束或換 session 後，舊的樹狀行會留著，直到這個 pane 下一次 sub agent 事件才被覆蓋（只接了 `SubagentStart`／`SubagentStop`，沒接 `SessionStart`／`SessionEnd`）。
-- 結束的 sub 不會自己消失：長 session 跑過很多 sub 後，側邊欄會固定佔 5 行（4 個最近的 + `+N more`）。
-- `●`、`✓`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
+- session 在還有 sub 跑中時結束或換 session，舊的樹狀行會留著，直到這個 pane 下一次 sub agent 事件才被覆蓋（只接了 `SubagentStart`／`SubagentStop`，沒接 `SessionStart`／`SessionEnd`）。
+- 某個 sub 的 `SubagentStop` 沒記到（例如等 lock 超過時間預算，hook 直接放棄這次事件），那一行在同一個 session 裡不會自己消失（那個 sub 之後再收到一次 `SubagentStop` 才會拿掉）；換 session 後的下一次 sub 事件才會蓋掉。
+- `●`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
 
 ## setup 會加什麼
 
@@ -106,20 +112,22 @@ description = "sub agent viewer"
 claude = [
   ["state_icon", "machine", "workspace", "tab"],
   ["agent"],
-  [{ token = "$sub1", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
-  [{ token = "$sub2", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
-  [{ token = "$sub3", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
-  [{ token = "$sub4", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
-  [{ token = "$sub5", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }],
+  [{ token = "$sub1", bold = true, dim = false }],
+  [{ token = "$sub2", bold = true, dim = false }],
+  [{ token = "$sub3", bold = true, dim = false }],
+  [{ token = "$sub4", bold = true, dim = false }],
+  [{ token = "$sub5", bold = true, dim = false }],
 ]
 ```
 
 前兩行是 herdr 文件裡的預設 rows。`rows_by_agent` 會整個取代 `rows`，不是接在後面，所以預設的兩行要寫進來；如果你在 `[ui.sidebar.agents]` 自訂過 `rows`，claude 那一列會改回這兩行（setup 會提醒）。
 
-`$sub*` 用 inline style table 加 `rules`，只用粗細區分狀態：跑中（`●`）`bold`，結束（`✓`，`contains = "✓"` 那條 rule）不 `bold`。
+`$sub*` 用 inline style table，一律 `bold`：側邊欄只會出現跑中的 sub，不用區分狀態。
 
 - 不指定 `fg`：顏色全部跟著 herdr theme，換 theme 也不用改這五行。
 - `dim = false`：herdr 文件寫明沒寫的欄位沿用 token 的 contextual style，明確寫 `false` 才會拿掉那個修飾，這裡確保樹狀行不會被畫成 dim。
+
+舊版 setup 每行多寫了 `rules = [{ contains = "✓", bold = false }]`。現在不會再出現 `✓`，那條 rule 留著也沒有作用。setup 看到 claude rows 已經有 `$sub1` 就當成設定好，不會改寫；想拿掉就自己刪，或（在 marker 裡的話）先跑 remove 再跑 setup。
 
 ## 怎麼移除
 
@@ -140,4 +148,4 @@ claude = [
 node --test test/sidebar*.test.mjs
 ```
 
-涵蓋 payload 解析、狀態更新、樹狀行（含 `+N more`、80 字截斷）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr、巢狀 `claude -p` 略過、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+涵蓋 payload 解析、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr、巢狀 `claude -p` 略過、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
