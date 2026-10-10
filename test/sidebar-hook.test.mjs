@@ -301,6 +301,8 @@ describe('runHook', () => {
       isExecutable: () => true,
       queryPaneAgentSession: () => ({ agent: 'claude', sessionId: startPayload.session_id }),
       countClaudeAncestors: () => 1,
+      // fixture 的 transcript_path 是實測時的真實路徑，開發機上可能真的存在：這組測試不看 transcript，清除死掉 sub 的規則另有測試
+      readFileTail: () => ({ isMissing: true }),
       deadlineMs: Number.POSITIVE_INFINITY,
       ...overrides,
     };

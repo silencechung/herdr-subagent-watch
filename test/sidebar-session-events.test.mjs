@@ -1,0 +1,596 @@
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { after, describe, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+// 用 namespace import：新加的 export 在舊版不存在時，只有用到它的測試失敗，不會整個檔案載入失敗
+import * as hook from '../hooks/sidebar-hook.mjs';
+
+const testDirectory = dirname(fileURLToPath(import.meta.url));
+const hookScriptPath = join(testDirectory, '..', 'hooks', 'sidebar-hook.mjs');
+const fixtureDirectory = join(testDirectory, 'fixtures', 'sidebar');
+const readFixture = (name) => readFileSync(join(fixtureDirectory, name), 'utf8');
+const startupPayload = JSON.parse(readFixture('session-start-startup.json'));
+const resumePayload = JSON.parse(readFixture('session-start-resume.json'));
+const stopPayload = JSON.parse(readFixture('stop.json'));
+const subagentStartPayload = JSON.parse(readFixture('subagent-start.json'));
+const apiErrorTailText = readFixture('subagent-tail-api-error.jsonl');
+const interruptedTailText = readFixture('subagent-tail-interrupted.jsonl');
+const testPaneId = 'w1:pSession';
+const minuteMs = 60 * 1000;
+const allTokensCleared = [
+  '--clear-token', 'sub1',
+  '--clear-token', 'sub2',
+  '--clear-token', 'sub3',
+  '--clear-token', 'sub4',
+  '--clear-token', 'sub5',
+];
+
+const temporaryDirectories = [];
+function createTemporaryDirectory() {
+  const directory = mkdtempSync(join(tmpdir(), 'sidebar-session-events-test-'));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+after(() => {
+  for (const directory of temporaryDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function parseRecords(text) {
+  return text.trim().split('\n').map((line) => JSON.parse(line));
+}
+
+function assistantToolUse(timestamp, name, input = {}) {
+  return { type: 'assistant', timestamp, message: { content: [{ type: 'tool_use', id: `toolu_${timestamp}`, name, input }], stop_reason: 'tool_use' } };
+}
+
+function assistantEndTurn(timestamp) {
+  return { type: 'assistant', timestamp, message: { content: [{ type: 'text', text: 'Summary' }], stop_reason: 'end_turn' } };
+}
+
+function userToolResult(timestamp) {
+  return { type: 'user', timestamp, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_x', content: 'ok' }] } };
+}
+
+function notificationLine(agentId, status, timestamp) {
+  const content = `<task-notification>\n<task-id>${agentId}</task-id>\n<status>${status}</status>\n<summary>Agent finished</summary>\n</task-notification>`;
+  return JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp, sessionId: 's', content });
+}
+
+function toJsonLines(records) {
+  return `${records.map((record) => JSON.stringify(record)).join('\n')}\n`;
+}
+
+// Claude Code 的 transcript 版面：<projects>/<project>/<session>.jsonl，sub 在 <session>/subagents/agent-<id>.jsonl
+function createSessionFiles(sessionId = 'aaaa0000-0000-4000-8000-0000000000aa') {
+  const projectDirectory = join(createTemporaryDirectory(), 'projects', '-srv-work');
+  const subagentsDirectory = join(projectDirectory, sessionId, 'subagents');
+  mkdirSync(subagentsDirectory, { recursive: true });
+  const transcriptPath = join(projectDirectory, `${sessionId}.jsonl`);
+  writeFileSync(transcriptPath, toJsonLines([{ type: 'user', timestamp: '2026-10-10T09:00:00.000Z', message: { content: 'go' } }]));
+  return {
+    sessionId,
+    transcriptPath,
+    subagentsDirectory,
+    writeSubagent(agentId, text, { meta = { agentType: 'general-purpose', requestShape: 'background' }, modifiedMs = null } = {}) {
+      const filePath = join(subagentsDirectory, `agent-${agentId}.jsonl`);
+      writeFileSync(filePath, text);
+      if (meta !== null) {
+        writeFileSync(join(subagentsDirectory, `agent-${agentId}.meta.json`), JSON.stringify(meta));
+      }
+      if (modifiedMs !== null) {
+        const modifiedDate = new Date(modifiedMs);
+        utimesSync(filePath, modifiedDate, modifiedDate);
+      }
+      return filePath;
+    },
+    appendMain(line) {
+      writeFileSync(transcriptPath, `${readFileSync(transcriptPath, 'utf8')}${line}\n`);
+    },
+  };
+}
+
+describe('SessionStart and Stop payloads', () => {
+  test('the real SessionStart payloads (startup, resume) are read without an agent', () => {
+    assert.deepEqual(hook.parseHookPayload(JSON.stringify(startupPayload)), {
+      eventName: 'SessionStart',
+      sessionId: startupPayload.session_id,
+      agentId: null,
+      agentType: null,
+      transcriptPath: startupPayload.transcript_path,
+      cwd: startupPayload.cwd,
+      source: 'startup',
+    });
+    assert.equal(hook.parseHookPayload(JSON.stringify(resumePayload)).source, 'resume');
+  });
+
+  test('the real Stop payload is read without an agent', () => {
+    const event = hook.parseHookPayload(JSON.stringify(stopPayload));
+    assert.equal(event.eventName, 'Stop');
+    assert.equal(event.sessionId, stopPayload.session_id);
+    assert.equal(event.agentId, null);
+    assert.equal(event.transcriptPath, stopPayload.transcript_path);
+  });
+
+  test('a SessionStart with an unknown or odd source still counts, and agent_type from `claude --agent` is not a sub agent', () => {
+    for (const source of [undefined, '', 'Weird Value', 42, 'x'.repeat(40)]) {
+      assert.equal(hook.parseHookPayload(JSON.stringify({ ...startupPayload, source })).source, 'unknown', String(source));
+    }
+    const withAgent = hook.parseHookPayload(JSON.stringify({ ...startupPayload, agent_type: 'reviewer' }));
+    assert.equal(withAgent.agentId, null);
+    assert.equal(withAgent.agentType, null);
+    assert.equal(hook.parseHookPayload(JSON.stringify({ ...stopPayload, session_id: '../escape' })), null);
+  });
+});
+
+function createHarness({ clockMs = Date.parse('2026-10-10T10:00:00.000Z'), ...overrides } = {}) {
+  const runtimeDirectory = createTemporaryDirectory();
+  const herdrCalls = [];
+  let currentMs = clockMs;
+  const dependencies = {
+    now: () => currentMs,
+    runHerdr: (binaryPath, argumentList) => {
+      herdrCalls.push(argumentList);
+    },
+    isExecutable: () => true,
+    queryPaneAgentSession: () => null,
+    countClaudeAncestors: () => 1,
+    deadlineMs: Number.POSITIVE_INFINITY,
+    ...overrides,
+  };
+  const environment = { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory };
+  const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+  const paneMapPath = join(stateDirectory, `pane-${testPaneId}.json`);
+  return {
+    runtimeDirectory,
+    stateDirectory,
+    paneMapPath,
+    herdrCalls,
+    run: (payload) => hook.runHook(JSON.stringify(payload), environment, dependencies),
+    readPaneMap: () => JSON.parse(readFileSync(paneMapPath, 'utf8')),
+    readState: (sessionId) => JSON.parse(readFileSync(join(stateDirectory, `session-${sessionId}.json`), 'utf8')),
+    writeState: (sessionId, subagents) => {
+      mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+      writeFileSync(join(stateDirectory, `session-${sessionId}.json`), JSON.stringify({ sessionId, lastSequence: 0, subagents }));
+    },
+    advanceClock: (durationMs) => {
+      currentMs += durationMs;
+    },
+    nowMs: () => currentMs,
+  };
+}
+
+function sessionPayload(base, files, overrides = {}) {
+  return { ...base, session_id: files.sessionId, transcript_path: files.transcriptPath, ...overrides };
+}
+
+describe('SessionStart writes the pane map and redraws the sidebar for the new session', () => {
+  test('the pane map carries the SessionStart mark and the tokens are cleared for a session without sub agents', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    const result = harness.run(sessionPayload(startupPayload, files));
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.lines, []);
+    assert.deepEqual(harness.herdrCalls[0].slice(7), allTokensCleared);
+    assert.deepEqual(harness.readPaneMap(), {
+      sessionId: files.sessionId,
+      transcriptPath: files.transcriptPath,
+      cwd: startupPayload.cwd,
+      updatedAtMs: harness.nowMs(),
+      sessionStartSource: 'startup',
+    });
+    // 沒有 sub 的 session 不留空的狀態檔：每個 session 都會觸發 SessionStart
+    assert.deepEqual(readdirSync(harness.stateDirectory).filter((name) => name.startsWith('session-')), []);
+  });
+
+  test('switching to another session replaces the old tree right away instead of waiting for the next sub agent event', () => {
+    const harness = createHarness();
+    const oldFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000001');
+    const newFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000002');
+    harness.run({ ...subagentStartPayload, session_id: oldFiles.sessionId, transcript_path: oldFiles.transcriptPath, agent_id: 'oldrunning1', agent_type: 'Explore' });
+    assert.ok(harness.herdrCalls[0].includes('sub1=└─ Explore ●'));
+    harness.advanceClock(1000);
+    const result = harness.run(sessionPayload(startupPayload, newFiles, { source: 'clear' }));
+    assert.deepEqual(result.lines, []);
+    assert.deepEqual(harness.herdrCalls[1].slice(7), allTokensCleared);
+    assert.equal(harness.readPaneMap().sessionId, newFiles.sessionId);
+    assert.equal(harness.readPaneMap().sessionStartSource, 'clear');
+  });
+
+  test('resuming a session that still has running sub agents draws that session\'s tree', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'stillrunning1', agentType: 'Plan', startedAtMs: harness.nowMs() - 1000 }]);
+    files.writeSubagent('stillrunning1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.000Z', 'Bash', { command: 'ls' })]));
+    const result = harness.run(sessionPayload(resumePayload, files));
+    assert.deepEqual(result.lines, ['└─ Plan ●']);
+    assert.equal(harness.readPaneMap().sessionStartSource, 'resume');
+  });
+
+  test('sub agent events of the same session keep the mark; an event of another session does not inherit it', () => {
+    const harness = createHarness();
+    const files = createSessionFiles('aaaa0000-0000-4000-8000-000000000003');
+    harness.run(sessionPayload(startupPayload, files));
+    const subagentStart = { ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'keepmark1' };
+    harness.advanceClock(10);
+    harness.run(subagentStart);
+    assert.equal(harness.readPaneMap().sessionStartSource, 'startup');
+    assert.equal(harness.readPaneMap().updatedAtMs, harness.nowMs());
+    harness.advanceClock(10);
+    harness.run({ ...subagentStart, hook_event_name: 'SubagentStop' });
+    assert.equal(harness.readPaneMap().sessionStartSource, 'startup');
+
+    const otherFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000004');
+    harness.run({ ...subagentStart, session_id: otherFiles.sessionId, transcript_path: otherFiles.transcriptPath });
+    const paneMap = harness.readPaneMap();
+    assert.equal(paneMap.sessionId, otherFiles.sessionId);
+    assert.equal('sessionStartSource' in paneMap, false);
+  });
+
+  test('a nested-looking SessionStart that herdr does not confirm writes nothing', () => {
+    const harness = createHarness({ countClaudeAncestors: () => 2, queryPaneAgentSession: () => ({ agent: 'claude', sessionId: 'main-session' }) });
+    const result = harness.run(sessionPayload(startupPayload, createSessionFiles()));
+    assert.deepEqual(result, { action: 'skipped', reason: 'nested-claude' });
+    assert.deepEqual(readdirSync(harness.runtimeDirectory), []);
+    assert.equal(harness.herdrCalls.length, 0);
+  });
+});
+
+describe('Stop only prunes and redraws', () => {
+  test('Stop never writes the pane map', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.run(sessionPayload(stopPayload, files));
+    assert.equal(existsSync(harness.paneMapPath), false);
+    harness.run(sessionPayload(startupPayload, files));
+    const written = readFileSync(harness.paneMapPath, 'utf8');
+    harness.advanceClock(5000);
+    harness.run(sessionPayload(stopPayload, files));
+    assert.equal(readFileSync(harness.paneMapPath, 'utf8'), written);
+  });
+
+  test('Stop with nothing to prune does not call herdr', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
+    files.writeSubagent('running1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.500Z', 'Bash')]));
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+    assert.equal(harness.herdrCalls.length, 0);
+  });
+
+  test('review 23:19 (w8:pV): a sub agent stopped by an API error is removed on the next Stop and the tree is redrawn', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [
+      { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
+      { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
+    ]);
+    files.writeSubagent('aapierror0000001', apiErrorTailText);
+    files.writeSubagent('running2', toJsonLines([assistantToolUse('2026-10-10T09:59:00.000Z', 'Grep', { pattern: 'x' })]));
+    const result = harness.run(sessionPayload(stopPayload, files));
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
+    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2']);
+  });
+
+  test('pruning also runs on SubagentStart and SubagentStop, but never judges the sub agent that is just starting', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [
+      { id: 'finished1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') },
+    ]);
+    files.writeSubagent('finished1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback', { message: 'done' })]));
+    // resume：transcript 尾端還是上一輪的 SubagentHandback
+    files.writeSubagent('resumed1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback', { message: 'old' })]));
+    const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'resumed1', agent_type: 'Explore' });
+    assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
+    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    // 下一個事件：resume 後的 sub 還沒寫新紀錄，舊的 handback 早於它的 SubagentStart，不算
+    harness.advanceClock(3000);
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+  });
+
+  test('without the main transcript nothing is pruned (the sub agent paths cannot be trusted)', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'nofile1', agentType: 'Plan', startedAtMs: harness.nowMs() - 3 * 60 * minuteMs }]);
+    const missingMain = join(dirname(files.transcriptPath), 'bbbb0000-0000-4000-8000-0000000000bb.jsonl');
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files, { transcript_path: missingMain })), { action: 'unchanged' });
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files, { transcript_path: 'relative/x.jsonl' })), { action: 'unchanged' });
+  });
+
+  test('pruning stops when the time budget runs out and keeps the rest', () => {
+    const files = createSessionFiles();
+    const state = { sessionId: files.sessionId, lastSequence: 0, subagents: [
+      { id: 'done1', agentType: 'Plan', startedAtMs: 0 },
+      { id: 'done2', agentType: 'Plan', startedAtMs: 0 },
+    ] };
+    for (const agentId of ['done1', 'done2']) {
+      files.writeSubagent(agentId, toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
+    }
+    const event = hook.parseHookPayload(JSON.stringify(sessionPayload(stopPayload, files)));
+    let checks = 0;
+    const result = hook.pruneEndedSubagents(state, event, { nowMs: Date.parse('2026-10-10T10:00:00.000Z'), hasTimeLeft: () => {
+      checks += 1;
+      return checks === 1;
+    } });
+    assert.deepEqual(result.removed, [{ id: 'done1', reason: 'handback' }]);
+    assert.deepEqual(result.state.subagents.map((subagent) => subagent.id), ['done2']);
+  });
+});
+
+// 官方 hooks 文件（https://code.claude.com/docs/en/hooks#stopfailure）的範例 payload：回合因 API 錯誤結束時不觸發 Stop、改觸發 StopFailure。
+// 本機沒有實際觸發過（要真的遇到 API 錯誤），欄位照文件
+const stopFailurePayload = {
+  session_id: 'abc123',
+  transcript_path: '/Users/.../.claude/projects/.../00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl',
+  cwd: '/Users/...',
+  hook_event_name: 'StopFailure',
+  error: 'rate_limit',
+  error_details: '429 Too Many Requests',
+  last_assistant_message: 'API Error: Rate limit reached',
+};
+
+describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
+  test('the documented StopFailure payload is read as a session event, whatever the error type', () => {
+    assert.deepEqual(hook.parseHookPayload(JSON.stringify(stopFailurePayload)), {
+      eventName: 'StopFailure',
+      sessionId: 'abc123',
+      agentId: null,
+      agentType: null,
+      transcriptPath: stopFailurePayload.transcript_path,
+      cwd: '/Users/...',
+      source: null,
+    });
+    for (const error of ['overloaded', 'server_error', 'unknown', 'something_new', undefined]) {
+      assert.equal(hook.parseHookPayload(JSON.stringify({ ...stopFailurePayload, error })).eventName, 'StopFailure', String(error));
+    }
+    assert.equal(hook.parseHookPayload(JSON.stringify({ ...stopFailurePayload, session_id: '../escape' })), null);
+  });
+
+  test('a sub agent stopped by the same API error is removed on StopFailure and the tree is redrawn', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [
+      { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
+      { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
+    ]);
+    files.writeSubagent('aapierror0000001', apiErrorTailText);
+    files.writeSubagent('running2', toJsonLines([assistantToolUse('2026-10-10T09:59:00.000Z', 'Grep', { pattern: 'x' })]));
+    const result = harness.run(sessionPayload(stopFailurePayload, files));
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
+    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(harness.herdrCalls.length, 1);
+    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2']);
+  });
+
+  test('StopFailure never writes the pane map and calls herdr only when something was removed', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
+    files.writeSubagent('running1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.500Z', 'Bash')]));
+    assert.deepEqual(harness.run(sessionPayload(stopFailurePayload, files)), { action: 'unchanged' });
+    assert.equal(existsSync(harness.paneMapPath), false);
+    assert.equal(harness.herdrCalls.length, 0);
+
+    harness.run(sessionPayload(startupPayload, files));
+    const written = readFileSync(harness.paneMapPath, 'utf8');
+    harness.advanceClock(5000);
+    assert.deepEqual(harness.run(sessionPayload(stopFailurePayload, files)), { action: 'unchanged' });
+    assert.equal(readFileSync(harness.paneMapPath, 'utf8'), written);
+  });
+
+  test('the nested claude check applies to StopFailure as well', () => {
+    const files = createSessionFiles();
+    const nested = createHarness({ countClaudeAncestors: () => 2, queryPaneAgentSession: () => ({ agent: 'claude', sessionId: 'main-session' }) });
+    assert.deepEqual(nested.run(sessionPayload(stopFailurePayload, files)), { action: 'skipped', reason: 'nested-claude' });
+    assert.deepEqual(readdirSync(nested.runtimeDirectory), []);
+    const confirmed = createHarness({ countClaudeAncestors: () => 2, queryPaneAgentSession: () => ({ agent: 'claude', sessionId: files.sessionId }) });
+    assert.deepEqual(confirmed.run(sessionPayload(stopFailurePayload, files)), { action: 'unchanged' });
+  });
+});
+
+describe('when a sub agent counts as ended', () => {
+  const nowMs = Date.parse('2026-10-10T10:00:00.000Z');
+  const startedAtMs = Date.parse('2026-10-10T09:00:00.000Z');
+  const recentWriteMs = nowMs - 1000;
+  const judge = (records, overrides = {}) => hook.detectSubagentEnd({ startedAtMs, records, lastWriteMs: recentWriteMs, nowMs, ...overrides });
+
+  test('the real API error tail (usage limit) counts as ended', () => {
+    assert.equal(judge(parseRecords(apiErrorTailText)), 'api_error');
+  });
+
+  test('the real interrupted tail counts as ended', () => {
+    assert.equal(judge(parseRecords(interruptedTailText), { startedAtMs: Date.parse('2026-10-09T06:00:00.000Z') }), 'interrupted');
+  });
+
+  test('an API error or interruption followed by a new prompt (the sub agent was resumed) does not count', () => {
+    const resumed = [...parseRecords(apiErrorTailText), { type: 'user', timestamp: '2026-10-10T09:40:00.000Z', message: { content: 'continue' } }];
+    assert.equal(judge(resumed), null);
+    const interruptedThenResumed = [...parseRecords(interruptedTailText), { type: 'user', timestamp: '2026-10-09T06:31:00.000Z', message: { content: 'go on' } }];
+    assert.equal(judge(interruptedThenResumed, { startedAtMs: Date.parse('2026-10-09T06:00:00.000Z') }), null);
+  });
+
+  test('the viewer rules are reused: SubagentHandback, end_turn only for non-background sub agents, and task notifications', () => {
+    assert.equal(judge([assistantToolUse('2026-10-10T09:30:00.000Z', 'SubagentHandback')]), 'handback');
+    const endTurn = [assistantToolUse('2026-10-10T09:30:00.000Z', 'Bash'), assistantEndTurn('2026-10-10T09:31:00.000Z')];
+    assert.equal(judge(endTurn, { meta: { requestShape: 'background' } }), null);
+    assert.equal(judge(endTurn, { meta: { requestShape: 'background', isFork: true } }), 'end_turn');
+    const notification = { agentId: 'x', status: 'killed', timestampMs: Date.parse('2026-10-10T09:32:00.000Z') };
+    assert.equal(judge([assistantToolUse('2026-10-10T09:30:00.000Z', 'Bash')], { notification }), 'killed');
+  });
+
+  test('a running sub agent waiting on a tool result does not count, even after 59 minutes without writes', () => {
+    const running = [assistantToolUse('2026-10-10T09:01:00.000Z', 'Bash', { command: 'make' }), userToolResult('2026-10-10T09:01:30.000Z')];
+    assert.equal(judge(running), null);
+    const earlyStartMs = Date.parse('2026-10-10T08:00:00.000Z');
+    assert.equal(judge(running, { startedAtMs: earlyStartMs, lastWriteMs: nowMs - 59 * minuteMs }), null);
+    assert.equal(judge(running, { startedAtMs: earlyStartMs, lastWriteMs: nowMs - 61 * minuteMs }), 'abandoned');
+  });
+
+  test('a resumed sub agent is not abandoned while its transcript still has the old modification time', () => {
+    const running = [assistantToolUse('2026-10-10T07:00:00.000Z', 'Bash')];
+    assert.equal(judge(running, { startedAtMs: nowMs - 5000, lastWriteMs: nowMs - 3 * 60 * minuteMs }), null);
+  });
+
+  test('end signals from before the SubagentStart (an earlier run) do not count, apart from a small clock tolerance', () => {
+    const handback = [assistantToolUse('2026-10-10T09:30:00.000Z', 'SubagentHandback')];
+    assert.equal(judge(handback, { startedAtMs: Date.parse('2026-10-10T09:35:00.000Z') }), null);
+    assert.equal(judge(parseRecords(apiErrorTailText), { startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') }), null);
+    // hook 的 now() 比 sub 第一筆紀錄晚一點點取：立刻遇到 API 錯誤的 sub 仍要算結束
+    assert.equal(judge(parseRecords(apiErrorTailText), { startedAtMs: Date.parse('2026-10-10T09:33:04.500Z') }), 'api_error');
+  });
+});
+
+describe('reading only the end of a transcript', () => {
+  test('a large transcript is judged from its last 64 KB', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    const filler = toJsonLines(Array.from({ length: 4000 }, (unused, index) => assistantToolUse(`2026-10-10T09:10:${String(index % 60).padStart(2, '0')}.000Z`, 'Bash', { command: 'x'.repeat(200) })));
+    assert.ok(filler.length > 10 * hook.transcriptTailBytes);
+    harness.writeState(files.sessionId, [
+      { id: 'bigdone1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') },
+      { id: 'bigold1', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') },
+    ]);
+    files.writeSubagent('bigdone1', filler + toJsonLines([assistantToolUse('2026-10-10T09:50:00.000Z', 'SubagentHandback')]));
+    // 結束訊號在尾端 64 KB 之前：讀不到，當成還在跑（README 已知限制）
+    files.writeSubagent('bigold1', toJsonLines([assistantToolUse('2026-10-10T09:05:00.000Z', 'SubagentHandback')]) + filler);
+    const result = harness.run(sessionPayload(stopPayload, files));
+    assert.deepEqual(result.removed, [{ id: 'bigdone1', reason: 'handback' }]);
+  });
+
+  test('a task notification in the tail of the main transcript ends a killed sub agent', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'killed1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') }]);
+    files.writeSubagent('killed1', toJsonLines([assistantToolUse('2026-10-10T09:10:00.000Z', 'Bash')]));
+    files.appendMain(notificationLine('killed1', 'killed', '2026-10-10T09:11:00.000Z'));
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)).removed, [{ id: 'killed1', reason: 'killed' }]);
+  });
+
+  test('a transcript that is not there yet is kept for 2 minutes, then removed', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'nofileyet1', agentType: 'Plan', startedAtMs: harness.nowMs() }]);
+    harness.advanceClock(hook.missingTranscriptGraceMs - 1000);
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+    harness.advanceClock(2000);
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)).removed, [{ id: 'nofileyet1', reason: 'missing-transcript' }]);
+  });
+
+  test('a FIFO planted where a transcript should be is not waited on', () => {
+    const files = createSessionFiles();
+    const fifoPath = join(files.subagentsDirectory, 'agent-fifo1.jsonl');
+    const made = spawnSync('mkfifo', [fifoPath]);
+    if (made.status !== 0) {
+      return;
+    }
+    const startedAtMs = Date.now();
+    assert.equal(hook.readFileTail(fifoPath, hook.transcriptTailBytes), null);
+    assert.ok(Date.now() - startedAtMs < 500);
+  });
+});
+
+describe('hook script with SessionStart and Stop, as Claude Code runs it', () => {
+  function createScriptCase() {
+    const workDirectory = createTemporaryDirectory();
+    const runtimeDirectory = join(workDirectory, 'runtime');
+    mkdirSync(runtimeDirectory, { mode: 0o700 });
+    const callLogPath = join(workDirectory, 'herdr-calls.jsonl');
+    const fakeHerdrPath = join(workDirectory, 'herdr');
+    writeFileSync(fakeHerdrPath, [
+      `#!${process.execPath}`,
+      `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    return {
+      runtimeDirectory,
+      callLogPath,
+      environment: { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtimeDirectory, HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: fakeHerdrPath },
+    };
+  }
+
+  function runScript(environment, payload) {
+    const startedAtMs = Date.now();
+    const result = spawnSync(process.execPath, [hookScriptPath], { input: JSON.stringify(payload), env: environment, encoding: 'utf8', timeout: 5000 });
+    return { ...result, elapsedMs: Date.now() - startedAtMs };
+  }
+
+  const readCalls = (callLogPath) => readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+
+  test('SessionStart: exit 0, no output, pane map marked, tokens cleared, under 1 second', () => {
+    const scriptCase = createScriptCase();
+    const files = createSessionFiles();
+    const result = runScript(scriptCase.environment, sessionPayload(startupPayload, files));
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
+    assert.ok(result.elapsedMs < 1000, `took ${result.elapsedMs}ms`);
+    const paneMap = JSON.parse(readFileSync(join(scriptCase.runtimeDirectory, 'subagent-watch', `pane-${testPaneId}.json`), 'utf8'));
+    assert.equal(paneMap.sessionStartSource, 'startup');
+    assert.equal(paneMap.sessionId, files.sessionId);
+    assert.deepEqual(readCalls(scriptCase.callLogPath).map((call) => call.slice(7)), [allTokensCleared]);
+  });
+
+  test('Stop: a stuck sub agent among five with large transcripts is removed within the time budget', () => {
+    const scriptCase = createScriptCase();
+    const files = createSessionFiles();
+    const filler = toJsonLines(Array.from({ length: 2000 }, (unused, index) => assistantToolUse(`2026-10-10T09:20:${String(index % 60).padStart(2, '0')}.000Z`, 'Read', { file_path: '/x'.repeat(100) })));
+    const subagents = [];
+    for (let index = 0; index < 5; index += 1) {
+      const agentId = `bigrun${index}`;
+      subagents.push({ id: agentId, agentType: `worker${index}`, startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') + index });
+      files.writeSubagent(agentId, filler);
+    }
+    files.writeSubagent('bigrun2', filler + apiErrorTailText);
+    mkdirSync(join(scriptCase.runtimeDirectory, 'subagent-watch'), { mode: 0o700 });
+    writeFileSync(join(scriptCase.runtimeDirectory, 'subagent-watch', `session-${files.sessionId}.json`), JSON.stringify({ sessionId: files.sessionId, lastSequence: 0, subagents }));
+    const result = runScript(scriptCase.environment, sessionPayload(stopPayload, files));
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.ok(result.elapsedMs < 1000, `took ${result.elapsedMs}ms`);
+    const calls = readCalls(scriptCase.callLogPath);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].filter((argument) => /^sub\d/.test(argument)), [
+      'sub1=├─ worker0 ●',
+      'sub2=├─ worker1 ●',
+      'sub3=├─ worker3 ●',
+      'sub4=└─ worker4 ●',
+      'sub5',
+    ]);
+  });
+
+  test('StopFailure: exit 0, no output, the sub agent stopped by the API error is removed, no pane map written', () => {
+    const scriptCase = createScriptCase();
+    const files = createSessionFiles();
+    const stateDirectory = join(scriptCase.runtimeDirectory, 'subagent-watch');
+    mkdirSync(stateDirectory, { mode: 0o700 });
+    writeFileSync(join(stateDirectory, `session-${files.sessionId}.json`), JSON.stringify({ sessionId: files.sessionId, lastSequence: 0, subagents: [
+      { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
+    ] }));
+    files.writeSubagent('aapierror0000001', apiErrorTailText);
+    const result = runScript(scriptCase.environment, sessionPayload(stopFailurePayload, files));
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
+    assert.ok(result.elapsedMs < 1000, `took ${result.elapsedMs}ms`);
+    assert.deepEqual(readCalls(scriptCase.callLogPath).map((call) => call.slice(7)), [allTokensCleared]);
+    assert.equal(existsSync(join(stateDirectory, `pane-${testPaneId}.json`)), false);
+  });
+});
