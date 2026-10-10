@@ -3,7 +3,7 @@ import { getClaudeProjectsDirectory } from './lib/claude-config.mjs';
 import { createDemoSource } from './lib/demo.mjs';
 import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder } from './lib/keys.mjs';
-import { ansi, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
+import { ansi, buildEventLayout, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
@@ -199,13 +199,14 @@ function createController({ options, environment, onChange }) {
       return true;
     },
     // 回傳 key 是不是捲動鍵；只動目前選取的 tab，其他 tab 的位置各自留著
-    scroll(key, height) {
+    // width 要和畫面用的一樣：捲動以折行後的畫面行為單位
+    scroll(key, width, height) {
       const tabs = getTabs(Date.now());
       if (tabs.length === 0) {
         return false;
       }
       const tab = tabs[getSelectedIndex(tabs)];
-      return applyScrollKey(getScrollState(tab.agentId), key, tab.events.length, getBodyHeight(height));
+      return applyScrollKey(getScrollState(tab.agentId), key, buildEventLayout(tab.events, width), getBodyHeight(height));
     },
     buildLines(width, height, useColor) {
       const nowMs = Date.now();
@@ -214,11 +215,13 @@ function createController({ options, environment, onChange }) {
       const hasSession = options.isDemo || (session !== null && session.transcriptPath !== null);
       const messages = hasSession ? [emptySessionMessage] : getUnresolvedMessages(session);
       let scrollView = null;
+      let layout = null;
       if (tabs.length > 0) {
         const tab = tabs[selectedIndex];
-        scrollView = resolveScrollView(getScrollState(tab.agentId), tab.events.length, getBodyHeight(height));
+        layout = buildEventLayout(tab.events, width);
+        scrollView = resolveScrollView(getScrollState(tab.agentId), layout, getBodyHeight(height));
       }
-      return buildFrame({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages, scrollView });
+      return buildFrame({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages, scrollView, layout });
     },
   };
 }
@@ -298,7 +301,7 @@ function runInteractive(controller, setOnChange) {
       render();
       return;
     }
-    if (controller.scroll(key, process.stdout.rows || defaultHeight)) {
+    if (controller.scroll(key, process.stdout.columns || defaultWidth, process.stdout.rows || defaultHeight)) {
       render();
     }
   });

@@ -76,7 +76,7 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 | 按鍵 | 作用 |
 | --- | --- |
 | `←` / `→` | 切換 tab（循環） |
-| `↑` / `↓` | 捲一行 |
+| `↑` / `↓` | 捲一行（折行後的畫面行，以下同） |
 | `PgUp` / `PgDn` | 捲一頁 |
 | `Home` | 捲到最舊 |
 | `End` | 回到最新、恢復 follow |
@@ -91,10 +91,15 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
   - 不是 TTY（`--once` 導到檔案或 pipe）時輸出同樣結構的純文字。
 - tab 名稱用 meta 的 `agentType`；同一個 type 出現多次時接 `description` 片段區分。
 - 新的 `agent-*.jsonl` 出現就即時多一個 tab（`fs.watch` 監看 `subagents/`，每秒 polling 備援）。第一次有 tab 時選最新的跑中 sub，之後選取跟著 agent 走，新 tab 不會搶走目前看的。
-- 事件一行一個：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。resize 會重畫。
-- 捲動：每個 sub 的事件整份留著（不限筆數，開啟時從頭讀整個 transcript），可以捲回最舊的一行。
+- 事件格式：`HH:MM:SS  <tool>  <參數摘要>`。Bash 取 `command`、Read／Edit／Write 取 `file_path`、Grep 取 `pattern`、WebFetch 取 `url`、Agent 取 `description`，其他取第一個字串欄位；thinking 顯示 `thinking...`。只顯示 assistant 的 `tool_use` 與 thinking，不顯示 `tool_result` 內容。
+  - 摘要太長時自動折行，續行縮排對齊摘要欄（時間與 tool 欄留白）；寬度照 display width 算（CJK／全形算 2 格），寬字不會被切半。
+  - 多行內容（例 Bash heredoc）保留原本的換行與縮排，每一行各自折行；tab 換成 4 個空白。
+  - tool 名稱比 tool 欄（10 格）寬時（例 `SubagentHandback`），tool 名稱自己佔一行、摘要從下一行的摘要欄開始，所有事件的摘要都對齊同一欄。
+  - 一個事件最多 20 行，超過時第 20 行顯示 `… (+N more lines)`（dim）。
+  - resize 會重新折行，暫停中的捲動位置停在同一個事件。
+- 捲動：每個 sub 的事件整份留著（不限筆數，開啟時從頭讀整個 transcript），可以捲回最舊的一行。捲動單位是折行後的畫面行。
   - 預設 follow：新事件進來自動捲到最新。
-  - 往上捲就暫停 follow，底部提示列最前面顯示 `↓ N new`（暫停後新進來的行數）；按 `End` 或捲回最底恢復 follow。
+  - 往上捲就暫停 follow，底部提示列最前面顯示 `↓ N new`（暫停後新進來的事件佔幾個畫面行）；按 `End` 或捲回最底恢復 follow。
   - 每個 tab 各自記住捲動位置，切 tab 不會影響其他 tab。
   - 底部提示列：`<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`，視窗窄時自動縮短。
 - 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、未預期的例外都會關）。
@@ -163,7 +168,7 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
 - herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。
 - 開了 mouse reporting，在 viewer 裡用滑鼠拖曳選字會被 viewer 吃掉、選不到字。部分 terminal 按住 Shift 拖曳可以繞過，herdr popup 裡是否可行未驗證。
-- `SubagentHandback` 這類長 tool 名稱會把該行的參數往右推，不對齊。
+- 摘要在讀 transcript 時只留前 20 行、總寬度 8000 欄（夠在 400 欄寬的摘要欄折滿 20 行）；被截掉的部分在 `+N` 裡每個原始行算一行，原始行很長時實際會更多。
 - 視窗窄時摘要照樣保留，tab 列只顯示選取的 tab 附近幾個，兩端箭頭變 magenta 代表那一側還有藏起來的 tab；單一 tab 比剩下的寬度還寬時只截名稱（結尾 `…`），狀態符號一定看得到。
 - setup 沒有 TOML parser，只做逐行文字處理：看不懂的寫法（多行字串、inline table 形式的 `rows_by_agent` 等）會跳過或被 `herdr config check` 擋下還原，這時照 log 的片段手動貼。
 - plugin 目錄路徑含 `"`、`$`、`` ` ``、`\` 時 setup 不會寫 hook（會破壞 shell command），要手動設定。

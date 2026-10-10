@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  buildToolSummary,
   detectRecordEndSignal,
   extractRecordEvents,
   parseJsonLine,
@@ -38,7 +39,7 @@ test('splitCompleteLines holds back a partial last line until its newline arrive
 });
 
 test('summarizeToolInput picks the documented field for each tool', () => {
-  assert.equal(summarizeToolInput('Bash', { description: 'Check', command: 'git status\nls' }), 'git status ls');
+  assert.equal(summarizeToolInput('Bash', { description: 'Check', command: 'git status\nls' }), 'git status\nls');
   assert.equal(summarizeToolInput('Read', { limit: 10, file_path: '/tmp/a.mjs' }), '/tmp/a.mjs');
   assert.equal(summarizeToolInput('Edit', { old_string: 'x', file_path: '/tmp/b.mjs' }), '/tmp/b.mjs');
   assert.equal(summarizeToolInput('Write', { content: 'body', file_path: '/tmp/c.md' }), '/tmp/c.md');
@@ -65,6 +66,7 @@ test('extractRecordEvents returns tool_use and thinking from assistant records o
   assert.deepEqual(events[0], { kind: 'thinking', toolUseId: null, timestampMs: Date.parse('2026-10-10T01:00:00.000Z'), tool: thinkingLabel, summary: '' });
   assert.equal(events[1].tool, 'Bash');
   assert.equal(events[1].summary, 'ls');
+  assert.equal(events[1].omittedLineCount, 0);
   assert.equal(events[1].toolUseId, 'toolu_1');
 
   const toolResult = {
@@ -105,8 +107,27 @@ test('parseTaskNotifications reads agent id and terminal status from the main tr
   assert.deepEqual(parseTaskNotifications('{"type":"user"}'), []);
 });
 
-test('a very long summary is cut to a bounded width', () => {
-  const summary = summarizeToolInput('Bash', { command: `cat <<'EOF'\n${'x'.repeat(5000)}\nEOF` });
-  assert.equal(summary.length, 1000);
-  assert.ok(summary.startsWith("cat <<'EOF' xxx"));
+test('a multi-line command keeps its line breaks and indentation', () => {
+  const command = "cat <<'EOF' > notes.md\n# Notes\n\n  - item\n\tindented by tab\nEOF\n";
+  assert.deepEqual(buildToolSummary('Bash', { command }), {
+    summary: "cat <<'EOF' > notes.md\n# Notes\n\n  - item\n    indented by tab\nEOF",
+    omittedLineCount: 0,
+  });
+});
+
+test('a long command keeps enough to fill 20 wrapped rows and counts what it drops', () => {
+  // 5000 欄的單行還在上限內，整行留著讓 viewer 折行
+  const heredoc = buildToolSummary('Bash', { command: `cat <<'EOF'\n${'x'.repeat(5000)}\nEOF` });
+  assert.equal(heredoc.summary, `cat <<'EOF'\n${'x'.repeat(5000)}\nEOF`);
+  assert.equal(heredoc.omittedLineCount, 0);
+  // 超過總寬度上限：那一行截到上限，它和後面的行都算進 omittedLineCount
+  const huge = buildToolSummary('Bash', { command: `cat <<'EOF'\n${'x'.repeat(50_000)}\nEOF` });
+  assert.equal(huge.summary.length, 8000 + 1);
+  assert.ok(huge.summary.startsWith("cat <<'EOF'\nxxx"));
+  assert.equal(huge.omittedLineCount, 2);
+  // 行數超過 20：只留前 20 行
+  const manyLines = buildToolSummary('Bash', { command: Array.from({ length: 500 }, (_, index) => `echo ${index}`).join('\n') });
+  assert.equal(manyLines.summary.split('\n').length, 20);
+  assert.equal(manyLines.summary.split('\n').at(-1), 'echo 19');
+  assert.equal(manyLines.omittedLineCount, 480);
 });

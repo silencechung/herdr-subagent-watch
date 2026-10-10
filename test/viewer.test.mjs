@@ -50,7 +50,8 @@ test('--once --session prints a frame from a real transcript layout and exits 0 
   assert.doesNotMatch(lines[0].split('│')[1], /\d/);
   // 第一次開啟選最新的跑中 sub：fixture 只有 Explore 還在跑
   assert.match(result.stdout, /Grep {8}emitKeypressEvents/);
-  assert.match(result.stdout, /Bash {8}git status --short ls src/);
+  // 多行指令保留換行，第二行縮排到摘要欄
+  assert.match(result.stdout, /Bash {8}git status --short\n {22}ls src\n/);
   assert.match(result.stdout, /thinking\.\.\./);
   assert.doesNotMatch(result.stdout, /file body/);
   assert.match(lines[22], /session 11111111/);
@@ -414,6 +415,48 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
       pty.send('q');
       assert.equal(await pty.exited, 0);
       assertMouseReportingRestored(pty.session.output);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('long commands wrap, the arrow keys move by screen rows and ↓ N new counts rows', { timeout: 30_000 }, async () => {
+    const transcriptPath = copyFixtureSession();
+    const agentPath = getExploreAgentPath(transcriptPath);
+    appendSteps(agentPath, 0, 20);
+    // columns 60 → 摘要欄 38 欄：8 + 90 + 5 = 103 欄折成 3 行（38、38、27）
+    const longCommand = (label) => `${label} ${'-'.repeat(90)} tail`;
+    fs.appendFileSync(agentPath, toolUseLine(20, longCommand('wrap-a')));
+    const pty = startInPty(['--session', transcriptPath], { columns: 60, rows: 16 });
+    const body = (lines) => lines.slice(2, 14);
+    const footer = (lines) => lines[15] ?? '';
+    try {
+      let screen = await pty.waitForScreen((lines) => /^ {22}-+ tail$/.test(body(lines).at(-1) ?? ''), 'follow shows the last wrapped row');
+      assert.match(body(screen).at(-3), /Bash {8}wrap-a -+$/);
+      assert.match(body(screen).at(-2), /^ {22}-{38}$/);
+      assert.match(body(screen).at(-4), /step 19$/);
+
+      pty.send('\x1b[A');
+      screen = await pty.waitForScreen((lines) => /↓ 0 new/.test(footer(lines)), 'up pauses');
+      assert.match(body(screen).at(-1), /^ {22}-{38}$/);
+      assert.match(body(screen).at(-2), /wrap-a -+$/);
+
+      fs.appendFileSync(agentPath, toolUseLine(21, longCommand('wrap-b')));
+      screen = await pty.waitForScreen((lines) => /↓ 3 new/.test(footer(lines)), 'a 3-row event counts as 3 new rows');
+      appendSteps(agentPath, 22, 23);
+      screen = await pty.waitForScreen((lines) => /↓ 4 new/.test(footer(lines)), 'one more short event');
+      assert.match(body(screen).at(-1), /^ {22}-{38}$/);
+
+      pty.send('\x1b[F');
+      screen = await pty.waitForScreen((lines) => /step 22$/.test(body(lines).at(-1) ?? '') && !/new/.test(footer(lines)), 'End resumes follow');
+      assert.match(body(screen).at(-2), /^ {22}-+ tail$/);
+      assert.match(body(screen).at(-4), /Bash {8}wrap-b -+$/);
+      for (const line of screen) {
+        assert.ok(line.length <= 60, line);
+      }
+
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
     } finally {
       pty.kill();
     }

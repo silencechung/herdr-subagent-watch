@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   ansi,
-  buildEventLine,
+  buildEventLayout,
+  buildEventRows,
   buildFooter,
   buildFrame,
   buildTabBar,
@@ -10,8 +11,11 @@ import {
   buildTabSummary,
   emptySessionMessage,
   getVisibleTabRange,
+  measureEventRows,
 } from '../lib/render.mjs';
+import { applyScrollKey, createScrollState, resolveScrollView } from '../lib/scroll.mjs';
 import { displayWidth } from '../lib/text.mjs';
+import { buildToolSummary } from '../lib/transcript.mjs';
 
 function makeTab(label, isDone, events = []) {
   return { label, isDone, events };
@@ -115,14 +119,110 @@ test('narrow tab bar keeps the summary and the selected tab visible and fits the
 
 test('event lines follow HH:MM:SS  tool  summary and fit the width', () => {
   const timestampMs = new Date(2026, 9, 10, 9, 5, 7).getTime();
-  const line = buildEventLine({ kind: 'tool', timestampMs, tool: 'Bash', summary: 'git status --short' }, 80, false);
-  assert.equal(line, '09:05:07  Bash        git status --short');
-  const thinking = buildEventLine({ kind: 'thinking', timestampMs, tool: 'thinking...', summary: '' }, 80, false);
-  assert.equal(thinking, '09:05:07  thinking...');
-  const wide = buildEventLine({ kind: 'tool', timestampMs, tool: 'Read', summary: '中'.repeat(100) }, 40, false);
-  assert.ok(displayWidth(wide) <= 40);
-  const end = buildEventLine({ kind: 'end', timestampMs, tool: '', summary: 'done' }, 80, false);
-  assert.equal(end, '09:05:07  ── done ──');
+  const line = buildEventRows({ kind: 'tool', timestampMs, tool: 'Bash', summary: 'git status --short' }, 80, false);
+  assert.deepEqual(line, ['09:05:07  Bash        git status --short']);
+  const thinking = buildEventRows({ kind: 'thinking', timestampMs, tool: 'thinking...', summary: '' }, 80, false);
+  assert.deepEqual(thinking, ['09:05:07  thinking...']);
+  const wide = buildEventRows({ kind: 'tool', timestampMs, tool: 'Read', summary: '中'.repeat(100) }, 40, false);
+  for (const row of wide) {
+    assert.ok(displayWidth(row) <= 40, row);
+  }
+  const end = buildEventRows({ kind: 'end', timestampMs, tool: '', summary: 'done' }, 80, false);
+  assert.deepEqual(end, ['09:05:07  ── done ──']);
+  assert.deepEqual(buildEventRows({ kind: 'tool', timestampMs, tool: 'Bash', summary: '' }, 80, false), ['09:05:07  Bash']);
+});
+
+const clockAt = new Date(2026, 9, 10, 9, 5, 7).getTime();
+const summaryIndent = ' '.repeat(22);
+
+function toolEvent(tool, summary, extra = {}) {
+  return { kind: 'tool', timestampMs: clockAt, tool, summary, ...extra };
+}
+
+test('a long summary wraps and continuation rows line up under the summary column', () => {
+  const summary = 'node --test /home/user/projects/watch/test/*.test.mjs --reporter spec';
+  const rows = buildEventRows(toolEvent('Bash', summary), 50, false);
+  assert.deepEqual(rows, [
+    '09:05:07  Bash        node --test /home/user/proje',
+    `${summaryIndent}cts/watch/test/*.test.mjs --`,
+    `${summaryIndent}reporter spec`,
+  ]);
+  for (const row of rows) {
+    assert.ok(displayWidth(row) <= 50, row);
+  }
+  // 摘要內容接起來跟原文一樣，沒有被截掉
+  assert.equal(rows.map((row) => row.slice(22)).join(''), summary);
+  assert.equal(measureEventRows(toolEvent('Bash', summary), 50), 3);
+  assert.equal(measureEventRows(toolEvent('Bash', summary), 200), 1);
+});
+
+test('multi-line commands keep their line breaks and each line wraps on its own', () => {
+  const { summary } = buildToolSummary('Bash', { command: "cat <<'EOF' > notes.md\n# Notes\n\n  - indented item that is quite long\nEOF\n" });
+  const rows = buildEventRows(toolEvent('Bash', summary), 50, false);
+  assert.deepEqual(rows, [
+    "09:05:07  Bash        cat <<'EOF' > notes.md",
+    `${summaryIndent}# Notes`,
+    '',
+    `${summaryIndent}  - indented item that is qu`,
+    `${summaryIndent}ite long`,
+    `${summaryIndent}EOF`,
+  ]);
+  assert.equal(measureEventRows(toolEvent('Bash', summary), 50), rows.length);
+});
+
+test('wide CJK characters are never split across wrapped rows', () => {
+  // 摘要欄 19 欄（奇數）：每行最多放 9 個中文字，第 10 個整個移到下一行
+  const rows = buildEventRows(toolEvent('Read', '中文'.repeat(15)), 41, false);
+  assert.equal(rows.length, 4);
+  for (const row of rows) {
+    assert.ok(displayWidth(row) <= 41, row);
+    assert.doesNotMatch(row, /\uFFFD/);
+  }
+  assert.equal(rows[0], '09:05:07  Read        中文中文中文中文中');
+  assert.equal(displayWidth(rows[1].slice(22)), 18);
+  assert.equal(rows.map((row) => row.slice(22)).join(''), '中文'.repeat(15));
+});
+
+test('a tool name wider than the tool column gets its own row and the summary stays aligned', () => {
+  const rows = buildEventRows(toolEvent('SubagentHandback', 'report delivered to the caller with details'), 50, false);
+  assert.deepEqual(rows, [
+    '09:05:07  SubagentHandback',
+    `${summaryIndent}report delivered to the call`,
+    `${summaryIndent}er with details`,
+  ]);
+  assert.deepEqual(buildEventRows(toolEvent('SubagentHandback', ''), 50, false), ['09:05:07  SubagentHandback']);
+  assert.equal(measureEventRows(toolEvent('SubagentHandback', 'short'), 50), 2);
+  const colored = buildEventRows(toolEvent('SubagentHandback', 'short'), 50, true);
+  assert.equal(colored[0], `${dim}09:05:07  ${reset}${bold}SubagentHandback${reset}`);
+});
+
+test('an event shows at most 20 rows and the last one counts the hidden rows', () => {
+  const { summary, omittedLineCount } = buildToolSummary('Bash', { command: Array.from({ length: 30 }, (_, index) => `echo line ${index}`).join('\n') });
+  assert.equal(omittedLineCount, 10);
+  const event = toolEvent('Bash', summary, { omittedLineCount });
+  const rows = buildEventRows(event, 80, false);
+  assert.equal(rows.length, 20);
+  assert.equal(measureEventRows(event, 80), 20);
+  assert.equal(rows[0], '09:05:07  Bash        echo line 0');
+  assert.equal(rows[18], `${summaryIndent}echo line 18`);
+  assert.equal(rows[19], `${summaryIndent}… (+11 more lines)`);
+  const colored = buildEventRows(event, 80, true);
+  assert.equal(colored[19], `${summaryIndent}${dim}… (+11 more lines)${reset}`);
+  // 一行長摘要折出來超過 20 行也一樣
+  const long = buildEventRows(toolEvent('Bash', 'x'.repeat(28 * 30)), 50, false);
+  assert.equal(long.length, 20);
+  assert.equal(long[19], `${summaryIndent}… (+11 more lines)`);
+  // 剛好 20 行不需要提示
+  assert.equal(buildEventRows(toolEvent('Bash', 'x'.repeat(28 * 20)), 50, false).at(-1), `${summaryIndent}${'x'.repeat(28)}`);
+});
+
+test('a summary cut while it was stored still says how much is hidden', () => {
+  const rows = buildEventRows(toolEvent('Bash', 'echo first\necho second', { omittedLineCount: 3 }), 80, false);
+  assert.deepEqual(rows, [
+    '09:05:07  Bash        echo first',
+    `${summaryIndent}echo second`,
+    `${summaryIndent}… (+3 more lines)`,
+  ]);
 });
 
 test('frame without sub agents shows the empty session message', () => {
@@ -202,4 +302,81 @@ test('colored output only uses theme-following SGR codes, never truecolor', () =
     assert.match(output, /\x1b\[/);
     assert.doesNotMatch(output, truecolorPattern);
   }
+});
+
+// 每 5 個事件放一個 90 字元的長指令：寬 50 時折成 4 行，寬 120 時 1 行
+function wrappedSteps(count) {
+  return Array.from({ length: count }, (_, index) => {
+    const summary = index % 5 === 0 ? `step ${String(index).padStart(2, '0')} ${'-'.repeat(82)}` : `step ${String(index).padStart(2, '0')}`;
+    return { kind: 'tool', timestampMs: 0, tool: 'Bash', summary };
+  });
+}
+
+test('the body follows the newest wrapped rows and can start in the middle of an event', () => {
+  const events = wrappedSteps(30);
+  const tab = makeTab('Explore', false, events);
+  // height 12 → body 8 行；step 25 折成 4 行，後面 26–29 各 1 行
+  const follow = buildFrame({ tabs: [tab], selectedIndex: 0, width: 50, height: 12, useColor: false }).slice(2, 10);
+  assert.match(follow[0], /step 25 -+$/);
+  assert.match(follow[1], /^ {22}-{28}$/);
+  assert.match(follow[3], /^ {22}-{6}$/);
+  assert.match(follow[4], /step 26$/);
+  assert.match(follow[7], /step 29$/);
+  const layout = buildEventLayout(events, 50);
+  assert.equal(layout.totalRows, 30 + 6 * 3);
+  // 第 1 行是 step 00 的第二行
+  const scrolled = buildFrame({
+    tabs: [tab],
+    selectedIndex: 0,
+    width: 50,
+    height: 12,
+    useColor: false,
+    layout,
+    scrollView: { start: 1, isFollowing: false, newLineCount: 0 },
+  }).slice(2, 10);
+  assert.match(scrolled[0], /^ {22}-+$/);
+  assert.match(scrolled[2], /^ {22}-{6}$/);
+  assert.match(scrolled[3], /step 01$/);
+  assert.match(scrolled[7], /step 05 -+$/);
+});
+
+test('a resize re-wraps the body and keeps the same event at the top', () => {
+  const events = wrappedSteps(30);
+  const tab = makeTab('Explore', false, events);
+  const state = createScrollState();
+  const bodyHeight = 6;
+  const narrowLayout = buildEventLayout(events, 50);
+  // 48 行、一頁 6 行：最底 42 → 36 → 30 → 24 → 18；第 18 行是 step 10（佔 16–19）的第三行
+  for (let index = 0; index < 4; index += 1) {
+    applyScrollKey(state, 'page-up', narrowLayout, bodyHeight);
+  }
+  assert.deepEqual([state.anchorEventIndex, state.anchorRowOffset], [10, 2]);
+  const frameAt = (width) => {
+    const layout = buildEventLayout(events, width);
+    const scrollView = resolveScrollView(state, layout, bodyHeight);
+    return buildFrame({ tabs: [tab], selectedIndex: 0, width, height: bodyHeight + 4, useColor: false, layout, scrollView });
+  };
+  const narrow = frameAt(50);
+  assert.match(narrow[2], /^ {22}-{28}$/);
+  assert.match(narrow[4], /step 11$/);
+  // 變寬後 step 10 只剩一行：停在 step 10，不會跳到頂
+  const wide = frameAt(120);
+  assert.match(wide[2], /step 10 -{82}$/);
+  assert.match(wide[3], /step 11$/);
+  assert.match(wide.at(-1), /^↓ 0 new/);
+  // 再變窄回到原本那一行
+  assert.deepEqual(frameAt(50), narrow);
+});
+
+test('the footer counts new wrapped rows while follow is paused', () => {
+  const events = wrappedSteps(20);
+  const state = createScrollState();
+  applyScrollKey(state, 'page-up', buildEventLayout(events, 50), 6);
+  // 一個 4 行的長指令 + 一個短指令進來：寬 50 時是 5 行新內容，寬 120 時是 2 行
+  events.push({ kind: 'tool', timestampMs: 0, tool: 'Bash', summary: `late ${'-'.repeat(85)}` });
+  events.push({ kind: 'tool', timestampMs: 0, tool: 'Bash', summary: 'late short' });
+  const narrowView = resolveScrollView(state, buildEventLayout(events, 50), 6);
+  assert.equal(narrowView.newLineCount, 5);
+  assert.match(buildFooter(80, false, narrowView), /^↓ 5 new {2}/);
+  assert.equal(resolveScrollView(state, buildEventLayout(events, 120), 6).newLineCount, 2);
 });

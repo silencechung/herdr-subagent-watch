@@ -62,7 +62,7 @@ test('the fixture session loads every sub agent with meta, events and end state'
   assert.equal(explore.description, 'Find key handling code');
   // 壞掉的那一行被跳過，其他事件照常讀到
   assert.deepEqual(explore.events.map((event) => event.tool), ['thinking...', 'Grep', 'Read', 'Bash']);
-  assert.equal(explore.events[3].summary, 'git status --short ls src');
+  assert.equal(explore.events[3].summary, 'git status --short\nls src');
 
   const nowMs = Date.now();
   assert.equal(getSubAgentStatus(explore, nowMs).isDone, false);
