@@ -88,8 +88,9 @@ Tab bar:
 Events:
 
 - Format: `HH:MM:SS  <tool>  <argument summary>`. The summary is `command` for Bash, `file_path` for Read / Edit / Write, `pattern` for Grep, `url` for WebFetch, `description` for Agent, and the first string field for any other tool. Thinking shows as `thinking...`. Only the assistant's `tool_use` and thinking are shown, never `tool_result` content.
-- Long summaries wrap; continuation lines are indented to the summary column (the time and tool columns stay blank). Width is measured in display width (CJK / full-width characters count as 2), and wide characters are never cut in half.
+- Long summaries wrap; continuation lines are indented to the summary column (the time and tool columns stay blank). Width is measured in display width: characters whose Unicode East Asian Width is W or F (CJK, full-width forms, and emoji such as `✅` `🚀`) count as 2, and wide characters are never cut in half.
 - Multi-line content (for example a Bash heredoc) keeps its line breaks and indentation, and each line wraps on its own. Tabs become 4 spaces.
+- Escape sequences (CSI, OSC such as OSC 52 / OSC 8, DCS, and their 8-bit C1 forms), other control characters and Unicode format characters (bidi overrides, zero-width characters) are removed from transcripts, meta files and herdr output before anything is drawn, so a transcript cannot write the clipboard, add links or clear the screen.
 - When a tool name is wider than the tool column (10 cells), for example `SubagentHandback`, the tool name takes its own line and the summary starts on the next line in the summary column, so every event's summary lines up in the same column.
 - One event takes at most 20 lines; beyond that, line 20 shows `… (+N more lines)` (dim).
 - Resizing re-wraps everything; while follow is paused, the scroll position stays on the same event.
@@ -101,7 +102,7 @@ Scrolling:
 - Scrolling up pauses follow, and the start of the bottom hint bar shows `↓ N new` (how many screen lines arrived since the pause). Press `End` or scroll back to the bottom to resume follow.
 - Each tab remembers its own scroll position; switching tabs does not affect other tabs.
 - Bottom hint bar: `<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`, shortened automatically in narrow windows.
-- Mouse: SGR mouse reporting (`\x1b[?1000h\x1b[?1006h`) is turned on while the popup is open to receive wheel events, and always turned off on exit (`q`, `Esc`, `Ctrl+C`, SIGTERM and unexpected exceptions all turn it off).
+- Mouse: SGR mouse reporting (`\x1b[?1000h\x1b[?1006h`) is turned on while the popup is open to receive wheel events, and always turned off on exit (`q`, `Esc`, `Ctrl+C`, SIGTERM, SIGHUP and unexpected exceptions all turn it off).
 - Before any sub agent exists, the popup shows `No sub agents yet in this session`.
 
 You can also open the popup without the action: `herdr plugin pane open --plugin subagent.watch --entrypoint viewer`. The viewer then uses the `focused_pane_id` from the popup's own context JSON.
@@ -160,16 +161,18 @@ In the two "not Claude Code" cases the viewer does not guess a session. It asks 
 
 If herdr cannot be asked (herdr not found, or `herdr pane get` fails), the viewer goes straight to 2 → 3; without any pane id it can only guess (3). When nothing is found it shows `No Claude Code session found for this pane` plus the reason each step failed.
 
+The lookup keeps running every 2 seconds after a session is found. When herdr or the pane map reports a different session id (for example after `/resume`, or after restarting `claude` in the pane), the popup switches to the new transcript, rebuilds the tabs and updates the session label. A guessed session is replaced as soon as herdr or the pane map names the real one. A confirmed session is kept when a later lookup only gets a guess or nothing (for example while herdr is briefly unreachable). Lookups run asynchronously and one at a time, and `herdr pane get` times out after 3 seconds, so `q` / `Esc` close the popup right away even while herdr is stuck.
+
 ### Data sources and when a sub agent counts as finished
 
-- Sub agent transcript: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project>/<session-id>/subagents/agent-<id>.jsonl`, with `agent-<id>.meta.json` next to it (`agentType`, `description`). Only newly appended bytes are read; broken or incomplete lines are skipped. This format is internal to Claude Code and may change between versions.
-- A sub agent is shown as finished (`✓`) when any of these holds. The rules are based on 117 real sub agent transcripts examined during development:
-  1. The sub agent JSONL contains a `tool_use` of `SubagentHandback` (all 85 background sub agents ended this way).
-  2. The last assistant entry has `stop_reason` `end_turn` (the 27 `fork` sub agents have no `SubagentHandback` and all ended this way).
-  3. The main transcript has a `<task-notification>` whose `<task-id>` is this agent and whose `<status>` is `completed` / `killed` / `failed` (a killed sub agent has no other signal).
+- Sub agent transcript: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project>/<session-id>/subagents/agent-<id>.jsonl`, with `agent-<id>.meta.json` next to it (`agentType`, `description`). Only newly appended bytes are read, at most 8 MB at a time; broken or incomplete lines, and single lines longer than 64 MB, are skipped. A file that shrinks is read again from the start. This format is internal to Claude Code and may change between versions.
+- A sub agent is shown as finished (`✓`) when any of these holds. The rules are based on the 154 real sub agent transcripts (with their meta files) examined during development:
+  1. The sub agent JSONL contains a `tool_use` of `SubagentHandback` (117 sub agents ended this way, including the only foreground one).
+  2. An assistant entry has `stop_reason` `end_turn`, but only for sub agents that are not background: meta `isFork: true`, or a `requestShape` other than `"background"`. The 31 `fork` sub agents have no `SubagentHandback` and all ended this way. Background sub agents ignore `end_turn`: 6 of them hit `end_turn` mid-run, were sent a `[handback-send-enforce]` prompt and only finished with `SubagentHandback` afterwards, so counting `end_turn` made them flash `✓` for a few seconds.
+  3. The main transcript has a `<task-notification>` whose `<task-id>` is this agent and whose `<status>` is `completed` / `killed` / `failed` (a killed sub agent has no other signal). Only `queue-operation` lines whose content starts with `<task-notification>` count: every notification in the sample was written that way, and the same tag quoted in a user message, a queued message or a tool result is ignored.
   4. Fallback: the transcript has not been written for 10 minutes. The threshold matches the 10-minute maximum of a single Bash tool call, so a sub agent waiting on a command is not marked finished. The end line then reads `no writes for 10 min`; if the transcript is written again, the tab goes back to `●`.
 - An end signal older than the last assistant activity does not count: a resumed sub agent goes back to `●`.
-- Foreground sub agents: every meta file in the sample had `"requestShape":"background"`, so there was no foreground sample and their end signal is **not verified**. They are expected to hit rule 2 (`end_turn`) or 4 (the 10-minute fallback).
+- Foreground sub agents: the sample has only one (`"requestShape":"foreground"`), and it ended with `SubagentHandback` (rule 1). Rule 2 (`end_turn`) still applies to them; whether a foreground sub agent can also stop at `end_turn` mid-run is **not verified**.
 
 ### Sidebar tree
 
@@ -196,6 +199,7 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
 - **Setup wrote to the wrong config file**: the action uses the herdr server's environment; run `sh bin/run.sh scripts/setup.mjs` from your own shell in the plugin directory (see [Setup](#setup)).
 - **`(guessed: latest session)` in the popup**: the session was guessed from the pane's cwd and may be the wrong one when several Claude Code sessions share a folder (see [Which session a pane maps to](#which-session-a-pane-maps-to)).
 - `◀ ▶ ● ─ │ · … ↑ ↓` are East Asian ambiguous width characters. With a terminal set to treat ambiguous width as wide, the layout breaks.
+- Only characters whose East Asian Width is W or F (Unicode 16.0) count as 2 columns. Symbols that some terminals draw wide only with a variation selector (for example `❤️`), and emoji ZWJ sequences, can be measured differently from how the terminal draws them.
 - Whether herdr forwards the mouse wheel to the popup is **not verified**. If the wheel does nothing, use `↑` / `↓`.
 - With mouse reporting on, selecting text by dragging inside the viewer is captured by the viewer, so nothing gets selected. Some terminals let you hold Shift while dragging to get around this; whether that works inside a herdr popup is not verified.
 - When reading the transcript, a summary keeps only its first 20 lines and at most 8000 columns in total (enough to fill 20 lines in a 400-column summary column). In `+N`, each cut original line counts as one line, so the real number of screen lines can be higher when an original line is very long.

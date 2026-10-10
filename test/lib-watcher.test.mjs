@@ -152,3 +152,76 @@ test('a kill notification arriving after the sub agent was loaded marks it done'
   watcher.refresh();
   assert.equal(getSubAgentStatus(explore, Date.now()).reason, 'failed');
 });
+
+function toolUseLine(agentId, offsetSeconds, toolUseId, command) {
+  const timestamp = new Date(Date.parse('2026-10-10T01:00:00.000Z') + offsetSeconds * 1000).toISOString();
+  return `${assistantLine(agentId, timestamp, { type: 'tool_use', id: toolUseId, name: 'Bash', input: { command } })}\n`;
+}
+
+test('a sub agent transcript that gets truncated and rewritten is read again from the start', () => {
+  const transcriptPath = copyFixtureSession();
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const agentPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-a111explore.jsonl');
+  assert.equal(watcher.getSubAgents()[0].events.length, 4);
+  fs.writeFileSync(agentPath, toolUseLine('a111explore', 1, 'toolu_rewritten', 'echo rewritten'));
+  assert.equal(watcher.refresh(), true);
+  const explore = watcher.getSubAgents().find((subAgent) => subAgent.agentId === 'a111explore');
+  assert.deepEqual(explore.events.map((event) => event.summary), ['echo rewritten']);
+  fs.appendFileSync(agentPath, toolUseLine('a111explore', 2, 'toolu_after', 'echo after'));
+  watcher.refresh();
+  assert.deepEqual(explore.events.map((event) => event.summary), ['echo rewritten', 'echo after']);
+});
+
+test('a truncated main transcript is read again and its notifications still apply', () => {
+  const transcriptPath = copyFixtureSession();
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const explore = watcher.getSubAgents()[0];
+  const notification = JSON.stringify({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    timestamp: '2026-10-10T01:20:00.000Z',
+    content: '<task-notification>\n<task-id>a111explore</task-id>\n<status>killed</status>\n</task-notification>',
+  });
+  fs.writeFileSync(transcriptPath, `${notification}\n`);
+  watcher.refresh();
+  assert.equal(getSubAgentStatus(explore, Date.now()).reason, 'killed');
+});
+
+test('reading in small chunks keeps lines and multi-byte characters that span chunk boundaries', () => {
+  const transcriptPath = copyFixtureSession();
+  const agentPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-a111explore.jsonl');
+  fs.appendFileSync(agentPath, toolUseLine('a111explore', 30, 'toolu_cjk', '刪除暫存檔 ✅ 🚀 完成'));
+  const watcher = createSessionWatcher({ transcriptPath, readChunkBytes: 7 });
+  watcher.refresh();
+  const explore = watcher.getSubAgents()[0];
+  assert.deepEqual(explore.events.map((event) => event.tool), ['thinking...', 'Grep', 'Read', 'Bash', 'Bash']);
+  assert.equal(explore.events.at(-1).summary, '刪除暫存檔 ✅ 🚀 完成');
+});
+
+test('a line longer than the limit is skipped without breaking the lines after it', () => {
+  const transcriptPath = copyFixtureSession();
+  const agentPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-a111explore.jsonl');
+  fs.appendFileSync(agentPath, toolUseLine('a111explore', 30, 'toolu_huge', 'x'.repeat(5000)));
+  fs.appendFileSync(agentPath, toolUseLine('a111explore', 31, 'toolu_next', 'echo next'));
+  const watcher = createSessionWatcher({ transcriptPath, readChunkBytes: 256, maximumLineLength: 1024 });
+  watcher.refresh();
+  const explore = watcher.getSubAgents()[0];
+  assert.deepEqual(explore.events.map((event) => event.summary).slice(-2), ['git status --short\nls src', 'echo next']);
+});
+
+test('main transcript lines that only quote a task notification do not end a sub agent', () => {
+  const transcriptPath = copyFixtureSession();
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const explore = watcher.getSubAgents()[0];
+  const quoted = '<task-notification>\n<task-id>a111explore</task-id>\n<status>killed</status>\n</task-notification>';
+  fs.appendFileSync(transcriptPath, [
+    JSON.stringify({ type: 'user', timestamp: '2026-10-10T01:20:00.000Z', message: { content: quoted } }),
+    JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-10-10T01:20:01.000Z', content: `Look at this:\n${quoted}` }),
+    '',
+  ].join('\n'));
+  watcher.refresh();
+  assert.equal(getSubAgentStatus(explore, Date.now()).isDone, false);
+});

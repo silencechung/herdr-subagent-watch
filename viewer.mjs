@@ -5,15 +5,18 @@ import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder } from './lib/keys.mjs';
 import { ansi, buildEventLayout, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
-import { describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
+import { describeNonClaudePane, parseContextJson, resolveSession, shouldReplaceSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
+import { sanitizeMultilineText, sanitizeText } from './lib/text.mjs';
 import { createSessionWatcher, getSessionPaths } from './lib/watcher.mjs';
 
 const defaultWidth = 80;
 const defaultHeight = 24;
 const statusTickMs = 1000;
-const resolveRetryMs = 2000;
+// 已經接上 session 也要定期重問：/resume 或在同一個 pane 重開 claude 會換 session id
+const resolveIntervalMs = 2000;
 const unresolvedMessage = 'No Claude Code session found for this pane';
+const resolvingMessage = 'Looking up the Claude Code session for this pane...';
 const usageText = 'Usage: viewer.mjs [--once] [--demo | --session <transcript.jsonl>]\n';
 
 function parseArguments(argv) {
@@ -37,7 +40,7 @@ function parseArguments(argv) {
     } else if (argument === '--help' || argument === '-h') {
       options.error = '';
     } else {
-      options.error = `unknown argument: ${argument}`;
+      options.error = `unknown argument: ${sanitizeText(argument)}`;
       break;
     }
   }
@@ -51,7 +54,7 @@ function pickString(...values) {
   return values.find((value) => typeof value === 'string' && value !== '') ?? null;
 }
 
-function resolveFromEnvironment(environment) {
+function resolveFromEnvironment(environment, signal) {
   const context = parseContextJson(environment.HERDR_PLUGIN_CONTEXT_JSON);
   // popup 沒有 HERDR_PANE_ID；open action 會把觸發時的 pane 用 env 傳進來，context 的 focused_pane_id 是第二來源
   const paneId = pickString(environment.SUBAGENT_WATCH_PANE_ID, context.focused_pane_id, environment.HERDR_PANE_ID);
@@ -64,6 +67,7 @@ function resolveFromEnvironment(environment) {
     projectsDirectory: getClaudeProjectsDirectory(environment),
     runtimeDirectory: environment.XDG_RUNTIME_DIR,
     herdrBinPath: resolveHerdrBinPath(environment),
+    signal,
   });
 }
 
@@ -78,7 +82,7 @@ function describeSession(session) {
   if (session === null || session.transcriptPath === null) {
     return 'no session';
   }
-  const shortId = session.sessionId.slice(0, 8);
+  const shortId = sanitizeText(session.sessionId).slice(0, 8);
   if (session.isGuessed) {
     return `session ${shortId} (guessed: latest session)`;
   }
@@ -90,6 +94,10 @@ function createController({ options, environment, onChange }) {
   let source = null;
   let selectedAgentId = null;
   let lastResolveAttemptMs = 0;
+  let isStarted = false;
+  let isStopped = false;
+  // 同時只跑一個查詢：herdr 卡住時不要每秒疊一個新的子程序
+  let pendingResolve = null;
   const scrollStatesByAgentId = new Map();
 
   function attachSource(nextSession) {
@@ -104,7 +112,18 @@ function createController({ options, environment, onChange }) {
     scrollStatesByAgentId.clear();
     if (session.transcriptPath !== null) {
       source = createSessionWatcher({ transcriptPath: session.transcriptPath, onChange });
+      if (isStarted) {
+        source.start();
+      }
     }
+  }
+
+  function applyResolvedSession(nextSession) {
+    if (isStopped || !shouldReplaceSession(session, nextSession)) {
+      return;
+    }
+    attachSource(nextSession);
+    onChange();
   }
 
   function resolveNow() {
@@ -112,16 +131,34 @@ function createController({ options, environment, onChange }) {
     if (options.sessionPath !== null) {
       const { sessionId } = getSessionPaths(options.sessionPath);
       attachSource({ transcriptPath: options.sessionPath, sessionId, source: 'manual', isGuessed: false, isTranscriptMissing: false, notes: [] });
-      return;
+      return Promise.resolve();
     }
-    attachSource(resolveFromEnvironment(environment));
+    const abortController = new AbortController();
+    const promise = resolveFromEnvironment(environment, abortController.signal)
+      .then(applyResolvedSession, (error) => {
+        applyResolvedSession({
+          transcriptPath: null,
+          sessionId: null,
+          source: null,
+          isGuessed: false,
+          isTranscriptMissing: true,
+          notes: [sanitizeText(`session lookup failed: ${error?.message ?? error}`)],
+        });
+      })
+      .finally(() => {
+        pendingResolve = null;
+        lastResolveAttemptMs = Date.now();
+      });
+    pendingResolve = { promise, abortController };
+    return promise;
   }
 
+  let ready = Promise.resolve();
   if (options.isDemo) {
     session = { transcriptPath: 'demo', sessionId: 'demo', source: 'demo', isGuessed: false, isTranscriptMissing: false, notes: [] };
     source = createDemoSource({ onChange });
   } else {
-    resolveNow();
+    ready = resolveNow();
   }
 
   function getSessionLabel() {
@@ -170,23 +207,25 @@ function createController({ options, environment, onChange }) {
   }
 
   return {
+    ready,
     start() {
+      isStarted = true;
       source?.start();
     },
     stop() {
+      isStopped = true;
+      pendingResolve?.abortController.abort();
       source?.stop();
     },
     refresh() {
       source?.refresh();
     },
     tick() {
-      const needsResolve = !options.isDemo && (session === null || session.isTranscriptMissing);
-      if (needsResolve && Date.now() - lastResolveAttemptMs >= resolveRetryMs) {
-        const previousPath = session?.transcriptPath ?? null;
+      if (options.isDemo || options.sessionPath !== null || pendingResolve !== null) {
+        return;
+      }
+      if (Date.now() - lastResolveAttemptMs >= resolveIntervalMs) {
         resolveNow();
-        if (source !== null && session.transcriptPath !== previousPath) {
-          source.start();
-        }
       }
     },
     moveSelection(step) {
@@ -213,7 +252,12 @@ function createController({ options, environment, onChange }) {
       const tabs = getTabs(nowMs);
       const selectedIndex = getSelectedIndex(tabs);
       const hasSession = options.isDemo || (session !== null && session.transcriptPath !== null);
-      const messages = hasSession ? [emptySessionMessage] : getUnresolvedMessages(session);
+      let messages = [emptySessionMessage];
+      if (session === null && pendingResolve !== null) {
+        messages = [resolvingMessage];
+      } else if (!hasSession) {
+        messages = getUnresolvedMessages(session);
+      }
       let scrollView = null;
       let layout = null;
       if (tabs.length > 0) {
@@ -226,7 +270,8 @@ function createController({ options, environment, onChange }) {
   };
 }
 
-function runOnce(controller) {
+async function runOnce(controller) {
+  await controller.ready;
   controller.refresh();
   const width = process.stdout.columns || defaultWidth;
   const height = process.stdout.rows || defaultHeight;
@@ -267,16 +312,25 @@ function runInteractive(controller, setOnChange) {
     }, 16);
   }
 
+  // 先寫還原 escape 再關 raw mode：setRawMode 若丟例外（例如 SIGHUP 後 terminal 已斷線），放在前面就會跳過還原、mouse reporting 關不掉
+  // mouse reporting 沒關的話，離開後 shell 會收到一堆滾輪／點擊的 escape sequence
   function restoreTerminal() {
     if (isTerminalRestored) {
       return;
     }
     isTerminalRestored = true;
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(false);
+    try {
+      process.stdout.write(ansi.disableMouse + ansi.reset + ansi.showCursor + ansi.leaveAlternateScreen);
+    } catch {
+      // terminal 已經不在了，沒有東西可以還原
     }
-    // mouse reporting 沒關的話，離開後 shell 會收到一堆滾輪／點擊的 escape sequence
-    process.stdout.write(ansi.disableMouse + ansi.reset + ansi.showCursor + ansi.leaveAlternateScreen);
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(false);
+      } catch {
+        // terminal 已斷線時可能失敗，這時也沒有東西需要還原
+      }
+    }
   }
 
   function shutdown(exitCode) {
@@ -315,7 +369,8 @@ function runInteractive(controller, setOnChange) {
   }
   process.on('uncaughtException', (error) => {
     restoreTerminal();
-    process.stderr.write(`${error.stack ?? error}\n`);
+    // 例外訊息可能夾著 transcript 或路徑裡的字串，stderr 一樣是這個 terminal
+    process.stderr.write(`${sanitizeMultilineText(String(error?.stack ?? error))}\n`);
     process.exit(1);
   });
 
@@ -355,7 +410,9 @@ function main() {
     },
   });
   if (options.isOnce) {
-    runOnce(controller);
+    runOnce(controller).then(() => {
+      controller.stop();
+    });
     return;
   }
   runInteractive(controller, (callback) => {

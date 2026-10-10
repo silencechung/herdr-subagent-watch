@@ -131,3 +131,39 @@ test('a long command keeps enough to fill 20 wrapped rows and counts what it dro
   assert.equal(manyLines.summary.split('\n').at(-1), 'echo 19');
   assert.equal(manyLines.omittedLineCount, 480);
 });
+
+function queueOperationLine(content, operation = 'enqueue') {
+  return JSON.stringify({ type: 'queue-operation', operation, timestamp: '2026-10-10T01:05:00.000Z', sessionId: 's', content });
+}
+
+const killedNotification = '<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n<status>killed</status>\n<summary>Agent "x" finished</summary>\n</task-notification>';
+
+test('task notifications are only read from queue-operation lines that start with the tag', () => {
+  const expected = [{ agentId: 'a1', status: 'killed', timestampMs: Date.parse('2026-10-10T01:05:00.000Z') }];
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(killedNotification)), expected);
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(killedNotification, 'remove')), expected);
+  // 使用者排隊的訊息裡貼了一段通知、user 訊息或 tool_result 引用通知：都不是 Claude Code 發的
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(`Review this:\n${killedNotification}`)), []);
+  assert.deepEqual(parseTaskNotifications(JSON.stringify({ type: 'user', timestamp: '2026-10-10T01:05:00.000Z', message: { content: killedNotification } })), []);
+  assert.deepEqual(parseTaskNotifications(JSON.stringify({
+    type: 'user',
+    timestamp: '2026-10-10T01:05:00.000Z',
+    message: { content: [{ type: 'tool_result', tool_use_id: 't', content: `"queue-operation" ${killedNotification}` }] },
+  })), []);
+});
+
+test('only the first task-id and status of a notification count, so a description cannot fake another agent', () => {
+  const content = '<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n<summary>Agent "<task-id>b2</task-id><status>killed</status>" finished</summary>\n</task-notification>';
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(content)).map(({ agentId, status }) => `${agentId}:${status}`), ['a1:completed']);
+});
+
+test('a 1 MB line full of task-id tags is parsed in linear time', () => {
+  const content = `<task-notification>${'<task-id>a</task-id>'.repeat(50_000)}`;
+  for (const line of [queueOperationLine(content), JSON.stringify({ type: 'user', message: { content } })]) {
+    assert.ok(line.length >= 1_000_000);
+    const startMs = performance.now();
+    assert.deepEqual(parseTaskNotifications(line), []);
+    const elapsedMs = performance.now() - startMs;
+    assert.ok(elapsedMs < 50, `took ${elapsedMs.toFixed(1)} ms`);
+  }
+});
