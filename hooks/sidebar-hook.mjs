@@ -52,6 +52,10 @@ const sessionStartSourcePattern = /^[a-z_]{1,32}$/;
 const totalBudgetMs = 800;
 const minimumHerdrBudgetMs = 100;
 const maximumPaneQueryMs = 300;
+// lock 外判斷 sub 是否結束最多用這麼久，剩下的 sub 留到下一次事件：判斷拖太久的話，這次事件自己的更新反而等不到 lock。
+// 實測 5 個 sub、真實大小 transcript：單獨跑約 10 ms，8 個 hook 同時跑最多約 22 ms。8 個擠在 1 個 CPU 上、旁邊還有 4 個吃滿 CPU 的 process 時，
+// 每個 hook 都會碰到上限，大家同時判斷、搶 CPU，拿 lock 跟著變慢：上限 200 ms 時 640 次更新掉了 5 次（lock-timeout），100 ms 時 640 次都沒掉
+export const maximumPruneMs = 100;
 const lockRetryIntervalMs = 10;
 // 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的
 const staleLockMs = 2000;
@@ -284,8 +288,8 @@ export function detectSubagentEnd({ startedAtMs, records, meta = null, notificat
   return null;
 }
 
-function readSmallJsonFile(filePath, maximumBytes) {
-  const file = readFileTail(filePath, maximumBytes);
+function readSmallJsonFile(filePath, maximumBytes, readTail) {
+  const file = readTail(filePath, maximumBytes);
   if (file === null || file.isMissing || file.isTruncated) {
     return null;
   }
@@ -313,38 +317,56 @@ function collectTaskNotifications(mainTail) {
 }
 
 // 只靠 SubagentStop 移除的話，因 API 錯誤中斷的 sub 沒收到 SubagentStop（實際發生過，原因未驗證）就會一直卡在側邊欄。每次 hook 觸發時檢查這個 session 每個 sub 的 transcript 尾端。
-// sub transcript 在 `<main transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`；main transcript 路徑不像樣或不存在時不判斷（路徑可能對不上，寧可留著）
-export function pruneEndedSubagents(state, event, { nowMs, readTail = readFileTail, hasTimeLeft = () => true }) {
+// sub transcript 在 `<main transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`；main transcript 路徑不像樣或不存在時不判斷（路徑可能對不上，寧可留著）。
+// 只讀檔、不改狀態，回傳判斷為已結束的 sub（含判斷當下的 startedAtMs）：runHook 在 lock 外呼叫，讀 transcript 的時間不算進持有 lock 的時間
+export function findEndedSubagents(state, event, { nowMs, readTail = readFileTail, hasTimeLeft = () => true }) {
   const mainTranscriptPath = event.transcriptPath;
   if (state.subagents.length === 0 || !isAbsolute(mainTranscriptPath) || !mainTranscriptPath.endsWith('.jsonl')) {
-    return { state, removed: [] };
+    return [];
   }
   const mainTail = readTail(mainTranscriptPath, transcriptTailBytes);
   if (mainTail === null || mainTail.isMissing) {
-    return { state, removed: [] };
+    return [];
   }
   const notifications = collectTaskNotifications(mainTail);
   const subagentsDirectory = join(mainTranscriptPath.slice(0, -'.jsonl'.length), 'subagents');
-  const kept = [];
-  const removed = [];
+  const ended = [];
   for (const subagent of state.subagents) {
-    // 剛收到 SubagentStart 的 sub（可能是 resume）transcript 還停在上一輪，這次先不判斷
-    const isJustStarted = event.eventName === 'SubagentStart' && subagent.id === event.agentId;
-    if (isJustStarted || !isSafeIdentifier(subagent.id) || !hasTimeLeft()) {
-      kept.push(subagent);
+    // 這次事件的 sub 不判斷：SubagentStart 的（可能是 resume）transcript 還停在上一輪；SubagentStop 的本來就會被 applyEvent 拿掉，不用多讀一次
+    if (subagent.id === event.agentId || !isSafeIdentifier(subagent.id)) {
       continue;
     }
+    if (!hasTimeLeft()) {
+      break;
+    }
     const reason = judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, readTail });
-    if (reason === null) {
-      kept.push(subagent);
-    } else {
-      removed.push({ id: subagent.id, reason });
+    if (reason !== null) {
+      ended.push({ id: subagent.id, startedAtMs: subagent.startedAtMs, reason });
     }
   }
+  return ended;
+}
+
+// lock 內呼叫，不讀任何檔案。判斷之後、拿到 lock 之前，別的 hook 可能已經改過狀態檔：
+// 已經不在的不用拿；startedAtMs 不一樣的是被拿掉後又重新 SubagentStart（resume）的新一輪，判斷的是上一輪，不能拿
+export function removeEndedSubagents(state, ended) {
+  const removed = [];
+  const kept = state.subagents.filter((subagent) => {
+    const match = ended.find((entry) => entry.id === subagent.id && entry.startedAtMs === subagent.startedAtMs);
+    if (match === undefined) {
+      return true;
+    }
+    removed.push({ id: subagent.id, reason: match.reason });
+    return false;
+  });
   if (removed.length === 0) {
     return { state, removed };
   }
   return { state: { ...state, subagents: kept }, removed };
+}
+
+export function pruneEndedSubagents(state, event, options) {
+  return removeEndedSubagents(state, findEndedSubagents(state, event, options));
 }
 
 function judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, readTail }) {
@@ -360,7 +382,7 @@ function judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, rea
   return detectSubagentEnd({
     startedAtMs: subagent.startedAtMs,
     records: parseTailRecords(tail),
-    meta: readSmallJsonFile(join(subagentsDirectory, `agent-${subagent.id}.meta.json`), maximumMetaBytes),
+    meta: readSmallJsonFile(join(subagentsDirectory, `agent-${subagent.id}.meta.json`), maximumMetaBytes, readTail),
     notification: notifications.get(subagent.id) ?? null,
     lastWriteMs: tail.modifiedMs,
     nowMs,
@@ -767,19 +789,29 @@ export function runHook(rawInput, environment, overrides = {}) {
 
   const statePath = join(stateDirectory, `session-${event.sessionId}.json`);
   const lockPath = `${statePath}.lock`;
+  // 判斷 sub 是否結束要讀 main 與每個 sub 的 transcript 尾端，放在 lock 外：放在 lock 內的話同一個 session 平行觸發的 hook
+  // 每個都要多等前面每一個讀完，排在後面的等不到 lock 就放棄，放棄的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄。
+  // 狀態檔是 rename 換上的，lock 外讀到的一定是某個完整版本；lock 內再讀一次最新的，只拿掉這裡判斷過的（見 removeEndedSubagents）
+  const pruneDeadlineMs = Math.min(dependencies.now() + maximumPruneMs, deadlineMs - minimumHerdrBudgetMs);
+  const endedSubagents = findEndedSubagents(normalizeSessionState(readJsonFile(statePath), event.sessionId), event, {
+    nowMs: dependencies.now(),
+    readTail: dependencies.readFileTail,
+    hasTimeLeft: () => dependencies.now() < pruneDeadlineMs,
+  });
+  // Stop／StopFailure 只會拿掉上面判斷為結束的 sub：一個都沒有的話 lock 內什麼都不會改，不用跟別的 hook 搶 lock（Stop 每回合都會觸發）
+  if (pruneOnlyEventNames.has(event.eventName) && endedSubagents.length === 0) {
+    return { action: 'unchanged' };
+  }
   const ownLock = acquireLock(lockPath, deadlineMs - minimumHerdrBudgetMs, dependencies.now);
   if (ownLock === null) {
     return { action: 'skipped', reason: 'lock-timeout' };
   }
   try {
+    // lock 內不讀 transcript：只有狀態檔的讀寫與回報 herdr
     const nowMs = dependencies.now();
     const currentState = normalizeSessionState(readJsonFile(statePath), event.sessionId);
     const applied = applyEvent(currentState, event, nowMs);
-    const pruned = pruneEndedSubagents(applied.state, event, {
-      nowMs,
-      readTail: dependencies.readFileTail,
-      hasTimeLeft: () => dependencies.now() < deadlineMs - minimumHerdrBudgetMs,
-    });
+    const pruned = removeEndedSubagents(applied.state, endedSubagents);
     const isStateChanged = applied.changed || pruned.removed.length > 0;
     // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的樹（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋
     if (!isStateChanged && event.eventName !== 'SessionStart') {

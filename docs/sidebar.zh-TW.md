@@ -68,10 +68,14 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 - 認 lock 用 inode 加上內容（pid、啟動時間、建立時間）。只看 inode 不夠：ext4 這類檔案系統會把剛釋放的 inode 馬上給下一個新檔，失效 lock 被刪掉後別人新建的 lock 可能拿到同一個 inode。讀不到內容就不刪。
 - 接管：先用 `link` 搶 `<lock>.break-<inode>` 這個名字，搶到而且從這個名字讀回來的還是判定失效的那個 inode 與內容才刪 lock，不會刪到別人剛建好的新 lock。搶到的 process 若在刪之前被砍掉，留下的 `.break-*` 超過 2 秒就清掉。
 - 釋放時確認路徑上還是自己建的那個 inode 與內容才刪。
+- lock 內只讀寫狀態檔、回報 herdr。判斷 sub 是否結束（下一節）要讀的 transcript 在拿 lock 之前讀：放在 lock 內的話，同一個 session 平行觸發的 hook 每個都要多等前面每一個讀完，等不到 lock 的就放棄（`lock-timeout`），放棄的若是 `SubagentStart`，那個 sub 永遠不會出現在側邊欄。
+  - 拿到 lock 後重讀狀態檔，只拿掉仍在檔案裡、而且啟動時間跟判斷時一樣的 sub。中間被別的 hook 拿掉又重新啟動（resume）的那筆留著：判斷時讀的是上一輪的 transcript。
+  - `Stop`／`StopFailure` 沒有要拿掉的 sub 時，不拿 lock 直接結束。
+  - 實測（8 個 `SubagentStart` hook 同時啟動、假 herdr 每次 30 ms 才回應、5 個跑中的 sub 用真實 transcript，狀態檔與 transcript 在 btrfs 上，跑 20 輪）：持有 lock 約 36 ms（中位數），幾乎都是呼叫 herdr 的時間，跟還沒有清除 sub 這個功能時一樣。transcript 在 lock 內讀時約 47 ms；鎖在 1 個 CPU、旁邊另有 4 個吃滿 CPU 的 process 時，160 次更新掉了 46 次，改成 lock 外讀之後 640 次都沒掉。
 
 ### 沒收到 SubagentStop 就結束的 sub
 
-只靠 `SubagentStop` 移除的話，因 API 錯誤停下來的 sub 會一直留在清單裡：2026-10-10 一個額度用完的 sub（transcript 最後一行是 `isApiErrorMessage: true` 的 assistant 紀錄）在側邊欄卡了好幾個小時；Claude Code 為什麼沒觸發它的 `SubagentStop` 未驗證。所以每次 hook 事件（`SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure`）都在持有 session lock 時，檢查這個 session 狀態檔裡每個 sub 的 transcript，拿掉已經結束的：
+只靠 `SubagentStop` 移除的話，因 API 錯誤停下來的 sub 會一直留在清單裡：2026-10-10 一個額度用完的 sub（transcript 最後一行是 `isApiErrorMessage: true` 的 assistant 紀錄）在側邊欄卡了好幾個小時；Claude Code 為什麼沒觸發它的 `SubagentStop` 未驗證。所以每次 hook 事件（`SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure`）都在拿 session lock 之前，檢查這個 session 狀態檔裡每個 sub 的 transcript，拿掉已經結束的：
 
 - 位置：`<main transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl` 與旁邊的 `agent-<id>.meta.json`；task notification 從 main transcript（事件的 `transcript_path`）讀。main transcript 不存在或路徑不是絕對路徑時什麼都不拿：sub 的路徑不能信。
 - 每個 transcript（含 main transcript）只讀最後 64 KB，切到一半的第一行丟掉。
@@ -81,8 +85,8 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
   3. 最後一筆 `user`／`assistant` 是 `[Request interrupted by user…]`。本機 3 個這樣結尾的都是被中斷的背景 sub，main transcript 同一刻都記了 `killed`（那則通知可能已經不在最後 64 KB 裡）；
   4. `SubagentStart` 之後 2 分鐘 transcript 還不存在（實測 `SubagentStart` 之後約 0.1 秒就出現）；
   5. 最後手段：沒有任何結束訊號，但 transcript（或 `SubagentStart`，取比較晚的）超過 60 分鐘沒寫入。用來接住 Claude Code process 被砍掉、什麼訊號都沒留下的 sub。門檻是 Bash tool 單次上限 10 分鐘的 6 倍，sub 等指令、等 API 回應不會被拿掉；前景 sub 卡在權限確認超過一小時沒人按的會被拿掉（見已知限制）。
-- 早於這個 sub 的 `SubagentStart`（容許 2 秒誤差）的訊號不算：resume 的 sub 在寫出新紀錄之前，transcript 尾端還是上一輪的結束訊號。正在處理的那個 `SubagentStart` 的 sub，這次不判斷。
-- 耗時：5 個 sub、真實 transcript（每個 0.5–1.8 MB，main transcript 3.4 MB），整個 hook process 約 42 ms（15 次的中位數，其中 node 啟動約 18 ms）。時間預算快用完時，剩下的 sub 先留著，下一次事件再檢查。
+- 早於這個 sub 的 `SubagentStart`（容許 2 秒誤差）的訊號不算：resume 的 sub 在寫出新紀錄之前，transcript 尾端還是上一輪的結束訊號。正在處理的那個事件的 sub，這次不判斷（`SubagentStop` 的本來就會被拿掉）。
+- 耗時：5 個 sub、真實 transcript（每個 0.5–1.8 MB，main transcript 3.4 MB），整個 hook process 約 42 ms（15 次的中位數，其中 node 啟動約 18 ms）。判斷本身約 10 ms，8 個 hook 同時跑最多約 22 ms（5 個 sub、真實 transcript 每個 1.4–2.4 MB，main transcript 3.7 MB）。判斷最多做 100 ms（8 個 hook 擠在 1 個 CPU 上時會碰到），讓這次事件自己的更新還有時間等 lock（上限 200 ms 時，8 個 hook 擠在 1 個 CPU、旁邊另有 4 個吃滿 CPU 的 process，640 次更新掉了 5 次；100 ms 時 0 次）；剩下的 sub 先留著，下一次事件再檢查。
 - 拿本機 195 個 sub transcript（2026-10-10）跑過這套規則：192 個判定結束（`SubagentHandback` 146、`end_turn` 33、task notification `completed` 7／`killed` 1、API 錯誤 3、中斷 2）。留下的 3 個：兩個當下還在寫（其中一個就是跑這個檢查的 sub），一個約 15 分鐘沒寫入，實際狀態未驗證。
 
 ### herdr 回報
@@ -112,7 +116,7 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 - `bin/run.sh` 找不到 Node.js 22+ 時，對這個 hook 一律安靜地 exit 0（其他入口才印錯誤）。
 - `agent_type` 是空字串的 `SubagentStart`／`SubagentStop` 略過：Claude Code 內部 agent（prompt suggestion、`/btw`）也會觸發 `SubagentStop`。
 - 沒看過 `SubagentStart` 的 `SubagentStop` 略過。
-- `Stop` 每個 session 每一回合都會觸發（回合因 API 錯誤結束時改觸發 `StopFailure`）。狀態檔裡沒有跑中的 sub 時只讀那個檔案、不呼叫任何東西（整個 process 約 30 ms，大部分是 node 啟動）。
+- `Stop` 每個 session 每一回合都會觸發（回合因 API 錯誤結束時改觸發 `StopFailure`）。狀態檔裡沒有跑中的 sub 時只讀那個檔案、不呼叫任何東西（整個 process 約 30 ms，大部分是 node 啟動）；有跑中的 sub 但都還沒結束時，多讀它們的 transcript，但不拿 lock、不呼叫 herdr。
 - `subagent-watch` 資料夾不是自己的、是 symlink、或權限不是 `0700` → 什麼都不寫。
 - 同一個 pane 裡別的 Claude session 的事件略過（例如 pane 裡的 claude 用 Bash 跑 `claude -p`）：子 process 繼承同一個 `HERDR_PANE_ID`，不擋的話會蓋掉主 session 的樹和對照檔。五種事件都用同一套判斷：
   - 先數祖先 process 裡有幾組 `claude`。直接父子相鄰的 `claude` 只算一組，所以名為 claude、沒有 `exec` 的 wrapper script 仍然是一組；Bash tool 跑的指令一定隔著一層 shell，巢狀的 `claude -p` 會算第二組。
@@ -224,4 +228,4 @@ claude = [
 node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-涵蓋 payload 解析（含實測的 `SessionStart` startup／resume 與 `Stop` payload）、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、`SessionStart`（pane 對照檔的標記、同一個 session 的 sub 事件留著標記、別的 session 不帶、換 session 時重畫或清空樹狀行）、`Stop` 與 `StopFailure`（不寫 pane 對照檔、有拿掉 sub 才呼叫 herdr；`StopFailure` 用官方文件的 payload，會拿掉因 API 錯誤停下的 sub，也走同一套巢狀 `claude` 判斷）、清除沒收到 `SubagentStop` 就結束的 sub（實測的 API 錯誤與中斷 transcript 尾端、沿用 viewer 的規則、resume 前的結束訊號不算、2 分鐘與 60 分鐘的規則、只讀最後 64 KB、預放的 FIFO 不會卡住、時間預算）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、`bin/run.sh` 不執行相對路徑 PATH 項目裡的任何指令、判斷 pane 的 session（祖先只有一組 `claude` 時 herdr 回報舊的 `agent_session` 也照常更新、名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 除非 herdr 回報的就是它的 session 否則略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管與釋放不刪到別人的新 lock（拿到同一個 inode 也一樣）、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+涵蓋 payload 解析（含實測的 `SessionStart` startup／resume 與 `Stop` payload）、狀態更新（stop 移除、沒看過 start 的 stop 略過、舊版 `done` 項目丟掉）、`SessionStart`（pane 對照檔的標記、同一個 session 的 sub 事件留著標記、別的 session 不帶、換 session 時重畫或清空樹狀行）、`Stop` 與 `StopFailure`（不寫 pane 對照檔、有拿掉 sub 才呼叫 herdr；`StopFailure` 用官方文件的 payload，會拿掉因 API 錯誤停下的 sub，也走同一套巢狀 `claude` 判斷）、清除沒收到 `SubagentStop` 就結束的 sub（實測的 API 錯誤與中斷 transcript 尾端、沿用 viewer 的規則、resume 前的結束訊號不算、2 分鐘與 60 分鐘的規則、只讀最後 64 KB、預放的 FIFO 不會卡住、時間預算、transcript 都在拿 lock 之前讀、只拿掉中間沒被別的 hook 改過的、沒有要拿掉的 `Stop` 不拿 lock）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq 遞增、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、`bin/run.sh` 不執行相對路徑 PATH 項目裡的任何指令、判斷 pane 的 session（祖先只有一組 `claude` 時 herdr 回報舊的 `agent_session` 也照常更新、名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 除非 herdr 回報的就是它的 session 否則略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、lock（失效判斷、接管與釋放不刪到別人的新 lock（拿到同一個 inode 也一樣）、多個 hook 搶同一個失效 lock 不掉資料）、平行啟動不掉資料，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。

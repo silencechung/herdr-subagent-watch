@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -504,6 +504,115 @@ describe('reading only the end of a transcript', () => {
     const startedAtMs = Date.now();
     assert.equal(hook.readFileTail(fifoPath, hook.transcriptTailBytes), null);
     assert.ok(Date.now() - startedAtMs < 500);
+  });
+});
+
+// 讀 transcript 判斷 sub 是否結束放在 lock 裡的話，同一個 session 平行觸發的 hook 每個都要多等前面每一個讀完，
+// 排在後面的等不到 lock 就放棄（SubagentStart 放棄了，那個 sub 就永遠不會出現在側邊欄）
+describe('transcripts are read before the session lock is taken', () => {
+  const lockPathOf = (harness, sessionId) => join(harness.stateDirectory, `session-${sessionId}.json.lock`);
+
+  test('every transcript and meta read happens while the lock does not exist; herdr is called while it does', () => {
+    const files = createSessionFiles();
+    const reads = [];
+    let lockPath = null;
+    let isLockHeldDuringHerdr = null;
+    const harness = createHarness({
+      readFileTail: (filePath, maximumBytes) => {
+        reads.push({ name: basename(filePath), isLockHeld: existsSync(lockPath) });
+        return hook.readFileTail(filePath, maximumBytes);
+      },
+      // 對照組：lock 內一定看得到 lock 檔，確認上面的檢查不是永遠 false
+      runHerdr: () => {
+        isLockHeldDuringHerdr = existsSync(lockPath);
+      },
+    });
+    lockPath = lockPathOf(harness, files.sessionId);
+    harness.writeState(files.sessionId, [
+      { id: 'finished1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') },
+      { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
+    ]);
+    files.writeSubagent('finished1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
+    files.writeSubagent('running2', toJsonLines([assistantToolUse('2026-10-10T09:59:00.000Z', 'Grep', { pattern: 'x' })]));
+    const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'new3', agent_type: 'Explore' });
+    assert.deepEqual(reads.filter((read) => read.isLockHeld), []);
+    assert.equal(isLockHeldDuringHerdr, true);
+    assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
+    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2', 'new3']);
+    assert.deepEqual(reads.map((read) => read.name).sort(), [
+      `${files.sessionId}.jsonl`,
+      'agent-finished1.jsonl',
+      'agent-finished1.meta.json',
+      'agent-running2.jsonl',
+      'agent-running2.meta.json',
+    ]);
+    assert.equal(existsSync(lockPath), false);
+  });
+
+  test('only sub agents still in the state, with the same start, are removed: another hook may have changed it in between', () => {
+    const files = createSessionFiles();
+    const judgedStartMs = Date.parse('2026-10-10T09:40:00.000Z');
+    let isStateChangedByOtherHook = false;
+    const harness = createHarness({
+      readFileTail: (filePath, maximumBytes) => {
+        // 這裡已經讀完 lock 外的狀態檔、正在讀 transcript：模擬別的 hook 在這段時間拿到 lock 改了狀態檔
+        if (!isStateChangedByOtherHook) {
+          isStateChangedByOtherHook = true;
+          harness.writeState(files.sessionId, [
+            // 被拿掉後又 SubagentStart（resume）的新一輪：判斷的是上一輪，不能拿掉
+            { id: 'resumed1', agentType: 'Plan', startedAtMs: harness.nowMs() },
+            { id: 'finished2', agentType: 'Plan', startedAtMs: judgedStartMs },
+            { id: 'added3', agentType: 'Explore', startedAtMs: harness.nowMs() },
+          ]);
+        }
+        return hook.readFileTail(filePath, maximumBytes);
+      },
+    });
+    harness.writeState(files.sessionId, [
+      { id: 'resumed1', agentType: 'Plan', startedAtMs: judgedStartMs },
+      { id: 'finished2', agentType: 'Plan', startedAtMs: judgedStartMs },
+      { id: 'gone4', agentType: 'Plan', startedAtMs: judgedStartMs },
+    ]);
+    for (const agentId of ['resumed1', 'finished2', 'gone4']) {
+      files.writeSubagent(agentId, toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
+    }
+    const result = harness.run(sessionPayload(stopPayload, files));
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, [{ id: 'finished2', reason: 'handback' }]);
+    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['resumed1', 'added3']);
+  });
+
+  test('judging stops at its own time budget and the event itself is still recorded', () => {
+    const files = createSessionFiles();
+    const harness = createHarness({
+      readFileTail: (filePath, maximumBytes) => {
+        harness.advanceClock(hook.maximumPruneMs / 2);
+        return hook.readFileTail(filePath, maximumBytes);
+      },
+    });
+    const startedAtMs = Date.parse('2026-10-10T09:40:00.000Z');
+    harness.writeState(files.sessionId, ['done1', 'done2', 'done3'].map((id) => ({ id, agentType: 'Plan', startedAtMs })));
+    for (const agentId of ['done1', 'done2', 'done3']) {
+      files.writeSubagent(agentId, toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
+    }
+    const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'new4', agent_type: 'Explore' });
+    // 讀 main transcript 用掉一半預算、done1 的 transcript 用掉另一半：done1 判斷完就停，done2、done3 留到下一次事件
+    assert.deepEqual(result.removed, [{ id: 'done1', reason: 'handback' }]);
+    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['done2', 'done3', 'new4']);
+  });
+
+  test('a Stop with nothing to remove does not wait for the lock', () => {
+    const files = createSessionFiles();
+    const harness = createHarness({ now: () => Date.now(), deadlineMs: Date.now() + 300 });
+    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: Date.now() - 1000 }]);
+    files.writeSubagent('running1', toJsonLines([assistantToolUse(new Date().toISOString(), 'Bash')]));
+    // 活著的 process（自己）持有的 lock：要搶的話只會等到預算用完、回報 lock-timeout
+    const lockPath = lockPathOf(harness, files.sessionId);
+    const ownLock = JSON.stringify({ pid: process.pid, startTime: hook.readProcessInfo(process.pid).startTime, createdAtMs: Date.now() });
+    writeFileSync(lockPath, ownLock);
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+    assert.equal(readFileSync(lockPath, 'utf8'), ownLock);
+    assert.equal(harness.herdrCalls.length, 0);
   });
 });
 
