@@ -53,7 +53,7 @@ The hook process inherits Claude Code's environment variables: `HERDR_PANE_ID` (
 - `session-<sessionId>.json`: `{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`, where `subagents` holds only running sub agents. `SubagentStop` (or the cleanup below) removes the entry, so the file size depends only on how many sub agents run at the same time and does not keep growing. It is only written when something changed, so a session that never starts a sub agent leaves no file.
   - Entries left by an older version with `status` `"done"` are dropped the next time an event reads the file.
   - A `SubagentStart` for a sub agent that is still in the list (a resume whose previous `SubagentStop` was missed) keeps a single entry and replaces its start time with this one, so it moves to the end; a `SubagentStart` for one that has already been removed (resume) also adds it again at the end. The start time decides which run an end signal belongs to (see the next section).
-- `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`, plus `"sessionStartSource"` (the `source` of that `SessionStart`, e.g. `"startup"`) when the file was written by the `SessionStart` of this session. **The four fields are fixed**; the viewer reads `sessionStartSource` only as a mark (see [Which session a pane maps to](../README.md#which-session-a-pane-maps-to)).
+- `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`, plus `"sessionStartSource"` (the `source` of that `SessionStart`, e.g. `"startup"`) when the file was written by the `SessionStart` of this session. **The four fields are fixed**; the viewer reads `sessionStartSource` only as a mark (see [Which session a pane maps to](internals.md#which-session-a-pane-maps-to)).
   - `SubagentStart` / `SubagentStop` of the same session rewrite the file and keep the mark; an event of another session writes the file without it, because that session's `SessionStart` may never have been seen.
   - `Stop` / `StopFailure` never write it.
 
@@ -81,7 +81,7 @@ A sub agent stopped by an API error can stay in the list forever when only `Suba
 - Only the last 64 KB of each transcript (and of the main transcript) is read; a cut first line is dropped.
 - This cleanup is only a safety net for a missed `SubagentStop`. A sub agent is removed only when all three hold:
   1. the last real entry (`user` / `assistant`) of its transcript is an end signal, one of:
-     - the popup viewer's rules (see [README](../README.md#data-sources-and-when-a-sub-agent-counts-as-finished), the same code in `lib/subagent-state.mjs`): a `SubagentHandback` (followed by nothing but its own tool result) or `end_turn` for sub agents that are not background. The viewer's 10-minute "no writes" rule is not used here;
+     - the popup viewer's rules (see [internals](internals.md#data-sources-and-when-a-sub-agent-counts-as-finished), the same code in `lib/subagent-state.mjs`): a `SubagentHandback` (followed by nothing but its own tool result) or `end_turn` for sub agents that are not background. The viewer's 10-minute "no writes" rule is not used here;
      - a `<task-notification>` with `completed` / `killed` / `failed` in the main transcript: only the time of its `enqueue` line counts, and it must not be older than the last real entry; it is ignored when that entry is a new instruction (a `user` entry that is not a tool result, such as the message of a resume). The `remove` (dequeue) time is not used: it can come after a resume or after later entries of the sub agent. One local sub agent kept running Bash after its `SubagentHandback` because of a queued message, and its notification was dequeued after what was then its last entry;
      - an API error (`isApiErrorMessage: true`). The 3 local sub agents with an API error all stop at that entry with nothing after it;
      - `[Request interrupted by user…]`. The 3 local sub agents that end this way were all interrupted background sub agents, and the main transcript recorded `killed` for them at the same moment (that notification may already be outside the last 64 KB);
@@ -149,7 +149,7 @@ The hook is global and applies to every Claude session:
 
 ## What setup adds
 
-Written by the `subagent.watch.setup` action (or `sh bin/run.sh scripts/setup.mjs`). For the rules and conflict handling, see [Setup](../README.md#setup) in the README.
+Written by the `subagent.watch.setup` action (or `sh bin/run.sh scripts/setup.mjs`). For the rules and conflict handling, see [Setup details](internals.md#setup-details) in `docs/internals.md`.
 
 Under `hooks` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (other settings are untouched):
 

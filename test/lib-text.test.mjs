@@ -190,7 +190,7 @@ test('ZWJ and ZWNJ are kept with zero width while other format characters are st
   assert.equal(truncateWithEllipsis(family, 10), family);
   assert.equal(characterWidth('\u200d'), 0);
   assert.equal(characterWidth('\u200c'), 0);
-  // 量的是各部分加總，terminal 把整串畫成一個字時會比較窄（README 已知限制）
+  // 量的是各部分加總，terminal 把整串畫成一個字時會比較窄（docs/internals.md 已知限制）
   assert.equal(displayWidth(family), 6);
   assert.equal(displayWidth(persian), 7);
   assert.equal(stripTerminalControls('a\u202eb\u200bc\ufeffd\u2066e\u200ef'), 'abcdef');
