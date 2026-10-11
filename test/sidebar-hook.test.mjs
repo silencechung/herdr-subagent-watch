@@ -3,16 +3,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
-  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   symlinkSync,
-  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,24 +18,21 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  applyEvent,
-  breakStaleLock,
   buildMetadataArguments,
-  buildTreeLines,
+  buildSidebarLine,
   countClaudeAncestors,
-  createEmptySessionState,
-  formatTreeLine,
-  isLockOwnerGone,
-  maximumTokenLength,
-  nextSequence,
-  normalizeSessionState,
+  fallbackSequenceBaseNs,
+  listSessionSubagents,
   parseHookPayload,
-  parseLockOwner,
   parsePaneAgentSession,
+  parseSubagentFile,
   prepareStateDirectory,
-  readProcessInfo,
+  readBootTimeSeconds,
+  readLegacySubagents,
   runHook,
   sanitizeText,
+  subagentFileName,
+  takeSequence,
   totalBudgetMs,
 } from '../hooks/sidebar-hook.mjs';
 import { hookTimeoutSeconds } from '../lib/setup-claude.mjs';
@@ -50,13 +44,17 @@ const startPayloadText = readFileSync(join(fixtureDirectory, 'subagent-start.jso
 const stopPayloadText = readFileSync(join(fixtureDirectory, 'subagent-stop.json'), 'utf8');
 const startPayload = JSON.parse(startPayloadText);
 const testPaneId = 'w1:pTest';
-const allTokensCleared = [
-  '--clear-token', 'sub1',
+const testBootTimeSeconds = 1_790_000_000n;
+const testBootTimeNs = testBootTimeSeconds * 1_000_000_000n;
+// 舊安裝的 config.toml 還有 $sub2～$sub5：每次回報都要清掉
+const legacyTokensCleared = [
   '--clear-token', 'sub2',
   '--clear-token', 'sub3',
   '--clear-token', 'sub4',
   '--clear-token', 'sub5',
 ];
+const allTokensCleared = ['--clear-token', 'sub1', ...legacyTokensCleared];
+const runningTokens = (count) => ['--token', `sub1=● ${count} running`, ...legacyTokensCleared];
 
 const temporaryDirectories = [];
 function createTemporaryDirectory() {
@@ -114,175 +112,124 @@ describe('parseHookPayload', () => {
   });
 });
 
-describe('applyEvent', () => {
-  const startEvent = parseHookPayload(startPayloadText);
-  const stopEvent = parseHookPayload(stopPayloadText);
+describe('sub agent files', () => {
+  const content = (overrides = {}) => JSON.stringify({ sessionId: 'abc', id: 'agent1', agentType: 'Plan', startedAtMs: 5, ...overrides });
 
-  test('start adds a running sub agent', () => {
-    const { changed, state } = applyEvent(createEmptySessionState('session'), startEvent, 1000);
-    assert.equal(changed, true);
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 1000, 'general-purpose')]);
+  test('a file counts only when its session and id match its name', () => {
+    assert.equal(subagentFileName('abc', 'agent1'), 'sub-abc-agent1.json');
+    assert.deepEqual(parseSubagentFile(content(), 'abc', 'sub-abc-agent1.json'), subagent('agent1', 5, 'Plan'));
+    // session「abc」的前綴 sub-abc- 也對得上 session「abc-x」的檔：內容的 sessionId 不同，不算
+    assert.equal(parseSubagentFile(content({ sessionId: 'abc-x', id: 'agent1' }), 'abc', 'sub-abc-x-agent1.json'), null);
+    assert.equal(parseSubagentFile(content({ id: 'other' }), 'abc', 'sub-abc-agent1.json'), null);
+    assert.equal(parseSubagentFile(content({ id: '../x' }), 'abc', 'sub-abc-../x.json'), null);
+    assert.equal(parseSubagentFile(content({ startedAtMs: 'soon' }), 'abc', 'sub-abc-agent1.json'), null);
+    assert.equal(parseSubagentFile(content({ agentType: 3 }), 'abc', 'sub-abc-agent1.json'), null);
+    assert.equal(parseSubagentFile('{broken', 'abc', 'sub-abc-agent1.json'), null);
   });
 
-  test('stop removes the sub agent from the state', () => {
-    const started = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
-    const { changed, state } = applyEvent(started, stopEvent, 2500);
-    assert.equal(changed, true);
-    assert.deepEqual(state.subagents, []);
-    assert.equal(started.subagents.length, 1);
+  test('listing a session reads only its own finished files, not temporary ones or other sessions', () => {
+    const directory = createTemporaryDirectory();
+    writeFileSync(join(directory, 'sub-abc-agent1.json'), content());
+    writeFileSync(join(directory, 'sub-abc-agent2.json.0011223344556677.tmp'), content({ id: 'agent2' }));
+    writeFileSync(join(directory, 'sub-abc-x-agent3.json'), content({ sessionId: 'abc-x', id: 'agent3' }));
+    writeFileSync(join(directory, 'sub-other-agent4.json'), content({ sessionId: 'other', id: 'agent4' }));
+    writeFileSync(join(directory, 'session-abc.json'), JSON.stringify({ subagents: [subagent('agent5', 1)] }));
+    assert.deepEqual(listSessionSubagents(directory, 'abc'), [subagent('agent1', 5, 'Plan')]);
   });
 
-  test('stop for a sub agent that never started is ignored', () => {
-    const emptyState = createEmptySessionState('session');
-    const { changed, state } = applyEvent(emptyState, stopEvent, 2500);
-    assert.equal(changed, false);
-    assert.equal(state, emptyState);
-  });
-
-  test('start again after stop (resume) shows it once more', () => {
-    let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
-    state = applyEvent(state, stopEvent, 2000).state;
-    state = applyEvent(state, startEvent, 3000).state;
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
-  });
-
-  // resume 時上一輪的 stop 沒記到：啟動時間沿用舊的話，上一輪的結束訊號會被當成這一輪的，正在跑的 sub 被清掉
-  test('a repeated start without stop (a resume whose stop was missed) keeps one entry with the new start time', () => {
-    let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
-    state = applyEvent(state, startEvent, 3000).state;
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
-  });
-});
-
-describe('normalizeSessionState', () => {
-  test('drops finished entries left by the previous version', () => {
-    const state = normalizeSessionState({
+  test('running entries of the previous version\'s state file are read for migration; finished ones are dropped', () => {
+    const subagents = readLegacySubagents({
       sessionId: 'session',
       lastSequence: 42,
       subagents: [
         { id: 'old-done', agentType: 'Plan', status: 'done', startedAtMs: 1, endedAtMs: 2 },
         { id: 'old-running', agentType: 'Explore', status: 'running', startedAtMs: 3, endedAtMs: null },
         subagent('new', 4),
+        subagent('../escape', 5),
         null,
         { agentType: 'no-id' },
       ],
-    }, 'session');
-    assert.equal(state.lastSequence, 42);
-    assert.deepEqual(state.subagents.map((entry) => entry.id), ['old-running', 'new']);
+    });
+    assert.deepEqual(subagents, [subagent('old-running', 3, 'Explore'), subagent('new', 4)]);
+    assert.deepEqual(readLegacySubagents(null), []);
+    assert.deepEqual(readLegacySubagents({ subagents: 'x' }), []);
   });
 });
 
-describe('buildTreeLines', () => {
-  test('no running sub agents gives no lines', () => {
-    assert.deepEqual(buildTreeLines([]), []);
+describe('buildSidebarLine', () => {
+  test('no running sub agents gives no line', () => {
+    assert.equal(buildSidebarLine(0), null);
   });
 
-  test('single sub agent uses the last-branch glyph', () => {
-    assert.deepEqual(buildTreeLines([subagent('a', 1, 'general-purpose')]), ['└─ general-purpose ●']);
-  });
-
-  test('ordered by start time', () => {
-    const lines = buildTreeLines([
-      subagent('late', 30, 'late'),
-      subagent('early', 5, 'early'),
-      subagent('middle', 10, 'middle'),
-    ]);
-    assert.deepEqual(lines, [
-      '├─ early ●',
-      '├─ middle ●',
-      '└─ late ●',
-    ]);
-  });
-
-  test('exactly five fit without a more line', () => {
-    const subagents = [1, 2, 3, 4, 5].map((index) => subagent(`s${index}`, index));
-    const lines = buildTreeLines(subagents);
-    assert.equal(lines.length, 5);
-    assert.equal(lines[4], '└─ type-s5 ●');
-  });
-
-  test('overflow collapses the last line into +N more', () => {
-    const subagents = [1, 2, 3, 4, 5, 6, 7].map((index) => subagent(`s${index}`, index));
-    const lines = buildTreeLines(subagents);
-    assert.deepEqual(lines, [
-      '├─ type-s1 ●',
-      '├─ type-s2 ●',
-      '├─ type-s3 ●',
-      '├─ type-s4 ●',
-      '└─ +3 more',
-    ]);
-  });
-
-  // popup 的 tab 有編號，側邊欄刻意沒有：同 type 重複時也只列名稱，不帶任何數字
-  test('repeated agent types stay unnumbered even though popup tabs are numbered', () => {
-    const lines = buildTreeLines([
-      subagent('a', 1, 'general-purpose'),
-      subagent('b', 2, 'general-purpose'),
-      subagent('c', 3, 'general-purpose'),
-    ]);
-    assert.deepEqual(lines, [
-      '├─ general-purpose ●',
-      '├─ general-purpose ●',
-      '└─ general-purpose ●',
-    ]);
-    for (const line of lines) {
-      assert.doesNotMatch(line, /\d|\[/);
-    }
-  });
-
-  test('lines never contain numbering or a finished mark', () => {
-    const lines = buildTreeLines([subagent('a', 1, 'Plan'), subagent('b', 2, 'Explore')]);
-    for (const line of lines) {
-      assert.match(line, /^(├─|└─) [A-Za-z]+ ●$/);
-    }
-  });
-});
-
-describe('formatTreeLine', () => {
-  test('truncates long agent types to 80 characters and keeps the icon', () => {
-    const line = formatTreeLine('├─', 'x'.repeat(200));
-    assert.equal(Array.from(line).length, maximumTokenLength);
-    assert.ok(line.endsWith('x… ●'));
-  });
-
-  test('counts characters, not UTF-16 units', () => {
-    const line = formatTreeLine('└─', '代'.repeat(100));
-    assert.equal(Array.from(line).length, maximumTokenLength);
-    assert.ok(line.startsWith('└─ 代'));
-    assert.ok(line.endsWith('… ●'));
-  });
-
-  test('short agent types are untouched', () => {
-    assert.equal(formatTreeLine('├─', 'Explore'), '├─ Explore ●');
+  test('shows only the count of running sub agents, with no upper limit', () => {
+    assert.equal(buildSidebarLine(1), '● 1 running');
+    assert.equal(buildSidebarLine(7), '● 7 running');
+    assert.equal(buildSidebarLine(123), '● 123 running');
   });
 });
 
 describe('buildMetadataArguments', () => {
-  test('sets used tokens and clears the rest under one source', () => {
-    const argumentList = buildMetadataArguments('w8:pV', ['├─ Plan ●', '└─ Explore ●'], 1234);
+  test('sets sub1 to the line and always clears sub2 to sub5 left in older configs, under one source', () => {
+    const argumentList = buildMetadataArguments('w8:pV', '● 2 running', 1234);
     assert.deepEqual(argumentList, [
       'pane', 'report-metadata', 'w8:pV',
       '--source', 'subagent.watch',
       '--seq', '1234',
-      '--token', 'sub1=├─ Plan ●',
-      '--token', 'sub2=└─ Explore ●',
+      '--token', 'sub1=● 2 running',
+      '--clear-token', 'sub2',
       '--clear-token', 'sub3',
       '--clear-token', 'sub4',
       '--clear-token', 'sub5',
     ]);
   });
 
-  test('no lines clears all five tokens', () => {
-    assert.deepEqual(buildMetadataArguments('w8:pV', [], 1234).slice(7), allTokensCleared);
+  test('no line clears all five tokens', () => {
+    assert.deepEqual(buildMetadataArguments('w8:pV', null, 1234).slice(7), allTokensCleared);
   });
 });
 
-describe('nextSequence', () => {
-  test('follows the clock and stays strictly increasing', () => {
-    assert.equal(nextSequence(0, 5000), 5000);
-    assert.equal(nextSequence(5000, 5000), 5001);
-    assert.equal(nextSequence(9000, 5000), 9001);
-    assert.equal(nextSequence(undefined, 5000), 5000);
+describe('takeSequence', () => {
+  const herdrMaximumSequence = 2n ** 64n - 1n;
+
+  test('is boot time in ns plus the monotonic clock, as a BigInt', () => {
+    const sequence = takeSequence(1_791_608_737n, 123_456_789n);
+    assert.equal(typeof sequence, 'bigint');
+    assert.equal(sequence, 1_791_608_737_123_456_789n);
+    assert.equal(String(sequence), '1791608737123456789');
+  });
+
+  test('keeps increasing across a reboot, where the monotonic clock starts over', () => {
+    // 前一次開機跑了 30 天，最後一次回報；重開機 1 秒後的第一次回報
+    const lastBeforeReboot = takeSequence(1_790_000_000n, 30n * 86_400n * 1_000_000_000n);
+    const firstAfterReboot = takeSequence(1_790_000_000n + 30n * 86_400n + 60n, 1_000_000_000n);
+    assert.ok(firstAfterReboot > lastBeforeReboot);
+  });
+
+  test('is far above the millisecond seq of the previous version and far below the u64 limit herdr accepts', () => {
+    const previousVersionSequence = BigInt(Date.parse('2030-01-01T00:00:00Z'));
+    const now = takeSequence(readBootTimeSeconds() ?? 1_790_000_000n, process.hrtime.bigint());
+    assert.ok(now > previousVersionSequence * 1000n);
+    assert.ok(takeSequence(4_000_000_000n, 100n * 365n * 86_400n * 1_000_000_000n) < herdrMaximumSequence);
+  });
+
+  test('without a boot time it falls back to a fixed base that still beats the previous version\'s millisecond seq', () => {
+    assert.equal(takeSequence(null, 42n), fallbackSequenceBaseNs + 42n);
+    assert.ok(takeSequence(null, 0n) > BigInt(Date.parse('2100-01-01T00:00:00Z')));
+    assert.ok(takeSequence(null, 0n) < takeSequence(1_790_000_000n, 0n));
+  });
+
+  test('the boot time is read from btime in /proc/stat', () => {
+    const procStat = 'cpu  1 2 3\nintr 5\nctxt 6\nbtime 1791608737\nprocesses 7\n';
+    assert.equal(readBootTimeSeconds(() => procStat), 1_791_608_737n);
+    assert.equal(readBootTimeSeconds(() => 'cpu 1 2 3\n'), null);
+    assert.equal(readBootTimeSeconds(() => 'btime 0\n'), null);
+    assert.equal(readBootTimeSeconds(() => 'btime -5\n'), null);
+    assert.equal(readBootTimeSeconds(() => {
+      throw new Error('ENOENT');
+    }), null);
+    if (existsSync('/proc/stat')) {
+      assert.equal(typeof readBootTimeSeconds(), 'bigint');
+    }
   });
 });
 
@@ -313,8 +260,14 @@ describe('runHook', () => {
     const runtimeDirectory = createTemporaryDirectory();
     const herdrCalls = [];
     let clockMs = 1_000_000;
+    let monotonicNs = 0n;
     const dependencies = {
       now: () => clockMs,
+      readBootTimeSeconds: () => testBootTimeSeconds,
+      monotonicNs: () => {
+        monotonicNs += 1n;
+        return monotonicNs;
+      },
       runHerdr: (binaryPath, argumentList, timeoutMs) => {
         herdrCalls.push({ binaryPath, argumentList, timeoutMs });
       },
@@ -331,27 +284,31 @@ describe('runHook', () => {
       HERDR_BIN_PATH: '/fake/herdr',
       XDG_RUNTIME_DIR: runtimeDirectory,
     };
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
     return {
       runtimeDirectory,
-      stateDirectory: join(runtimeDirectory, 'subagent-watch'),
+      stateDirectory,
       herdrCalls,
       environment,
       dependencies,
       advanceClock: (durationMs) => {
         clockMs += durationMs;
       },
+      readSubagents: (sessionId = startPayload.session_id) => listSessionSubagents(stateDirectory, sessionId),
+      subagentFilePath: (agentId, sessionId = startPayload.session_id) => join(stateDirectory, subagentFileName(sessionId, agentId)),
     };
   }
 
-  test('start then stop updates state, pane mapping and herdr tokens', () => {
+  test('start then stop writes and removes the sub agent file, writes the pane mapping and reports to herdr', () => {
     const harness = createHarness();
     const startResult = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(startResult.action, 'reported');
-    assert.deepEqual(startResult.lines, ['└─ general-purpose ●']);
+    assert.equal(startResult.runningCount, 1);
+    assert.equal(startResult.line, '● 1 running');
     assert.equal(harness.herdrCalls.length, 1);
     assert.equal(harness.herdrCalls[0].binaryPath, '/fake/herdr');
     assert.deepEqual(harness.herdrCalls[0].argumentList.slice(0, 7), [
-      'pane', 'report-metadata', testPaneId, '--source', 'subagent.watch', '--seq', '1000000',
+      'pane', 'report-metadata', testPaneId, '--source', 'subagent.watch', '--seq', String(testBootTimeNs + 1n),
     ]);
 
     const paneMapping = JSON.parse(readFileSync(join(harness.stateDirectory, `pane-${testPaneId}.json`), 'utf8'));
@@ -361,27 +318,50 @@ describe('runHook', () => {
     assert.equal(paneMapping.cwd, startPayload.cwd);
     assert.equal(paneMapping.updatedAtMs, 1_000_000);
 
-    const sessionStatePath = join(harness.stateDirectory, `session-${startPayload.session_id}.json`);
-    let sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
-    assert.deepEqual(sessionState.subagents, [
-      subagent('a12e8c491ce2f7f4a', 1_000_000, 'general-purpose'),
-    ]);
+    const subagentFilePath = harness.subagentFilePath('a12e8c491ce2f7f4a');
+    assert.deepEqual(JSON.parse(readFileSync(subagentFilePath, 'utf8')), {
+      sessionId: startPayload.session_id,
+      id: 'a12e8c491ce2f7f4a',
+      agentType: 'general-purpose',
+      startedAtMs: 1_000_000,
+    });
+    assert.equal(statSync(subagentFilePath).mode & 0o777, 0o600);
 
     harness.advanceClock(2000);
     const stopResult = runHook(stopPayloadText, harness.environment, harness.dependencies);
     assert.equal(stopResult.action, 'reported');
-    assert.deepEqual(stopResult.lines, []);
-    assert.equal(harness.herdrCalls[1].argumentList[6], '1002000');
+    assert.equal(stopResult.runningCount, 0);
+    assert.equal(stopResult.line, null);
+    assert.equal(harness.herdrCalls[1].argumentList[6], String(testBootTimeNs + 2n));
     assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7), allTokensCleared);
-    sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
-    assert.deepEqual(sessionState.subagents, []);
-    assert.equal(sessionState.lastSequence, 1_002_000);
+    assert.equal(existsSync(subagentFilePath), false);
 
-    const leftovers = readdirSync(harness.stateDirectory).filter((name) => name.endsWith('.lock') || name.endsWith('.tmp'));
-    assert.deepEqual(leftovers, []);
+    // 沒有 lock、沒有 session 狀態檔，暫存檔也不會留下
+    assert.deepEqual(readdirSync(harness.stateDirectory), [`pane-${testPaneId}.json`]);
   });
 
-  test('start two, stop one, stop the other: two lines, then one └─ line, then everything cleared', () => {
+  test('start again after stop (resume) shows it once more', () => {
+    const harness = createHarness();
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    harness.advanceClock(1000);
+    runHook(stopPayloadText, harness.environment, harness.dependencies);
+    harness.advanceClock(1000);
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.runningCount, 1);
+    assert.deepEqual(harness.readSubagents(), [subagent('a12e8c491ce2f7f4a', 1_002_000, 'general-purpose')]);
+  });
+
+  // resume 時上一輪的 stop 沒收到：啟動時間沿用舊的話，上一輪的結束訊號會被當成這一輪的，正在跑的 sub 被清掉
+  test('a repeated start without stop (a resume whose stop was missed) keeps one entry with the new start time', () => {
+    const harness = createHarness();
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    harness.advanceClock(2000);
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.runningCount, 1);
+    assert.deepEqual(harness.readSubagents(), [subagent('a12e8c491ce2f7f4a', 1_002_000, 'general-purpose')]);
+  });
+
+  test('start two, stop one, stop the other: 2 running, then 1 running, then everything cleared', () => {
     const harness = createHarness();
     const firstStart = payloadWith({ agent_id: 'first', agent_type: 'Explore' });
     const secondStart = payloadWith({ agent_id: 'second', agent_type: 'Plan' });
@@ -391,33 +371,27 @@ describe('runHook', () => {
     runHook(firstStart, harness.environment, harness.dependencies);
     harness.advanceClock(10);
     const bothRunning = runHook(secondStart, harness.environment, harness.dependencies);
-    assert.deepEqual(bothRunning.lines, ['├─ Explore ●', '└─ Plan ●']);
+    assert.deepEqual(bothRunning.argumentList.slice(7), runningTokens(2));
 
     harness.advanceClock(10);
     const oneLeft = runHook(firstStop, harness.environment, harness.dependencies);
-    assert.deepEqual(oneLeft.lines, ['└─ Plan ●']);
-    assert.deepEqual(oneLeft.argumentList.slice(7), [
-      '--token', 'sub1=└─ Plan ●',
-      '--clear-token', 'sub2',
-      '--clear-token', 'sub3',
-      '--clear-token', 'sub4',
-      '--clear-token', 'sub5',
-    ]);
+    assert.deepEqual(oneLeft.argumentList.slice(7), runningTokens(1));
 
     harness.advanceClock(10);
     const noneLeft = runHook(secondStop, harness.environment, harness.dependencies);
-    assert.deepEqual(noneLeft.lines, []);
+    assert.equal(noneLeft.line, null);
     assert.deepEqual(noneLeft.argumentList.slice(7), allTokensCleared);
     assert.equal(harness.herdrCalls.length, 4);
   });
 
-  test('+N more only counts sub agents that are still running', () => {
+  // 舊版最多 5 行、第 5 行是 +N more；現在只有數量，超過 5 個也照實顯示
+  test('the count has no upper limit and only counts sub agents that are still running', () => {
     const harness = createHarness();
     for (let index = 1; index <= 7; index += 1) {
       harness.advanceClock(10);
       runHook(payloadWith({ agent_id: `s${index}`, agent_type: `worker${index}` }), harness.environment, harness.dependencies);
     }
-    assert.equal(harness.herdrCalls.at(-1).argumentList.at(-1), 'sub5=└─ +3 more');
+    assert.deepEqual(harness.herdrCalls.at(-1).argumentList.slice(7), runningTokens(7));
 
     const stop = (index) => {
       harness.advanceClock(10);
@@ -427,51 +401,83 @@ describe('runHook', () => {
         harness.dependencies,
       );
     };
-    assert.deepEqual(stop(1).lines, [
-      '├─ worker2 ●',
-      '├─ worker3 ●',
-      '├─ worker4 ●',
-      '├─ worker5 ●',
-      '└─ +2 more',
-    ]);
-    assert.deepEqual(stop(4).lines, [
-      '├─ worker2 ●',
-      '├─ worker3 ●',
-      '├─ worker5 ●',
-      '├─ worker6 ●',
-      '└─ worker7 ●',
-    ]);
+    assert.equal(stop(1).line, '● 6 running');
+    assert.equal(stop(4).line, '● 5 running');
+    // 已經停掉的再收到一次 stop：檔不在，不算改動、不回報
+    assert.equal(stop(4).action, 'unchanged');
   });
 
-  test('a state file from the previous version drops its finished sub agents on the next event', () => {
+  // 升級：舊版 hook 寫的 session 狀態檔裡還在跑的 sub 搬成 sub 檔，不會在升級後第一次重畫時從側邊欄消失
+  test('running sub agents in the previous version\'s state file are moved to sub agent files and the old file is removed', () => {
     const harness = createHarness();
-    runHook(startPayloadText, harness.environment, harness.dependencies);
-    const sessionStatePath = join(harness.stateDirectory, `session-${startPayload.session_id}.json`);
-    writeFileSync(sessionStatePath, JSON.stringify({
+    mkdirSync(harness.stateDirectory, { mode: 0o700 });
+    const legacyPath = join(harness.stateDirectory, `session-${startPayload.session_id}.json`);
+    writeFileSync(legacyPath, JSON.stringify({
       sessionId: startPayload.session_id,
-      lastSequence: 1_000_000,
+      lastSequence: 999_000,
       subagents: [
-        { id: 'a12e8c491ce2f7f4a', agentType: 'general-purpose', status: 'running', startedAtMs: 1_000_000, endedAtMs: null },
+        { id: 'oldrunning', agentType: 'Plan', status: 'running', startedAtMs: 990_000, endedAtMs: null },
         { id: 'finished', agentType: 'Plan', status: 'done', startedAtMs: 900_000, endedAtMs: 950_000 },
+        subagent('oldrunning2', 995_000, 'Explore'),
       ],
     }));
+    // 舊版留下的 lock 不擋任何事，也不會被動到
+    const legacyLockPath = `${legacyPath}.lock`;
+    writeFileSync(legacyLockPath, JSON.stringify({ pid: process.pid, startTime: '1', createdAtMs: 0 }));
+    const result = runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(result.line, '● 3 running');
+    assert.equal(existsSync(legacyPath), false);
+    assert.equal(existsSync(legacyLockPath), true);
+    assert.deepEqual(harness.readSubagents().map((entry) => entry.id).sort(), ['a12e8c491ce2f7f4a', 'oldrunning', 'oldrunning2']);
+
+    // 舊版的 sub 收到 SubagentStop 時照常拿掉
     harness.advanceClock(10);
-    const result = runHook(payloadWith({ agent_id: 'second', agent_type: 'Explore' }), harness.environment, harness.dependencies);
-    assert.deepEqual(result.lines, ['├─ general-purpose ●', '└─ Explore ●']);
-    const sessionState = JSON.parse(readFileSync(sessionStatePath, 'utf8'));
-    assert.deepEqual(sessionState.subagents.map((entry) => entry.id), ['a12e8c491ce2f7f4a', 'second']);
+    const stopped = runHook(payloadWith({ hook_event_name: 'SubagentStop', agent_id: 'oldrunning', agent_type: 'Plan' }), harness.environment, harness.dependencies);
+    assert.equal(stopped.line, '● 2 running');
   });
 
-  test('two events in the same millisecond still get increasing seq', () => {
+  test('migration never overwrites a sub agent file the new version already wrote', () => {
+    const harness = createHarness();
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    writeFileSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`), JSON.stringify({
+      sessionId: startPayload.session_id,
+      subagents: [subagent('a12e8c491ce2f7f4a', 1, 'stale')],
+    }));
+    harness.advanceClock(10);
+    runHook(payloadWith({ hook_event_name: 'Stop' }), harness.environment, harness.dependencies);
+    assert.deepEqual(harness.readSubagents(), [subagent('a12e8c491ce2f7f4a', 1_000_000, 'general-purpose')]);
+    assert.equal(existsSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`)), false);
+  });
+
+  // 搬舊檔是這次事件唯一的改動時也要回報：Stop 沒拿掉任何 sub，但側邊欄要畫出剛搬過來的 sub
+  test('a Stop whose only change is moving the previous version\'s running sub agents still reports them to herdr', () => {
+    const harness = createHarness();
+    mkdirSync(harness.stateDirectory, { mode: 0o700 });
+    writeFileSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`), JSON.stringify({
+      sessionId: startPayload.session_id,
+      subagents: [subagent('oldrunning', 990_000, 'Plan')],
+    }));
+    const result = runHook(payloadWith({ hook_event_name: 'Stop' }), harness.environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, []);
+    assert.equal(harness.herdrCalls.length, 1);
+    assert.deepEqual(harness.herdrCalls[0].argumentList.slice(7), runningTokens(1));
+    assert.deepEqual(harness.readSubagents().map((entry) => entry.id), ['oldrunning']);
+  });
+
+  test('seq follows the monotonic clock, so two events in the same millisecond still get increasing seq', () => {
     const harness = createHarness();
     runHook(startPayloadText, harness.environment, harness.dependencies);
     runHook(payloadWith({ agent_id: 'second', agent_type: 'Explore' }), harness.environment, harness.dependencies);
-    assert.equal(harness.herdrCalls[0].argumentList[6], '1000000');
-    assert.equal(harness.herdrCalls[1].argumentList[6], '1000001');
-    assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7, 11), [
-      '--token', 'sub1=├─ general-purpose ●',
-      '--token', 'sub2=└─ Explore ●',
-    ]);
+    assert.equal(harness.herdrCalls[0].argumentList[6], String(testBootTimeNs + 1n));
+    assert.equal(harness.herdrCalls[1].argumentList[6], String(testBootTimeNs + 2n));
+    assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7), runningTokens(2));
+  });
+
+  test('without a readable boot time the seq uses the fallback base', () => {
+    const harness = createHarness({ readBootTimeSeconds: () => null });
+    runHook(startPayloadText, harness.environment, harness.dependencies);
+    assert.equal(harness.herdrCalls[0].argumentList[6], String(fallbackSequenceBaseNs + 1n));
   });
 
   test('stop for an unknown sub agent does not call herdr', () => {
@@ -532,13 +538,15 @@ describe('runHook', () => {
     assert.equal(harness.herdrCalls.length, 0);
   });
 
-  test('corrupt session state is replaced instead of crashing', () => {
+  test('corrupt or mismatched sub agent files are skipped instead of crashing', () => {
     const harness = createHarness();
     runHook(startPayloadText, harness.environment, harness.dependencies);
+    writeFileSync(harness.subagentFilePath('broken'), '{broken');
+    writeFileSync(harness.subagentFilePath('mismatch'), JSON.stringify({ sessionId: startPayload.session_id, id: 'other', agentType: 'x', startedAtMs: 1 }));
     writeFileSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`), '{broken');
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1, 'broken and mismatched files are not counted');
   });
 });
 
@@ -618,7 +626,7 @@ describe('hook script as Claude Code runs it', () => {
     assert.equal(result.stderr, '');
   });
 
-  test('inside herdr: calls herdr with the tree tokens, no output, under 1 second', () => {
+  test('inside herdr: calls herdr with the count token, no output, under 1 second', () => {
     const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const result = runScript(environment, startPayloadText);
     assert.equal(result.status, 0);
@@ -628,42 +636,252 @@ describe('hook script as Claude Code runs it', () => {
     const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].slice(0, 5), ['pane', 'report-metadata', testPaneId, '--source', 'subagent.watch']);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.deepEqual(calls[0].slice(7), runningTokens(1));
     assert.ok(existsSync(join(runtimeDirectory, 'subagent-watch', `pane-${testPaneId}.json`)));
   });
 
-  test('parallel starts are all recorded and the newest seq shows every sub agent', async () => {
-    const { runtimeDirectory, callLogPath, environment } = createScriptCase();
-    const parallelCount = 6;
-    const runs = Array.from({ length: parallelCount }, (unused, index) => {
-      return new Promise((resolvePromise) => {
-        const child = spawn(process.execPath, [hookScriptPath], { env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
-        let output = '';
-        child.stdout.on('data', (chunk) => {
-          output += chunk;
-        });
-        child.on('close', (status) => {
-          resolvePromise({ status, output });
-        });
-        child.stdin.end(payloadWith({ agent_id: `parallel${index}`, agent_type: `worker${index}` }));
+  function runScriptAsync(environment, payloadText) {
+    return new Promise((resolvePromise) => {
+      const child = spawn(process.execPath, [hookScriptPath], { env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
+      let output = '';
+      child.stdout.on('data', (chunk) => {
+        output += chunk;
       });
+      child.on('close', (status) => {
+        resolvePromise({ status, output });
+      });
+      child.stdin.end(payloadText);
     });
-    const results = await Promise.all(runs);
-    for (const result of results) {
-      assert.equal(result.status, 0);
-      assert.equal(result.output, '');
+  }
+
+  // 假 herdr 照 herdr 的規則（實測）依送達的先後處理：seq 小於或等於上次收下的就忽略，所以 seq 一樣時收先到的那筆。
+  // call log 的順序就是假 herdr 收到的順序；上次收下的 seq 跟真的 herdr 一樣跨階段保留
+  function createFakeHerdrDisplay(callLogPath) {
+    let readCount = 0;
+    let lastAcceptedSequence = -1n;
+    let shownTokens = null;
+    return () => {
+      const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line)).slice(readCount);
+      readCount += calls.length;
+      for (const call of calls) {
+        const sequence = BigInt(call[6]);
+        if (sequence > lastAcceptedSequence) {
+          lastAcceptedSequence = sequence;
+          shownTokens = call.slice(7);
+        }
+      }
+      return { calls, shownTokens };
+    };
+  }
+
+  // 同一個 seq 被兩個以上的 hook 拿到的組：[{ sequence, count, isNewest }]
+  function findSequenceCollisions(calls) {
+    const countBySequence = new Map();
+    for (const call of calls) {
+      countBySequence.set(call[6], (countBySequence.get(call[6]) ?? 0) + 1);
     }
-    const sessionState = JSON.parse(readFileSync(
-      join(runtimeDirectory, 'subagent-watch', `session-${startPayload.session_id}.json`),
-      'utf8',
-    ));
-    assert.equal(sessionState.subagents.length, parallelCount);
-    const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    assert.equal(calls.length, parallelCount);
-    const newestCall = calls.reduce((newest, call) => (Number(call[6]) > Number(newest[6]) ? call : newest));
-    assert.ok(newestCall.includes('sub5=└─ +2 more'));
-    const sequences = calls.map((call) => Number(call[6]));
-    assert.equal(new Set(sequences).size, parallelCount);
+    const newest = calls.reduce((best, call) => (BigInt(call[6]) > best ? BigInt(call[6]) : best), -1n);
+    return [...countBySequence].filter(([, count]) => count > 1).map(([sequence, count]) => ({ sequence, count, isNewest: BigInt(sequence) === newest }));
+  }
+
+  // 沒有 lock 之後，平行的 hook 各自改自己的檔、各自回報：不管怎麼交錯，假 herdr 最後顯示的一定要等於檔案最後的狀態，一次都不能漏。
+  // seq 撞號（不同核心在同一個 ns 讀時鐘）不算錯，不檢查「每個 seq 都不一樣」：同一個 seq 代表兩個 hook 在同一個 ns 取號，
+  // 兩邊取號時自己的改動都已經完成、readdir 都在取號之後，所以兩筆都看得到 seq 不大於它的每一個改動；
+  // 之後才完成的改動，那個 hook 是改完才取號，seq 一定比較大，會蓋過這兩筆。herdr 收先到的那筆也一樣正確。
+  // 最壞的情況是撞號的就是這個階段最大的 seq（之後沒有更大的回報來蓋過）：那幾筆每一筆都要等於檔案狀態，不只是先到的那筆
+  test('parallel starts, stops and start-then-stop chains: what herdr shows always equals the files left, even when two hooks get the same seq', { timeout: 120_000 }, async (context) => {
+    const { runtimeDirectory, callLogPath, environment } = createScriptCase();
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+    const parallelCount = 8;
+    const start = (agentId) => payloadWith({ agent_id: agentId, agent_type: `worker-${agentId}` });
+    const stop = (agentId) => payloadWith({ hook_event_name: 'SubagentStop', agent_id: agentId, agent_type: `worker-${agentId}` });
+    const readDisplay = createFakeHerdrDisplay(callLogPath);
+    const checkPhase = async (label, runs, expectedIds) => {
+      const results = await Promise.all(runs);
+      for (const result of results.flat()) {
+        assert.deepEqual(result, { status: 0, output: '' }, label);
+      }
+      const running = listSessionSubagents(stateDirectory, startPayload.session_id);
+      assert.deepEqual(running.map((entry) => entry.id).sort(), [...expectedIds].sort(), label);
+      const expectedTokens = buildMetadataArguments(testPaneId, buildSidebarLine(running.length), 0).slice(7);
+      const { calls, shownTokens } = readDisplay();
+      const collisions = findSequenceCollisions(calls);
+      const isShownCorrect = JSON.stringify(shownTokens) === JSON.stringify(expectedTokens);
+      // 撞號的統計印成 TAP diagnostic（POC 連跑時收集）；先印再 assert，失敗的那一次也看得到
+      for (const collision of collisions) {
+        context.diagnostic(`seq collision: ${label}: ${collision.count} reports share seq ${collision.sequence}${collision.isNewest ? ' (the newest seq of the phase)' : ''}, shown ${isShownCorrect ? 'correct' : 'WRONG'}`);
+      }
+      assert.deepEqual(shownTokens, expectedTokens, label);
+      const newestSequence = calls.reduce((best, call) => (BigInt(call[6]) > best ? BigInt(call[6]) : best), -1n);
+      for (const call of calls.filter((candidate) => BigInt(candidate[6]) === newestSequence)) {
+        assert.deepEqual(call.slice(7), expectedTokens, `${label}: every report with the newest seq`);
+      }
+    };
+    for (let round = 0; round < 3; round += 1) {
+      const ids = Array.from({ length: parallelCount }, (unused, index) => `r${round}a${index}`);
+      await checkPhase(`round ${round}: ${parallelCount} starts at once`, ids.map((id) => runScriptAsync(environment, start(id))), ids);
+      await checkPhase(`round ${round}: ${parallelCount} stops at once`, ids.map((id) => runScriptAsync(environment, stop(id))), []);
+      const chainIds = Array.from({ length: parallelCount }, (unused, index) => `r${round}c${index}`);
+      const chains = chainIds.map(async (id) => [await runScriptAsync(environment, start(id)), await runScriptAsync(environment, stop(id))]);
+      await checkPhase(`round ${round}: ${parallelCount} start-then-stop chains`, chains, []);
+      // 一半 start、一半 stop 交錯：留下的是剛 start 的那一半
+      const keptIds = ids.slice(0, parallelCount / 2);
+      const mixedRuns = [...keptIds.map((id) => runScriptAsync(environment, start(id))), ...chainIds.slice(0, parallelCount / 2).map((id) => runScriptAsync(environment, stop(id)))];
+      await checkPhase(`round ${round}: starts mixed with stops`, mixedRuns, keptIds);
+      await checkPhase(`round ${round}: cleanup`, keptIds.map((id) => runScriptAsync(environment, stop(id))), []);
+    }
+    assert.deepEqual(readdirSync(stateDirectory).filter((name) => /\.(tmp|lock)$/.test(name)), []);
+  });
+});
+
+// 用 runHook 的注入點，把另一個 hook 整個插進這個 hook 的某一步之間，重現平行 hook 的交錯；假 herdr 跟真的一樣忽略 seq 不大於上次的回報
+describe('without a lock, any interleaving of hooks ends with the newest seq showing every change', () => {
+  const sessionId = startPayload.session_id;
+
+  function createInterleavingCase() {
+    const runtimeDirectory = createTemporaryDirectory();
+    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
+    const environment = { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory };
+    let lastAcceptedSequence = -1n;
+    let shownTokens = null;
+    let clockMs = 1_000_000;
+    const reports = [];
+    const acceptReport = (argumentList) => {
+      reports.push(argumentList);
+      const sequence = BigInt(argumentList[6]);
+      if (sequence > lastAcceptedSequence) {
+        lastAcceptedSequence = sequence;
+        shownTokens = argumentList.slice(7);
+      }
+    };
+    // pauses：[時機, 要插進來的 hook]；時機 'seq' 是取 seq 的當下（改完檔、readdir 之前），'report' 是送 herdr 的當下（readdir 之後）。
+    // monotonicOverrideNs：讀時鐘時拿到指定的值，用來重現撞號
+    const run = (payloadText, pauses = {}, monotonicOverrideNs = null) => {
+      return runHook(payloadText, environment, {
+        now: () => {
+          clockMs += 1;
+          return clockMs;
+        },
+        isExecutable: () => true,
+        queryPaneAgentSession: () => null,
+        countClaudeAncestors: () => 1,
+        readFileTail: () => ({ isMissing: true }),
+        deadlineMs: Number.POSITIVE_INFINITY,
+        // 先讀時鐘再插入：插進來的 hook 取到的 seq 一定比這個 hook 大
+        monotonicNs: () => {
+          const valueNs = monotonicOverrideNs ?? process.hrtime.bigint();
+          pauses.seq?.(valueNs);
+          return valueNs;
+        },
+        runHerdr: (binaryPath, argumentList) => {
+          pauses.report?.();
+          acceptReport(argumentList);
+        },
+      });
+    };
+    const expectedTokens = () => buildMetadataArguments(testPaneId, buildSidebarLine(listSessionSubagents(stateDirectory, sessionId).length), 0).slice(7);
+    const ownFileExists = (agentId) => existsSync(join(stateDirectory, subagentFileName(sessionId, agentId)));
+    return { run, shown: () => shownTokens, reports, expectedTokens, ownFileExists, stateDirectory };
+  }
+
+  const start = (agentId) => payloadWith({ agent_id: agentId, agent_type: `type-${agentId}` });
+  const stop = (agentId) => payloadWith({ hook_event_name: 'SubagentStop', agent_id: agentId, agent_type: `type-${agentId}` });
+
+  test('the seq is taken after the own file is written and before the folder is read', () => {
+    const interleaving = createInterleavingCase();
+    let isOwnFileWrittenAtSequence = null;
+    interleaving.run(start('first'), {
+      seq: () => {
+        isOwnFileWrittenAtSequence = interleaving.ownFileExists('first');
+        // 取 seq 之後才寫進來的檔：readdir 在取 seq 之後的話，這次回報一定看得到
+        writeFileSync(join(interleaving.stateDirectory, subagentFileName(sessionId, 'late')), JSON.stringify({ sessionId, id: 'late', agentType: 'late', startedAtMs: 1 }));
+      },
+    });
+    assert.equal(isOwnFileWrittenAtSequence, true);
+    assert.deepEqual(interleaving.shown(), runningTokens(2));
+  });
+
+  test('the seq is taken after the own file is removed', () => {
+    const interleaving = createInterleavingCase();
+    interleaving.run(start('first'));
+    let isOwnFileGoneAtSequence = null;
+    interleaving.run(stop('first'), {
+      seq: () => {
+        isOwnFileGoneAtSequence = !interleaving.ownFileExists('first');
+      },
+    });
+    assert.equal(isOwnFileGoneAtSequence, true);
+  });
+
+  for (const [firstLabel, firstPayload] of [['start', start('a')], ['stop', stop('a')]]) {
+    for (const [secondLabel, secondPayload] of [['start', start('b')], ['stop', stop('b')]]) {
+      for (const pause of ['seq', 'report']) {
+        test(`a ${secondLabel} running entirely inside a ${firstLabel} at its ${pause} step`, () => {
+          const interleaving = createInterleavingCase();
+          // stop 要有東西可停：兩個 sub 都先跑起來
+          interleaving.run(start('a'));
+          interleaving.run(start('b'));
+          interleaving.run(firstPayload, { [pause]: () => interleaving.run(secondPayload) });
+          assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
+        });
+      }
+    }
+  }
+
+  // 撞號：另一個 hook 在這個 hook 讀時鐘的同一個 ns 取號，拿到一樣的 seq。同一個 ns 代表另一個 hook 取號時，這個 hook 的改動已經完成、readdir 還沒開始，
+  // 所以把它整個插在取 seq 的當下（插在 report 的當下就不是同一個 ns 了：readdir 至少要幾 µs）。插進來的先送到，herdr 收它、忽略這個 hook 的；
+  // 兩筆都看得到兩邊的改動，所以不管收哪一筆都正確
+  for (const [firstLabel, firstPayload] of [['start', start('a')], ['stop', stop('a')]]) {
+    for (const [secondLabel, secondPayload] of [['start', start('b')], ['stop', stop('b')], ['start of a third sub agent', start('c')]]) {
+      test(`a ${secondLabel} that gets the same seq inside a ${firstLabel}: either report shows every change`, () => {
+        const interleaving = createInterleavingCase();
+        interleaving.run(start('a'));
+        interleaving.run(start('b'));
+        const reportCountBefore = interleaving.reports.length;
+        interleaving.run(firstPayload, { seq: (valueNs) => interleaving.run(secondPayload, {}, valueNs) });
+        const collided = interleaving.reports.slice(reportCountBefore);
+        assert.equal(collided.length, 2);
+        assert.equal(collided[0][6], collided[1][6], 'both reports carry the same seq');
+        assert.deepEqual(collided[0].slice(7), interleaving.expectedTokens(), 'the report herdr keeps (first to arrive)');
+        assert.deepEqual(collided[1].slice(7), interleaving.expectedTokens(), 'the report herdr ignores');
+        assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
+      });
+    }
+  }
+
+  // 隨機產生多層巢狀的交錯（每個 hook 在取 seq 或回報時，可能先讓另一個 hook 整個跑完）；固定種子，失敗可重現
+  test('random nested interleavings of starts and stops of 6 sub agents never lose a change', () => {
+    let seed = 20261011;
+    const random = () => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed / 2_147_483_648;
+    };
+    for (let trial = 0; trial < 300; trial += 1) {
+      const interleaving = createInterleavingCase();
+      const pending = [];
+      for (let index = 0; index < 6; index += 1) {
+        pending.push(random() < 0.7 ? start(`s${index}`) : stop(`s${index}`));
+        if (random() < 0.5) {
+          pending.push(stop(`s${index}`));
+        }
+      }
+      const runNext = () => {
+        const payloadText = pending.shift();
+        if (payloadText === undefined) {
+          return;
+        }
+        const pauses = {};
+        if (random() < 0.5) {
+          pauses[random() < 0.5 ? 'seq' : 'report'] = runNext;
+        }
+        interleaving.run(payloadText, pauses);
+      };
+      while (pending.length > 0) {
+        runNext();
+      }
+      // 一次都沒回報（例如全是沒看過 start 的 stop）時側邊欄維持空的，檔案也要是空的
+      assert.deepEqual(interleaving.shown() ?? allTokensCleared, interleaving.expectedTokens(), `trial ${trial}`);
+    }
   });
 });
 
@@ -751,14 +969,13 @@ describe('the ancestor scan decides; herdr\'s session is asked only when claude 
     });
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1);
     assert.equal(harness.herdrCalls.length, 1);
     assert.deepEqual(paneQueries, [], 'one claude ancestor is enough; herdr is not asked');
     const stateDirectory = join(harness.runtimeDirectory, 'subagent-watch');
     const paneMapping = JSON.parse(readFileSync(join(stateDirectory, `pane-${testPaneId}.json`), 'utf8'));
     assert.equal(paneMapping.sessionId, startPayload.session_id);
-    const sessionState = JSON.parse(readFileSync(join(stateDirectory, `session-${startPayload.session_id}.json`), 'utf8'));
-    assert.deepEqual(sessionState.subagents.map((entry) => entry.id), [startPayload.agent_id]);
+    assert.deepEqual(listSessionSubagents(stateDirectory, startPayload.session_id).map((entry) => entry.id), [startPayload.agent_id]);
   });
 
   test('without a session from herdr the ancestor scan decides', () => {
@@ -812,7 +1029,8 @@ describe('invisible characters in agent_type', () => {
     assert.equal(sanitizeText('代理 Explore'), '代理 Explore');
   });
 
-  test('the review PoC agent_type reaches herdr without any Cc or Cf character', () => {
+  // 側邊欄只顯示數量，agent_type 完全不會送給 herdr
+  test('the review PoC agent_type never reaches herdr: only the count is reported', () => {
     const runtimeDirectory = createTemporaryDirectory();
     const herdrCalls = [];
     const result = runHook(
@@ -830,10 +1048,9 @@ describe('invisible characters in agent_type', () => {
       },
     );
     assert.equal(result.action, 'reported');
-    const tokens = herdrCalls[0].filter((argument) => argument.startsWith('sub1='));
-    assert.deepEqual(tokens, ['sub1=└─ gp]52;c;QQ==2Jevil ●']);
+    assert.deepEqual(herdrCalls[0].slice(7), runningTokens(1));
     for (const argument of herdrCalls[0]) {
-      assert.doesNotMatch(argument, /[\p{Cc}\p{Cf}]/u);
+      assert.doesNotMatch(argument, /[\p{Cc}\p{Cf}]|gp|evil/u);
     }
   });
 });
@@ -901,208 +1118,5 @@ describe('state folder in XDG_RUNTIME_DIR', () => {
     assert.equal(readFileSync(victimPath, 'utf8'), 'original\n');
     const leftovers = readdirSync(stateDirectory).filter((name) => /\.(lock|tmp)$|\.break-/.test(name) && !name.endsWith(`.${process.pid}.tmp`));
     assert.deepEqual(leftovers, []);
-  });
-});
-
-describe('session lock', () => {
-  function createLockCase(overrides = {}) {
-    const runtimeDirectory = createTemporaryDirectory();
-    const stateDirectory = join(runtimeDirectory, 'subagent-watch');
-    mkdirSync(stateDirectory, { mode: 0o700 });
-    const lockPath = join(stateDirectory, `session-${startPayload.session_id}.json.lock`);
-    const herdrCalls = [];
-    const dependencies = {
-      now: () => Date.now(),
-      isExecutable: () => true,
-      queryPaneAgentSession: () => null,
-      countClaudeAncestors: () => 1,
-      runHerdr: (binaryPath, argumentList) => {
-        herdrCalls.push(argumentList);
-      },
-      deadlineMs: Date.now() + 400,
-      ...overrides,
-    };
-    const environment = { HERDR_PANE_ID: testPaneId, HERDR_BIN_PATH: '/fake/herdr', XDG_RUNTIME_DIR: runtimeDirectory };
-    return { stateDirectory, lockPath, herdrCalls, dependencies, environment };
-  }
-
-  function makeOld(filePath, ageMs) {
-    const old = new Date(Date.now() - ageMs);
-    utimesSync(filePath, old, old);
-  }
-
-  function deadProcessId() {
-    return spawnSync(process.execPath, ['-e', '']).pid;
-  }
-
-  const ownStartTime = readProcessInfo(process.pid).startTime;
-
-  test('the lock holds the pid and start time of its holder while the state is updated', () => {
-    let lockOwner = null;
-    const lockCase = createLockCase({
-      runHerdr: () => {
-        lockOwner = JSON.parse(readFileSync(lockCase.lockPath, 'utf8'));
-      },
-    });
-    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
-    assert.equal(lockOwner.pid, process.pid);
-    assert.equal(lockOwner.startTime, ownStartTime);
-    assert.equal(typeof lockOwner.createdAtMs, 'number');
-    assert.equal(existsSync(lockCase.lockPath), false);
-  });
-
-  test('a lock whose holder has exited is taken over right away, even when it is brand new', () => {
-    const lockCase = createLockCase();
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
-    const result = runHook(startPayloadText, lockCase.environment, lockCase.dependencies);
-    assert.equal(result.action, 'reported');
-    assert.equal(existsSync(lockCase.lockPath), false);
-  });
-
-  test('a lock held by a live process is never removed: the hook gives up within its budget', () => {
-    const lockCase = createLockCase({ deadlineMs: Date.now() + 300 });
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() }));
-    makeOld(lockCase.lockPath, 5000);
-    const before = statSync(lockCase.lockPath);
-    const startedAtMs = Date.now();
-    const result = runHook(startPayloadText, lockCase.environment, lockCase.dependencies);
-    assert.deepEqual(result, { action: 'skipped', reason: 'lock-timeout' });
-    assert.ok(Date.now() - startedAtMs < 400, `took ${Date.now() - startedAtMs}ms`);
-    assert.equal(statSync(lockCase.lockPath).ino, before.ino);
-    assert.equal(lockCase.herdrCalls.length, 0);
-    rmSync(lockCase.lockPath);
-  });
-
-  test('a reused pid (same pid, different start time) counts as gone', () => {
-    const lockCase = createLockCase();
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: process.pid, startTime: `${ownStartTime}9`, createdAtMs: Date.now() }));
-    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
-  });
-
-  test('an empty lock from the previous version is stale only after 2 seconds', () => {
-    const fresh = createLockCase({ deadlineMs: Date.now() + 250 });
-    writeFileSync(fresh.lockPath, '');
-    assert.equal(runHook(startPayloadText, fresh.environment, fresh.dependencies).reason, 'lock-timeout');
-    assert.equal(existsSync(fresh.lockPath), true);
-    rmSync(fresh.lockPath);
-
-    const old = createLockCase();
-    writeFileSync(old.lockPath, '');
-    makeOld(old.lockPath, 3000);
-    assert.equal(runHook(startPayloadText, old.environment, old.dependencies).action, 'reported');
-  });
-
-  test('a .break file left by a killed process blocks takeover only until it is 2 seconds old', async () => {
-    const lockCase = createLockCase({ deadlineMs: Date.now() + 250 });
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
-    const breakPath = `${lockCase.lockPath}.break-${statSync(lockCase.lockPath).ino}`;
-    linkSync(lockCase.lockPath, breakPath);
-    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).reason, 'lock-timeout');
-    await new Promise((resolvePromise) => {
-      setTimeout(resolvePromise, 2100);
-    });
-    const result = runHook(startPayloadText, lockCase.environment, { ...lockCase.dependencies, deadlineMs: Date.now() + 400 });
-    assert.equal(result.action, 'reported');
-    assert.equal(existsSync(breakPath), false);
-    assert.equal(existsSync(lockCase.lockPath), false);
-  });
-
-  // ext4 會把剛釋放的 inode 馬上給下一個新檔，tmpfs 不會：刪掉再建時 inode 同不同由檔案系統決定，兩種都要守住
-  test('review race: a lock judged stale but replaced by a fresh one before the takeover is left alone', () => {
-    const lockCase = createLockCase();
-    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
-    writeFileSync(lockCase.lockPath, staleContent);
-    const staleInode = statSync(lockCase.lockPath).ino;
-    // 另一個 process 在這段時間接管了失效的 lock 並建好自己的
-    rmSync(lockCase.lockPath);
-    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
-    writeFileSync(lockCase.lockPath, freshContent);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
-    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
-    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
-    rmSync(lockCase.lockPath);
-  });
-
-  // 刪掉再建不保證拿到同一個 inode；就地覆寫內容才能在任何檔案系統上穩定做出「inode 相同、內容不同」的新 lock
-  test('review race: a fresh lock that reuses the stale lock\'s inode is left alone', () => {
-    const lockCase = createLockCase();
-    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
-    writeFileSync(lockCase.lockPath, staleContent);
-    const staleInode = statSync(lockCase.lockPath).ino;
-    const freshContent = JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() });
-    writeFileSync(lockCase.lockPath, freshContent);
-    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false);
-    assert.equal(existsSync(lockCase.lockPath), true, 'the fresh lock on the reused inode must survive');
-    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), freshContent);
-    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
-    rmSync(lockCase.lockPath);
-  });
-
-  test('only one of two takeovers of the same stale lock succeeds', () => {
-    const lockCase = createLockCase();
-    const staleContent = JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() });
-    writeFileSync(lockCase.lockPath, staleContent);
-    const staleInode = statSync(lockCase.lockPath).ino;
-    const breakPath = `${lockCase.lockPath}.break-${staleInode}`;
-    linkSync(lockCase.lockPath, breakPath);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), false, 'someone else holds the .break name');
-    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
-    rmSync(breakPath);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, staleContent), true);
-    assert.equal(existsSync(lockCase.lockPath), false);
-  });
-
-  test('a takeover without the content it judged stale removes nothing', () => {
-    const lockCase = createLockCase();
-    writeFileSync(lockCase.lockPath, JSON.stringify({ pid: deadProcessId(), startTime: '1', createdAtMs: Date.now() }));
-    const staleInode = statSync(lockCase.lockPath).ino;
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode), false);
-    assert.equal(breakStaleLock(lockCase.lockPath, staleInode, null), false);
-    assert.equal(statSync(lockCase.lockPath).ino, staleInode);
-    assert.deepEqual(readdirSync(lockCase.stateDirectory).filter((name) => name.includes('.break-')), []);
-    rmSync(lockCase.lockPath);
-  });
-
-  test('releasing never deletes another lock that reuses this run\'s inode', () => {
-    const otherContent = JSON.stringify({ pid: process.pid, startTime: `${ownStartTime}9`, createdAtMs: Date.now() });
-    let ownInode = null;
-    const lockCase = createLockCase({
-      runHerdr: () => {
-        ownInode = statSync(lockCase.lockPath).ino;
-        // 等同「這次的 lock 被當成失效接管、別人新建的 lock 拿到同一個 inode」
-        writeFileSync(lockCase.lockPath, otherContent);
-      },
-    });
-    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
-    assert.equal(existsSync(lockCase.lockPath), true, 'the lock on the reused inode must survive our release');
-    assert.equal(statSync(lockCase.lockPath).ino, ownInode);
-    assert.equal(readFileSync(lockCase.lockPath, 'utf8'), otherContent);
-    rmSync(lockCase.lockPath);
-  });
-
-  test('releasing never deletes a lock that is no longer the one this run created', () => {
-    const lockCase = createLockCase({
-      runHerdr: () => {
-        const replacementPath = `${lockCase.lockPath}.replacement`;
-        writeFileSync(replacementPath, JSON.stringify({ pid: process.pid, startTime: ownStartTime, createdAtMs: Date.now() }));
-        renameSync(replacementPath, lockCase.lockPath);
-      },
-    });
-    assert.equal(runHook(startPayloadText, lockCase.environment, lockCase.dependencies).action, 'reported');
-    assert.equal(existsSync(lockCase.lockPath), true, 'the lock that replaced ours must survive our release');
-    rmSync(lockCase.lockPath);
-  });
-
-  test('lock owners: only positive integer pids are accepted, and a missing process is gone', () => {
-    assert.equal(parseLockOwner(''), null);
-    assert.equal(parseLockOwner(JSON.stringify({ pid: 0 })), null);
-    assert.equal(parseLockOwner(JSON.stringify({ pid: -1 })), null);
-    assert.equal(parseLockOwner(JSON.stringify({ pid: '12' })), null);
-    assert.deepEqual(parseLockOwner(JSON.stringify({ pid: 12, startTime: '34' })), { pid: 12, startTime: '34' });
-    assert.equal(isLockOwnerGone({ pid: deadProcessId(), startTime: null }), true);
-    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: ownStartTime }), false);
-    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: null }), false);
-    assert.equal(isLockOwnerGone({ pid: process.pid, startTime: ownStartTime }, () => ({ state: 'Z', startTime: ownStartTime })), true);
   });
 });

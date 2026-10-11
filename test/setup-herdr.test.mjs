@@ -8,6 +8,7 @@ import { resolveHerdrBinPath } from '../lib/herdr.mjs';
 import {
   analyzeHerdrConfig,
   applyHerdrSetup,
+  buildManualRowsSnippet,
   markerEnd,
   markerStart,
   parseTableHeader,
@@ -61,6 +62,12 @@ claude = [
 ]
 `;
 
+// 舊版 setup 寫的五格 $sub1～$sub5：hook 每次都清掉 sub2～sub5，不改寫也只會顯示一行
+const configuredWithFiveTokens = alreadyConfigured.replace(
+  '  [{ token = "$sub1", bold = true, dim = false }],\n',
+  [1, 2, 3, 4, 5].map((index) => `  [{ token = "$sub${index}", bold = true, dim = false }],\n`).join(''),
+);
+
 const configuredByOlderVersion = alreadyConfigured.replace(
   '[{ token = "$sub1", bold = true, dim = false }]',
   '[{ token = "$sub1", bold = true, dim = false, rules = [{ contains = "✓", bold = false }] }]',
@@ -93,7 +100,7 @@ describe('line helpers', () => {
 });
 
 describe('setup', () => {
-  test('no rows table: appends the key and a full rows table, each inside markers', () => {
+  test('no rows table: appends the key and a full rows table with a single $sub1 row, each inside markers', () => {
     const { text, analysis } = applyHerdrSetup(baseConfig);
     assert.equal(analysis.key.state, 'missing');
     assert.equal(analysis.rows.state, 'missing-table');
@@ -101,9 +108,8 @@ describe('setup', () => {
     assert.equal(countMarkers(text), 2);
     assert.match(text, /\[\[keys\.command\]\]\nkey = "prefix\+\."\ntype = "plugin_action"\ncommand = "subagent\.watch\.open"/);
     assert.match(text, /\[ui\.sidebar\.agents\.rows_by_agent\]\nclaude = \[\n {2}\["state_icon", "machine", "workspace", "tab"\],\n {2}\["agent"\],/);
-    for (let index = 1; index <= 5; index += 1) {
-      assert.ok(text.includes(`[{ token = "$sub${index}", bold = true, dim = false }],`));
-    }
+    assert.match(text, /\n {2}\["agent"\],\n {2}\[\{ token = "\$sub1", bold = true, dim = false \}\],\n\]\n/);
+    assert.doesNotMatch(text, /\$sub[2-9]/);
     assert.doesNotMatch(text, /\bfg\s*=/);
     assert.doesNotMatch(text, /\brules\s*=|✓/);
   });
@@ -141,6 +147,17 @@ describe('setup', () => {
     assert.equal(text, configuredByOlderVersion);
   });
 
+  test('five $sub rows written by an older version count as configured and are not rewritten', () => {
+    const { text, analysis, operations } = applyHerdrSetup(configuredWithFiveTokens);
+    assert.equal(analysis.rows.state, 'configured');
+    assert.deepEqual(operations, []);
+    assert.equal(text, configuredWithFiveTokens);
+  });
+
+  test('the snippet for your own claude rows is the single $sub1 row', () => {
+    assert.deepEqual(buildManualRowsSnippet().slice(1), ['  [{ token = "$sub1", bold = true, dim = false }],']);
+  });
+
   test('prefix+. bound to something else is reported and not touched', () => {
     const occupied = baseConfig.replace('key = "prefix+y"', 'key = "prefix+."');
     const { text, analysis } = applyHerdrSetup(occupied);
@@ -175,7 +192,7 @@ describe('setup', () => {
 
 describe('remove', () => {
   test('setup then remove gives back the original text byte for byte', () => {
-    for (const original of [baseConfig, tableWithoutClaude, ownClaudeRows, alreadyConfigured, '', 'a = 1\r\n[ui]\r\nb = 2\r\n']) {
+    for (const original of [baseConfig, tableWithoutClaude, ownClaudeRows, alreadyConfigured, configuredWithFiveTokens, '', 'a = 1\r\n[ui]\r\nb = 2\r\n']) {
       const installed = applyHerdrSetup(original).text;
       const removed = removeHerdrSetup(installed);
       assert.equal(removed.error, null);
@@ -217,7 +234,7 @@ describe('generated config passes the real `herdr config check`', { skip: !canRu
     return spawnSync(herdrBinPath, ['config', 'check'], { env: environment, encoding: 'utf8' });
   }
 
-  for (const [name, original] of [['no-table', baseConfig], ['table-without-claude', tableWithoutClaude], ['empty', '']]) {
+  for (const [name, original] of [['no-table', baseConfig], ['table-without-claude', tableWithoutClaude], ['empty', ''], ['five-tokens-from-older-version', configuredWithFiveTokens]]) {
     test(name, () => {
       const result = checkConfig(name, applyHerdrSetup(original).text);
       assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);

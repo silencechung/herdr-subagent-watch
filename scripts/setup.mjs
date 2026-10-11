@@ -301,7 +301,7 @@ function describeSetupAnalysis(analysis, section) {
   } else if (rows.state === 'configured') {
     section.lines.push(`sidebar rows: claude rows already show $sub1 (line ${rows.lineNumber})`);
   } else {
-    section.warnings.push(`sidebar rows: ${rows.reason} (line ${rows.lineNumber}); left them alone. Add the sub agent rows yourself:`);
+    section.warnings.push(`sidebar rows: ${rows.reason} (line ${rows.lineNumber}); left them alone. Add the sub agent row yourself:`);
     section.warnings.push(...buildManualRowsSnippet().map((line) => `    ${line}`));
   }
   const isAddingRows = rows.state === 'missing-table' || rows.state === 'missing-claude';

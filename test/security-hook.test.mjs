@@ -126,7 +126,7 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     assert.deepEqual(result, { status: 0, stdout: '' });
     const calls = readCalls(tree.callLogPath);
     assert.equal(calls.length, 1);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.ok(calls[0].includes('sub1=● 1 running'));
   });
 
   test('a wrapper named claude is counted once when herdr has no session for the pane', async () => {
@@ -145,7 +145,7 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     assert.deepEqual(result, { status: 0, stdout: '' });
     const calls = readCalls(tree.callLogPath);
     assert.equal(calls.length, 1);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.ok(calls[0].includes('sub1=● 1 running'));
     assert.ok(fs.existsSync(path.join(tree.runtimeDirectory, 'subagent-watch', `pane-${paneId}.json`)));
   });
 
@@ -172,13 +172,17 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
   });
 });
 
-describe('stale lock race (review scenario: scratchpad/code-review/stale-lock-race.mjs)', () => {
-  async function runTrial(caseDirectory, trial, parallelCount, writeStaleLock) {
+// 舊版用 session-<id>.json.lock 串起讀改寫，被砍掉的 process 會留下 lock（review 情境：scratchpad/code-review/stale-lock-race.mjs）。
+// 新版不用 lock：升級後留下的 lock 不管是哪一種，8 個 hook 同時觸發也一個都不能漏，lock 也不去動它
+describe('lock files left by the previous version do not matter', () => {
+  async function runTrial(caseDirectory, trial, parallelCount, writeLeftoverLock) {
     const runtimeDirectory = path.join(caseDirectory, `runtime-${trial}`);
     const stateDirectory = path.join(runtimeDirectory, 'subagent-watch');
     fs.mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
     const sessionId = 'race-session';
-    writeStaleLock(path.join(stateDirectory, `session-${sessionId}.json.lock`));
+    const lockPath = path.join(stateDirectory, `session-${sessionId}.json.lock`);
+    writeLeftoverLock(lockPath);
+    const lockContent = fs.readFileSync(lockPath, 'utf8');
     const environment = { PATH: process.env.PATH, XDG_RUNTIME_DIR: runtimeDirectory, HERDR_PANE_ID: paneId, HERDR_BIN_PATH: path.join(caseDirectory, 'herdr') };
     const outputs = await Promise.all(Array.from({ length: parallelCount }, (unused, index) => new Promise((resolvePromise) => {
       const child = spawn(process.execPath, [hookScriptPath], { env: { ...environment, FAKE_PANE_SESSION: sessionId }, stdio: ['pipe', 'pipe', 'ignore'] });
@@ -194,9 +198,11 @@ describe('stale lock race (review scenario: scratchpad/code-review/stale-lock-ra
     for (const output of outputs) {
       assert.deepEqual(output, { status: 0, output: '' });
     }
-    const state = JSON.parse(fs.readFileSync(path.join(stateDirectory, `session-${sessionId}.json`), 'utf8'));
-    const leftovers = fs.readdirSync(stateDirectory).filter((name) => /\.lock$|\.tmp$|\.break-/.test(name));
-    return { count: state.subagents.length, leftovers };
+    const names = fs.readdirSync(stateDirectory);
+    const count = names.filter((name) => name.startsWith(`sub-${sessionId}-`) && name.endsWith('.json')).length;
+    const leftovers = names.filter((name) => /\.tmp$|\.break-/.test(name));
+    assert.equal(fs.readFileSync(lockPath, 'utf8'), lockContent);
+    return { count, leftovers };
   }
 
   function writeOldEmptyLock(lockPath) {
@@ -210,13 +216,22 @@ describe('stale lock race (review scenario: scratchpad/code-review/stale-lock-ra
     fs.writeFileSync(lockPath, JSON.stringify({ pid: deadProcessId, startTime: '1', createdAtMs: Date.now() }));
   }
 
-  for (const [name, writeStaleLock] of [['an empty lock left by the previous version', writeOldEmptyLock], ['a lock whose holder died', writeDeadOwnerLock]]) {
-    test(`8 hooks racing for ${name} lose no update`, { timeout: 60_000 }, async () => {
+  // 活著的持有者（自己）：舊版會一直等到預算用完、整批放棄
+  function writeLiveOwnerLock(lockPath) {
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startTime: '1', createdAtMs: Date.now() }));
+  }
+
+  for (const [name, writeLeftoverLock] of [
+    ['an empty lock left by an older version', writeOldEmptyLock],
+    ['a lock whose holder died', writeDeadOwnerLock],
+    ['a lock that names a live process', writeLiveOwnerLock],
+  ]) {
+    test(`8 hooks started at once next to ${name} lose no update`, { timeout: 60_000 }, async () => {
       const caseDirectory = createCaseDirectory();
       writeFakeHerdr(caseDirectory);
       const counts = [];
       for (let trial = 0; trial < 8; trial += 1) {
-        const { count, leftovers } = await runTrial(caseDirectory, trial, 8, writeStaleLock);
+        const { count, leftovers } = await runTrial(caseDirectory, trial, 8, writeLeftoverLock);
         counts.push(count);
         assert.deepEqual(leftovers, []);
       }

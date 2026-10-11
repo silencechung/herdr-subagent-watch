@@ -14,7 +14,7 @@
    - **用舊版 setup 過**（只有 `SubagentStart`／`SubagentStop`）：再跑一次 setup，會補上 `SessionStart`、`Stop` 與 `StopFailure`，原本的兩個不動。每個 event 各自檢查，缺哪個補哪個，不會重複。補上之前 popup 照舊版的方式找 session，側邊欄的 sub 也只有收到 `SubagentStop` 才拿掉。已經在跑的 Claude Code session 要等它下一次 `SessionStart`（重開、`/resume`、`/clear` 或 compaction）才會寫 session 對照。
 2. herdr：`$HERDR_CONFIG_PATH`，沒設就是 `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml`。加的內容都包在 `# >>> subagent.watch` ／ `# <<< subagent.watch` 之間。
    - 快捷鍵：沒有任何東西用 `prefix+.` 才加 `[[keys.command]]`；已被別的動作佔用就跳過，log 裡附上可以改成別的鍵的片段。
-   - 側邊欄：沒有 `[ui.sidebar.agents.rows_by_agent]` 就整段加上；有這個表但沒有 `claude =` 就插在表頭下一行；已經有自己的 `claude =` 而且沒有 `$sub1` 就不動，log 裡附上要自己貼進去的五行。
+   - 側邊欄：沒有 `[ui.sidebar.agents.rows_by_agent]` 就整段加上；有這個表但沒有 `claude =` 就插在表頭下一行；已經有自己的 `claude =` 而且沒有 `$sub1` 就不動，log 裡附上要自己貼進去的那一行。claude rows 已經有 `$sub1` 的（包括舊版 setup 寫的 `$sub1`…`$sub5` 五行）當成設定好，不改寫（見 [setup 會加什麼](sidebar.zh-TW.md#setup-會加什麼)）。
    - 新內容先寫成設定檔旁邊的暫存檔，跑 `herdr config check`：多出新的問題就刪掉暫存檔並回報錯誤（原檔完全沒動過，不需要還原）；通過才把暫存檔 `rename` 過去，再 `herdr server reload-config`。
 
 - 兩個檔案改動前都備份成同資料夾的 `<檔名>.subagent-watch.bak`，**只備份第一次**：`.bak` 已經存在就不覆寫，保留最早的原始檔（想重新備份就自己刪掉舊的 `.bak`）。
@@ -29,7 +29,7 @@
 - remove 只拿掉 `settings.json` 裡本 plugin 的 hook（認法跟 setup 一樣；event 陣列空了就整個 key 拿掉）和 `config.toml` 裡 marker 之間的內容；備份與 `herdr config check` 的做法跟 setup 一樣，最後 `herdr server reload-config`。
 - 不在 marker 裡、手動加的設定不會被刪，log 會列出行號。
 - 你其他的 hook 與兩個檔案其餘的內容都不動。
-- 側邊欄已經顯示的樹狀行會留到那個 pane 下次回報或 herdr 重開；要馬上清掉見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md#怎麼移除) 的「怎麼移除」。
+- 側邊欄已經顯示的那一行會留到那個 pane 下次回報或 herdr 重開；要馬上清掉見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md#怎麼移除) 的「怎麼移除」。
 
 ## popup viewer 細節
 
@@ -80,20 +80,17 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 
 ## 側邊欄
 
-herdr 側邊欄 claude 那一列底下，用最多 5 行顯示這個 session **還在跑**的 sub agent：
+herdr 側邊欄 claude 那一列底下，用一行顯示這個 session **還在跑**的 sub agent 有幾個：
 
 ```
 claude
-├─ Explore ●
-├─ general-purpose ●
-└─ Plan ●
+● 3 running
 ```
 
-- 只列跑中的（`●`），不帶編號。sub 一結束（`SubagentStop`）那一行就拿掉，其餘的重畫。
-- 側邊欄不留歷程，sub 一結束那一行就消失；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，在它最後一次寫入 2 分鐘後的下一次 hook 事件拿掉（例如主 session 下一次回合結束的 `Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`），這只是安全網：沒有結束訊號的 sub（或 resume 後新一輪還沒寫紀錄的）不管多久沒寫入都留著。
-- pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的樹。
-- 跑中的超過 5 個時第 5 行改成 `└─ +N more`。
-- 沒有任何跑中的 sub 時，側邊欄只剩 claude 那一列。
+- 只顯示數量，不列名稱，也沒有上限。每次 `SubagentStart` 加一、`SubagentStop` 減一。
+- 側邊欄不留歷程，sub 一結束就不算進數量；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，在它最後一次寫入 2 分鐘後的下一次 hook 事件拿掉（例如主 session 下一次回合結束的 `Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`），這只是安全網：沒有結束訊號的 sub（或 resume 後新一輪還沒寫紀錄的）不管多久沒寫入都留著。
+- pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的數量。
+- 沒有任何跑中的 sub 時，那一行消失，側邊欄只剩 claude 那一列。
 - 結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。
 
 細節見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md)。
@@ -144,9 +141,9 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 - 結束訊號比最後一筆 assistant 活動早時不算數：sub 被 resume 後會回到 `●`。
 - 前景 sub：樣本只有一個（`"requestShape":"foreground"`），用 `SubagentHandback` 結束（規則 1）。規則 2（`end_turn`）對前景 sub 照樣適用；前景 sub 會不會中途出現 `end_turn` **未驗證**。
 
-### 側邊欄樹狀行
+### 側邊欄數量
 
-Claude Code 觸發 `SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure` hook（回合因 API 錯誤結束時改觸發 `StopFailure`，不觸發 `Stop`）；`hooks/sidebar-hook.mjs`（經 `bin/run.sh` 執行）更新狀態檔，再呼叫 `herdr pane report-metadata` 把樹狀行寫進 pane token `sub1`…`sub5`，由 setup 加的 `claude` rows 顯示。上面第 2 步用的 pane map 也是這個 hook 寫的（`Stop` 與 `StopFailure` 以外的每個事件都寫）。每個事件也會拿掉這個 session 裡 transcript 以這一輪的結束訊號結尾（`SubagentHandback`、API 錯誤、中斷、task notification 等）、而且 2 分鐘沒寫入的 sub，因為有些 sub 永遠收不到 `SubagentStop`。這個 hook 套用到每個 Claude Code session，所以永遠 exit 0、不輸出任何東西，並在時間預算內結束。細節見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md)。
+Claude Code 觸發 `SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure` hook（回合因 API 錯誤結束時改觸發 `StopFailure`，不觸發 `Stop`）；`hooks/sidebar-hook.mjs`（經 `bin/run.sh` 執行）寫入或刪除跑中的 sub 各自的小檔（不用 lock：平行的 hook 只動自己那個 sub 的檔，靠 herdr 的 `--seq` 留下最新的回報），再呼叫 `herdr pane report-metadata` 把 `● N running` 寫進 pane token `sub1`，由 setup 加的 `claude` rows 顯示（舊版用到的 `sub2`…`sub5` 每次回報都清掉）。上面第 2 步用的 pane map 也是這個 hook 寫的（`Stop` 與 `StopFailure` 以外的每個事件都寫）。每個事件也會拿掉這個 session 裡 transcript 以這一輪的結束訊號結尾（`SubagentHandback`、API 錯誤、中斷、task notification 等）、而且 2 分鐘沒寫入的 sub，因為有些 sub 永遠收不到 `SubagentStop`。這個 hook 套用到每個 Claude Code session，所以永遠 exit 0、不輸出任何東西，並在時間預算內結束。細節見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md)。
 
 ### Node 怎麼找
 

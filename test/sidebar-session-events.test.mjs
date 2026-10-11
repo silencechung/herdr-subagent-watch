@@ -158,6 +158,18 @@ describe('SessionStart and Stop payloads', () => {
   });
 });
 
+function sortByStart(subagents) {
+  return [...subagents].sort((first, second) => first.startedAtMs - second.startedAtMs || (first.id < second.id ? -1 : 1));
+}
+
+// 跟 hook 寫的一樣：每個跑中的 sub 一個檔
+function writeSubagentFiles(stateDirectory, sessionId, subagents) {
+  mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+  for (const subagent of subagents) {
+    writeFileSync(join(stateDirectory, hook.subagentFileName(sessionId, subagent.id)), JSON.stringify({ sessionId, ...subagent }));
+  }
+}
+
 function createHarness({ clockMs = Date.parse('2026-10-10T10:00:00.000Z'), ...overrides } = {}) {
   const runtimeDirectory = createTemporaryDirectory();
   const herdrCalls = [];
@@ -183,11 +195,11 @@ function createHarness({ clockMs = Date.parse('2026-10-10T10:00:00.000Z'), ...ov
     herdrCalls,
     run: (payload) => hook.runHook(JSON.stringify(payload), environment, dependencies),
     readPaneMap: () => JSON.parse(readFileSync(paneMapPath, 'utf8')),
-    readState: (sessionId) => JSON.parse(readFileSync(join(stateDirectory, `session-${sessionId}.json`), 'utf8')),
-    writeState: (sessionId, subagents) => {
-      mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
-      writeFileSync(join(stateDirectory, `session-${sessionId}.json`), JSON.stringify({ sessionId, lastSequence: 0, subagents }));
-    },
+    // 依 startedAtMs 排序：readdir 的順序不固定
+    readSubagents: (sessionId) => sortByStart(hook.listSessionSubagents(stateDirectory, sessionId)),
+    writeSubagents: (sessionId, subagents) => writeSubagentFiles(stateDirectory, sessionId, subagents),
+    // 用 runHook 的注入點換掉 seq 的時鐘，記下取 seq 的時刻
+    dependencies,
     advanceClock: (durationMs) => {
       currentMs += durationMs;
     },
@@ -205,7 +217,7 @@ describe('SessionStart writes the pane map and redraws the sidebar for the new s
     const files = createSessionFiles();
     const result = harness.run(sessionPayload(startupPayload, files));
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, []);
+    assert.equal(result.line, null);
     assert.deepEqual(harness.herdrCalls[0].slice(7), allTokensCleared);
     assert.deepEqual(harness.readPaneMap(), {
       sessionId: files.sessionId,
@@ -214,31 +226,31 @@ describe('SessionStart writes the pane map and redraws the sidebar for the new s
       updatedAtMs: harness.nowMs(),
       sessionStartSource: 'startup',
     });
-    // 沒有 sub 的 session 不留空的狀態檔：每個 session 都會觸發 SessionStart
-    assert.deepEqual(readdirSync(harness.stateDirectory).filter((name) => name.startsWith('session-')), []);
+    // 沒有 sub 的 session 不留任何狀態檔：每個 session 都會觸發 SessionStart
+    assert.deepEqual(readdirSync(harness.stateDirectory), [`pane-${testPaneId}.json`]);
   });
 
-  test('switching to another session replaces the old tree right away instead of waiting for the next sub agent event', () => {
+  test('switching to another session replaces the old count right away instead of waiting for the next sub agent event', () => {
     const harness = createHarness();
     const oldFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000001');
     const newFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000002');
     harness.run({ ...subagentStartPayload, session_id: oldFiles.sessionId, transcript_path: oldFiles.transcriptPath, agent_id: 'oldrunning1', agent_type: 'Explore' });
-    assert.ok(harness.herdrCalls[0].includes('sub1=└─ Explore ●'));
+    assert.ok(harness.herdrCalls[0].includes('sub1=● 1 running'));
     harness.advanceClock(1000);
     const result = harness.run(sessionPayload(startupPayload, newFiles, { source: 'clear' }));
-    assert.deepEqual(result.lines, []);
+    assert.equal(result.line, null);
     assert.deepEqual(harness.herdrCalls[1].slice(7), allTokensCleared);
     assert.equal(harness.readPaneMap().sessionId, newFiles.sessionId);
     assert.equal(harness.readPaneMap().sessionStartSource, 'clear');
   });
 
-  test('resuming a session that still has running sub agents draws that session\'s tree', () => {
+  test('resuming a session that still has running sub agents shows that session\'s count', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'stillrunning1', agentType: 'Plan', startedAtMs: harness.nowMs() - 1000 }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'stillrunning1', agentType: 'Plan', startedAtMs: harness.nowMs() - 1000 }]);
     files.writeSubagent('stillrunning1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.000Z', 'Bash', { command: 'ls' })]));
     const result = harness.run(sessionPayload(resumePayload, files));
-    assert.deepEqual(result.lines, ['└─ Plan ●']);
+    assert.equal(result.line, '● 1 running');
     assert.equal(harness.readPaneMap().sessionStartSource, 'resume');
   });
 
@@ -287,16 +299,16 @@ describe('Stop only prunes and redraws', () => {
   test('Stop with nothing to prune does not call herdr', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
     files.writeSubagent('running1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.500Z', 'Bash')]));
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
     assert.equal(harness.herdrCalls.length, 0);
   });
 
-  test('review 23:19 (w8:pV): a sub agent stopped by an API error is removed on the next Stop and the tree is redrawn', () => {
+  test('review 23:19 (w8:pV): a sub agent stopped by an API error is removed on the next Stop and the count is redrawn', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
       { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
     ]);
@@ -305,14 +317,14 @@ describe('Stop only prunes and redraws', () => {
     const result = harness.run(sessionPayload(stopPayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
-    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2']);
+    assert.equal(result.line, '● 1 running');
+    assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2']);
   });
 
   test('pruning also runs on SubagentStart and SubagentStop, but never judges the sub agent that is just starting', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'finished1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') },
     ]);
     files.writeSubagent('finished1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback', { message: 'done' })]));
@@ -320,7 +332,7 @@ describe('Stop only prunes and redraws', () => {
     files.writeSubagent('resumed1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback', { message: 'old' })]));
     const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'resumed1', agent_type: 'Explore' });
     assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(result.line, '● 1 running');
     // 下一個事件：resume 後的 sub 還沒寫新紀錄，舊的 handback 早於它的 SubagentStart，不算
     harness.advanceClock(3000);
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
@@ -329,7 +341,7 @@ describe('Stop only prunes and redraws', () => {
   test('without the main transcript nothing is pruned (the sub agent paths cannot be trusted)', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'nofile1', agentType: 'Plan', startedAtMs: harness.nowMs() - 3 * 60 * minuteMs }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'nofile1', agentType: 'Plan', startedAtMs: harness.nowMs() - 3 * 60 * minuteMs }]);
     const missingMain = join(dirname(files.transcriptPath), 'bbbb0000-0000-4000-8000-0000000000bb.jsonl');
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files, { transcript_path: missingMain })), { action: 'unchanged' });
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files, { transcript_path: 'relative/x.jsonl' })), { action: 'unchanged' });
@@ -337,21 +349,20 @@ describe('Stop only prunes and redraws', () => {
 
   test('pruning stops when the time budget runs out and keeps the rest', () => {
     const files = createSessionFiles();
-    const state = { sessionId: files.sessionId, lastSequence: 0, subagents: [
+    const subagents = [
       { id: 'done1', agentType: 'Plan', startedAtMs: 0 },
       { id: 'done2', agentType: 'Plan', startedAtMs: 0 },
-    ] };
+    ];
     for (const agentId of ['done1', 'done2']) {
       files.writeSubagent(agentId, toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
     }
     const event = hook.parseHookPayload(JSON.stringify(sessionPayload(stopPayload, files)));
     let checks = 0;
-    const result = hook.pruneEndedSubagents(state, event, { nowMs: Date.parse('2026-10-10T10:00:00.000Z'), hasTimeLeft: () => {
+    const ended = hook.findEndedSubagents(subagents, event, { nowMs: Date.parse('2026-10-10T10:00:00.000Z'), hasTimeLeft: () => {
       checks += 1;
       return checks === 1;
     } });
-    assert.deepEqual(result.removed, [{ id: 'done1', reason: 'handback' }]);
-    assert.deepEqual(result.state.subagents.map((subagent) => subagent.id), ['done2']);
+    assert.deepEqual(ended, [{ id: 'done1', startedAtMs: 0, reason: 'handback' }]);
   });
 });
 
@@ -384,10 +395,10 @@ describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
     assert.equal(hook.parseHookPayload(JSON.stringify({ ...stopFailurePayload, session_id: '../escape' })), null);
   });
 
-  test('a sub agent stopped by the same API error is removed on StopFailure and the tree is redrawn', () => {
+  test('a sub agent stopped by the same API error is removed on StopFailure and the count is redrawn', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
       { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
     ]);
@@ -396,15 +407,15 @@ describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
     const result = harness.run(sessionPayload(stopFailurePayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(result.line, '● 1 running');
     assert.equal(harness.herdrCalls.length, 1);
-    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2']);
+    assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2']);
   });
 
   test('StopFailure never writes the pane map and calls herdr only when something was removed', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: harness.nowMs() - 1000 }]);
     files.writeSubagent('running1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.500Z', 'Bash')]));
     assert.deepEqual(harness.run(sessionPayload(stopFailurePayload, files)), { action: 'unchanged' });
     assert.equal(existsSync(harness.paneMapPath), false);
@@ -532,7 +543,7 @@ describe('reading only the end of a transcript', () => {
     const files = createSessionFiles();
     const filler = toJsonLines(Array.from({ length: 4000 }, (unused, index) => assistantToolUse(`2026-10-10T09:10:${String(index % 60).padStart(2, '0')}.000Z`, 'Bash', { command: 'x'.repeat(200) })));
     assert.ok(filler.length > 10 * hook.transcriptTailBytes);
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'bigdone1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') },
       { id: 'bigold1', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') },
     ]);
@@ -546,7 +557,7 @@ describe('reading only the end of a transcript', () => {
   test('a task notification in the tail of the main transcript ends a killed sub agent', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'killed1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'killed1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') }]);
     files.writeSubagent('killed1', toJsonLines([assistantToolUse('2026-10-10T09:10:00.000Z', 'Bash')]));
     files.appendMain(notificationLine('killed1', 'killed', '2026-10-10T09:11:00.000Z'));
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)).removed, [{ id: 'killed1', reason: 'killed' }]);
@@ -555,7 +566,7 @@ describe('reading only the end of a transcript', () => {
   test('a transcript that is not there yet is kept for 2 minutes, then removed', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'nofileyet1', agentType: 'Plan', startedAtMs: harness.nowMs() }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'nofileyet1', agentType: 'Plan', startedAtMs: harness.nowMs() }]);
     harness.advanceClock(hook.missingTranscriptGraceMs - 1000);
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
     harness.advanceClock(2000);
@@ -609,7 +620,7 @@ describe('the safety net never removes a sub agent that is still running', () =>
   for (const isFirstStopRecorded of [true, false]) {
     test(`a sub agent resumed 2 seconds after its previous end is kept until its new run ends (first SubagentStop ${isFirstStopRecorded ? 'recorded' : 'missed'})`, () => {
       const { harness, files } = startResumeCase({ isFirstStopRecorded });
-      assert.deepEqual(harness.readState(files.sessionId).subagents, [{ id: agentId, agentType: 'general-purpose', startedAtMs: resumeStartMs }]);
+      assert.deepEqual(harness.readSubagents(files.sessionId), [{ id: agentId, agentType: 'general-purpose', startedAtMs: resumeStartMs }]);
       // 新一輪還沒寫任何紀錄：尾端還是上一輪的 end_turn
       harness.advanceClock(500);
       assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
@@ -617,7 +628,7 @@ describe('the safety net never removes a sub agent that is still running', () =>
       files.writeSubagent(agentId, toJsonLines([...firstRun, resumePrompt]), { meta: foregroundMeta, modifiedMs: harness.nowMs() });
       harness.advanceClock(hook.quietAfterEndSignalMs);
       assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
-      assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), [agentId]);
+      assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), [agentId]);
     });
   }
 
@@ -634,7 +645,7 @@ describe('the safety net never removes a sub agent that is still running', () =>
   test('a sub agent that has written nothing for hours without an end signal is kept', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'sleeping1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-09T08:00:00.000Z') }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'sleeping1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-09T08:00:00.000Z') }]);
     files.writeSubagent('sleeping1', toJsonLines([assistantToolUse('2026-10-09T11:00:00.000Z', 'Bash', { command: 'make' })]));
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
   });
@@ -643,7 +654,7 @@ describe('the safety net never removes a sub agent that is still running', () =>
   test('a task notification counts by its enqueue time, not by when the main session took it off the queue', () => {
     const harness = createHarness();
     const files = createSessionFiles();
-    harness.writeState(files.sessionId, [{ id: 'queued1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:30:00.000Z') }]);
+    harness.writeSubagents(files.sessionId, [{ id: 'queued1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:30:00.000Z') }]);
     const handbackAt = '2026-10-10T09:40:00.000Z';
     files.writeSubagent('queued1', toJsonLines([
       assistantToolUse(handbackAt, 'SubagentHandback', { message: 'done' }),
@@ -657,68 +668,65 @@ describe('the safety net never removes a sub agent that is still running', () =>
   });
 });
 
-// 讀 transcript 判斷 sub 是否結束放在 lock 裡的話，同一個 session 平行觸發的 hook 每個都要多等前面每一個讀完，
-// 排在後面的等不到 lock 就放棄（SubagentStart 放棄了，那個 sub 就永遠不會出現在側邊欄）
-describe('transcripts are read before the session lock is taken', () => {
-  const lockPathOf = (harness, sessionId) => join(harness.stateDirectory, `session-${sessionId}.json.lock`);
-
-  test('every transcript and meta read happens while the lock does not exist; herdr is called while it does', () => {
+// 沒有 lock：判斷 sub 是否結束要讀的 transcript、刪結束的 sub 檔，都要在取 seq 之前做完；取 seq 之後才 readdir 畫樹
+describe('pruning happens before the seq is taken', () => {
+  test('every transcript and meta read happens before the seq is taken, and herdr gets the count read after it', () => {
     const files = createSessionFiles();
-    const reads = [];
-    let lockPath = null;
-    let isLockHeldDuringHerdr = null;
+    const steps = [];
     const harness = createHarness({
       readFileTail: (filePath, maximumBytes) => {
-        reads.push({ name: basename(filePath), isLockHeld: existsSync(lockPath) });
+        steps.push(`read ${basename(filePath)}`);
         return hook.readFileTail(filePath, maximumBytes);
       },
-      // 對照組：lock 內一定看得到 lock 檔，確認上面的檢查不是永遠 false
+      monotonicNs: () => {
+        steps.push('seq');
+        return process.hrtime.bigint();
+      },
       runHerdr: () => {
-        isLockHeldDuringHerdr = existsSync(lockPath);
+        steps.push('herdr');
       },
     });
-    lockPath = lockPathOf(harness, files.sessionId);
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'finished1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') },
       { id: 'running2', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:50:00.000Z') },
     ]);
     files.writeSubagent('finished1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
     files.writeSubagent('running2', toJsonLines([assistantToolUse('2026-10-10T09:59:00.000Z', 'Grep', { pattern: 'x' })]));
     const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'new3', agent_type: 'Explore' });
-    assert.deepEqual(reads.filter((read) => read.isLockHeld), []);
-    assert.equal(isLockHeldDuringHerdr, true);
-    assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
-    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['running2', 'new3']);
-    assert.deepEqual(reads.map((read) => read.name).sort(), [
-      `${files.sessionId}.jsonl`,
-      'agent-finished1.jsonl',
-      'agent-finished1.meta.json',
-      'agent-running2.jsonl',
-      'agent-running2.meta.json',
+    assert.deepEqual(steps.slice(-2), ['seq', 'herdr']);
+    assert.deepEqual(steps.slice(0, -2).sort(), [
+      `read ${files.sessionId}.jsonl`,
+      'read agent-finished1.jsonl',
+      'read agent-finished1.meta.json',
+      'read agent-running2.jsonl',
+      'read agent-running2.meta.json',
     ]);
-    assert.equal(existsSync(lockPath), false);
+    assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
+    assert.equal(result.line, '● 2 running');
+    assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2', 'new3']);
   });
 
-  test('only sub agents still in the state, with the same start, are removed: another hook may have changed it in between', () => {
+  test('only sub agents whose file still has the judged start are removed: another hook may have changed it in between', () => {
     const files = createSessionFiles();
     const judgedStartMs = Date.parse('2026-10-10T09:40:00.000Z');
-    let isStateChangedByOtherHook = false;
+    let isChangedByOtherHook = false;
     const harness = createHarness({
       readFileTail: (filePath, maximumBytes) => {
-        // 這裡已經讀完 lock 外的狀態檔、正在讀 transcript：模擬別的 hook 在這段時間拿到 lock 改了狀態檔
-        if (!isStateChangedByOtherHook) {
-          isStateChangedByOtherHook = true;
-          harness.writeState(files.sessionId, [
-            // 被拿掉後又 SubagentStart（resume）的新一輪：判斷的是上一輪，不能拿掉
+        // 這裡已經列好這個 session 的 sub、正在讀 transcript：模擬別的 hook 在這段時間改了 sub 檔
+        if (!isChangedByOtherHook) {
+          isChangedByOtherHook = true;
+          harness.writeSubagents(files.sessionId, [
+            // 被清掉後又 SubagentStart（resume）的新一輪：判斷的是上一輪，不能刪
             { id: 'resumed1', agentType: 'Plan', startedAtMs: harness.nowMs() },
-            { id: 'finished2', agentType: 'Plan', startedAtMs: judgedStartMs },
             { id: 'added3', agentType: 'Explore', startedAtMs: harness.nowMs() },
           ]);
+          // 收到 SubagentStop 已經刪掉的
+          rmSync(join(harness.stateDirectory, hook.subagentFileName(files.sessionId, 'gone4')));
         }
         return hook.readFileTail(filePath, maximumBytes);
       },
     });
-    harness.writeState(files.sessionId, [
+    harness.writeSubagents(files.sessionId, [
       { id: 'resumed1', agentType: 'Plan', startedAtMs: judgedStartMs },
       { id: 'finished2', agentType: 'Plan', startedAtMs: judgedStartMs },
       { id: 'gone4', agentType: 'Plan', startedAtMs: judgedStartMs },
@@ -729,7 +737,51 @@ describe('transcripts are read before the session lock is taken', () => {
     const result = harness.run(sessionPayload(stopPayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, [{ id: 'finished2', reason: 'handback' }]);
-    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['resumed1', 'added3']);
+    assert.deepEqual(harness.readSubagents(files.sessionId), [
+      { id: 'added3', agentType: 'Explore', startedAtMs: harness.nowMs() },
+      { id: 'resumed1', agentType: 'Plan', startedAtMs: harness.nowMs() },
+    ]);
+    assert.equal(result.line, '● 2 running');
+    assert.deepEqual(readdirSync(harness.stateDirectory).filter((name) => name.endsWith('.tmp')), []);
+  });
+
+  // 拿走到放回之間，別的 hook（例如 resume 的 SubagentStart 自己）readdir 時看不到這個 sub；放回後這次事件一定要用更大的 seq 重畫，側邊欄才會列出它
+  test('putting back a resumed sub agent file is a change: the hook reports even though nothing was removed', () => {
+    const files = createSessionFiles();
+    let isResumed = false;
+    const harness = createHarness({
+      readFileTail: (filePath, maximumBytes) => {
+        if (!isResumed) {
+          isResumed = true;
+          harness.writeSubagents(files.sessionId, [{ id: 'resumed1', agentType: 'Plan', startedAtMs: harness.nowMs() }]);
+        }
+        return hook.readFileTail(filePath, maximumBytes);
+      },
+    });
+    harness.writeSubagents(files.sessionId, [{ id: 'resumed1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') }]);
+    files.writeSubagent('resumed1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
+    const result = harness.run(sessionPayload(stopPayload, files));
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, []);
+    assert.equal(result.line, '● 1 running');
+    assert.equal(harness.herdrCalls.length, 1);
+  });
+
+  test('removing a judged sub agent file: removed when unchanged, put back when resumed, nothing when already gone', () => {
+    const stateDirectory = join(createTemporaryDirectory(), 'subagent-watch');
+    const sessionId = 'aaaa0000-0000-4000-8000-0000000000cc';
+    writeSubagentFiles(stateDirectory, sessionId, [
+      { id: 'ended1', agentType: 'Plan', startedAtMs: 100 },
+      { id: 'resumed2', agentType: 'Explore', startedAtMs: 300 },
+    ]);
+    const filePathOf = (agentId) => join(stateDirectory, hook.subagentFileName(sessionId, agentId));
+    const resumedContent = readFileSync(filePathOf('resumed2'), 'utf8');
+    assert.equal(hook.removeEndedSubagentFile(stateDirectory, sessionId, { id: 'ended1', startedAtMs: 100, reason: 'handback' }), 'removed');
+    assert.equal(existsSync(filePathOf('ended1')), false);
+    assert.equal(hook.removeEndedSubagentFile(stateDirectory, sessionId, { id: 'resumed2', startedAtMs: 200, reason: 'handback' }), 'restored');
+    assert.equal(readFileSync(filePathOf('resumed2'), 'utf8'), resumedContent);
+    assert.equal(hook.removeEndedSubagentFile(stateDirectory, sessionId, { id: 'missing3', startedAtMs: 100, reason: 'handback' }), 'gone');
+    assert.deepEqual(readdirSync(stateDirectory).sort(), [hook.subagentFileName(sessionId, 'resumed2')]);
   });
 
   test('judging stops at its own time budget and the event itself is still recorded', () => {
@@ -741,27 +793,37 @@ describe('transcripts are read before the session lock is taken', () => {
       },
     });
     const startedAtMs = Date.parse('2026-10-10T09:40:00.000Z');
-    harness.writeState(files.sessionId, ['done1', 'done2', 'done3'].map((id) => ({ id, agentType: 'Plan', startedAtMs })));
+    harness.writeSubagents(files.sessionId, ['done1', 'done2', 'done3'].map((id) => ({ id, agentType: 'Plan', startedAtMs })));
     for (const agentId of ['done1', 'done2', 'done3']) {
       files.writeSubagent(agentId, toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback')]));
     }
     const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'new4', agent_type: 'Explore' });
     // 讀 main transcript 用掉一半預算、done1 的 transcript 用掉另一半：done1 判斷完就停，done2、done3 留到下一次事件
     assert.deepEqual(result.removed, [{ id: 'done1', reason: 'handback' }]);
-    assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), ['done2', 'done3', 'new4']);
+    assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['done2', 'done3', 'new4']);
   });
 
-  test('a Stop with nothing to remove does not wait for the lock', () => {
+  test('a Stop with nothing to remove takes no seq, calls nothing and ignores a lock left by the previous version', () => {
     const files = createSessionFiles();
-    const harness = createHarness({ now: () => Date.now(), deadlineMs: Date.now() + 300 });
-    harness.writeState(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: Date.now() - 1000 }]);
+    let sequenceCount = 0;
+    const harness = createHarness({
+      now: () => Date.now(),
+      deadlineMs: Date.now() + 300,
+      monotonicNs: () => {
+        sequenceCount += 1;
+        return process.hrtime.bigint();
+      },
+    });
+    harness.writeSubagents(files.sessionId, [{ id: 'running1', agentType: 'Explore', startedAtMs: Date.now() - 1000 }]);
     files.writeSubagent('running1', toJsonLines([assistantToolUse(new Date().toISOString(), 'Bash')]));
-    // 活著的 process（自己）持有的 lock：要搶的話只會等到預算用完、回報 lock-timeout
-    const lockPath = lockPathOf(harness, files.sessionId);
-    const ownLock = JSON.stringify({ pid: process.pid, startTime: hook.readProcessInfo(process.pid).startTime, createdAtMs: Date.now() });
-    writeFileSync(lockPath, ownLock);
+    const legacyLockPath = join(harness.stateDirectory, `session-${files.sessionId}.json.lock`);
+    const legacyLock = JSON.stringify({ pid: process.pid, startTime: '1', createdAtMs: Date.now() });
+    writeFileSync(legacyLockPath, legacyLock);
+    const startedAtMs = Date.now();
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
-    assert.equal(readFileSync(lockPath, 'utf8'), ownLock);
+    assert.ok(Date.now() - startedAtMs < 250, `took ${Date.now() - startedAtMs}ms`);
+    assert.equal(readFileSync(legacyLockPath, 'utf8'), legacyLock);
+    assert.equal(sequenceCount, 0);
     assert.equal(harness.herdrCalls.length, 0);
   });
 });
@@ -818,8 +880,7 @@ describe('hook script with SessionStart and Stop, as Claude Code runs it', () =>
       files.writeSubagent(agentId, filler);
     }
     files.writeSubagent('bigrun2', filler + apiErrorTailText);
-    mkdirSync(join(scriptCase.runtimeDirectory, 'subagent-watch'), { mode: 0o700 });
-    writeFileSync(join(scriptCase.runtimeDirectory, 'subagent-watch', `session-${files.sessionId}.json`), JSON.stringify({ sessionId: files.sessionId, lastSequence: 0, subagents }));
+    writeSubagentFiles(join(scriptCase.runtimeDirectory, 'subagent-watch'), files.sessionId, subagents);
     const result = runScript(scriptCase.environment, sessionPayload(stopPayload, files));
     assert.equal(result.status, 0);
     assert.equal(result.stdout, '');
@@ -827,10 +888,10 @@ describe('hook script with SessionStart and Stop, as Claude Code runs it', () =>
     const calls = readCalls(scriptCase.callLogPath);
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].filter((argument) => /^sub\d/.test(argument)), [
-      'sub1=├─ worker0 ●',
-      'sub2=├─ worker1 ●',
-      'sub3=├─ worker3 ●',
-      'sub4=└─ worker4 ●',
+      'sub1=● 4 running',
+      'sub2',
+      'sub3',
+      'sub4',
       'sub5',
     ]);
   });
@@ -839,10 +900,9 @@ describe('hook script with SessionStart and Stop, as Claude Code runs it', () =>
     const scriptCase = createScriptCase();
     const files = createSessionFiles();
     const stateDirectory = join(scriptCase.runtimeDirectory, 'subagent-watch');
-    mkdirSync(stateDirectory, { mode: 0o700 });
-    writeFileSync(join(stateDirectory, `session-${files.sessionId}.json`), JSON.stringify({ sessionId: files.sessionId, lastSequence: 0, subagents: [
+    writeSubagentFiles(stateDirectory, files.sessionId, [
       { id: 'aapierror0000001', agentType: 'general-purpose', startedAtMs: Date.parse('2026-10-10T09:28:00.000Z') },
-    ] }));
+    ]);
     files.writeSubagent('aapierror0000001', apiErrorTailText);
     const result = runScript(scriptCase.environment, sessionPayload(stopFailurePayload, files));
     assert.equal(result.status, 0);
