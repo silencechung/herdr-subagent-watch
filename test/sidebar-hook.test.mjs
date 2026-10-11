@@ -213,6 +213,23 @@ describe('buildTreeLines', () => {
     ]);
   });
 
+  // popup 的 tab 有編號，側邊欄刻意沒有：同 type 重複時也只列名稱，不帶任何數字
+  test('repeated agent types stay unnumbered even though popup tabs are numbered', () => {
+    const lines = buildTreeLines([
+      subagent('a', 1, 'general-purpose'),
+      subagent('b', 2, 'general-purpose'),
+      subagent('c', 3, 'general-purpose'),
+    ]);
+    assert.deepEqual(lines, [
+      '├─ general-purpose ●',
+      '├─ general-purpose ●',
+      '└─ general-purpose ●',
+    ]);
+    for (const line of lines) {
+      assert.doesNotMatch(line, /\d|\[/);
+    }
+  });
+
   test('lines never contain numbering or a finished mark', () => {
     const lines = buildTreeLines([subagent('a', 1, 'Plan'), subagent('b', 2, 'Explore')]);
     for (const line of lines) {
