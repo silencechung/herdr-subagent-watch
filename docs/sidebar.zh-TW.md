@@ -53,7 +53,7 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 - `session-<sessionId>.json`：`{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`，`subagents` 只放跑中的。`SubagentStop`（或下面的清除）直接把那筆移除，檔案大小只跟同時在跑的 sub 數量有關，不會越長越大。有變動才寫檔，從沒開過 sub 的 session 不會留下檔案。
   - 舊版留下、`status` 是 `"done"` 的項目，下一次事件讀檔時就丟掉。
   - 同一個 sub 還在清單裡又收到 `SubagentStart`（resume 時上一輪的 `SubagentStop` 沒記到）時只留一筆，啟動時間換成這一次的，所以排到最後面；已經移除後再收到它的 `SubagentStart`（resume）也一樣重新列在最後面。啟動時間是判斷結束訊號屬於哪一輪的依據（見下一節）。
-- `pane-<HERDR_PANE_ID>.json`：給 popup viewer 讀的對照檔：`{"sessionId","transcriptPath","cwd","updatedAtMs"}`，這個 session 的 `SessionStart` 寫的檔案另外帶 `"sessionStartSource"`（那次 `SessionStart` 的 `source`，例 `"startup"`）。**四個欄位固定**；viewer 只把 `sessionStartSource` 當標記用（見 README 的[怎麼找到 pane 對應的 session](../README.zh-TW.md#怎麼找到-pane-對應的-session)）。
+- `pane-<HERDR_PANE_ID>.json`：給 popup viewer 讀的對照檔：`{"sessionId","transcriptPath","cwd","updatedAtMs"}`，這個 session 的 `SessionStart` 寫的檔案另外帶 `"sessionStartSource"`（那次 `SessionStart` 的 `source`，例 `"startup"`）。**四個欄位固定**；viewer 只把 `sessionStartSource` 當標記用（見 internals 的[怎麼找到 pane 對應的 session](internals.zh-TW.md#怎麼找到-pane-對應的-session)）。
   - 同一個 session 的 `SubagentStart`／`SubagentStop` 重寫時留著標記；別的 session 的事件寫的檔案不帶標記，因為不一定收到過那個 session 的 `SessionStart`。
   - `Stop`／`StopFailure` 不寫這個檔案。
 
@@ -81,7 +81,7 @@ hook process 繼承 Claude Code 的環境變數：實測 `HERDR_PANE_ID`（例 `
 - 每個 transcript（含 main transcript）只讀最後 64 KB，切到一半的第一行丟掉。
 - 清除只是 `SubagentStop` 漏掉時的安全網，三個條件都成立才拿掉：
   1. sub transcript 最後一筆有效紀錄（`user`／`assistant`）是結束訊號，種類：
-     - popup viewer 的規則（見 [README](../README.zh-TW.md#資料來源與結束判斷)，同一份 `lib/subagent-state.mjs`）：`SubagentHandback`（後面只能接它自己的 tool_result）、非 background sub 的 `end_turn`。viewer 的「10 分鐘沒寫入」不用在這裡；
+     - popup viewer 的規則（見 [internals](internals.zh-TW.md#資料來源與結束判斷)，同一份 `lib/subagent-state.mjs`）：`SubagentHandback`（後面只能接它自己的 tool_result）、非 background sub 的 `end_turn`。viewer 的「10 分鐘沒寫入」不用在這裡；
      - main transcript 裡 `completed`／`killed`／`failed` 的 `<task-notification>`：只看 `enqueue` 那一行的時間，要不早於最後一筆有效紀錄；最後一筆是新送進來的指令（不是 tool_result 的 `user`，例如 resume 送進來的）時不信。`remove`（出列）的時間不用：出列可能晚於 resume 或 sub 之後的紀錄，本機一個 sub 在 `SubagentHandback` 之後因排隊的訊息繼續跑 Bash，那則通知的出列時間比當時最後一筆紀錄晚；
      - API 錯誤（`isApiErrorMessage: true`）。本機 3 個遇到 API 錯誤的 sub 都停在這一筆，之後沒有任何紀錄；
      - `[Request interrupted by user…]`。本機 3 個這樣結尾的都是被中斷的背景 sub，main transcript 同一刻都記了 `killed`（那則通知可能已經不在最後 64 KB 裡）；
@@ -149,7 +149,7 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 
 ## setup 會加什麼
 
-由 `subagent.watch.setup` action（或 `sh bin/run.sh scripts/setup.mjs`）寫入，規則與衝突處理見 [README](../README.zh-TW.md#安裝) 的「安裝」。
+由 `subagent.watch.setup` action（或 `sh bin/run.sh scripts/setup.mjs`）寫入，規則與衝突處理見 [internals](internals.zh-TW.md#setup-細節) 的「setup 細節」。
 
 `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks` 底下（其他設定不動）：
 

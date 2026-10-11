@@ -5,7 +5,7 @@ min_herdr_version = "0.9.3"
 description = "Popup that follows the sub agents of the Claude Code session in the pane it was opened from"
 platforms = ["linux"]
 
-# 一律經過 bin/run.sh 找 node（順序見 README「Node 怎麼找」），manifest 不寫死任何路徑
+# 一律經過 bin/run.sh 找 node（順序見 docs/internals.zh-TW.md「Node 怎麼找」），manifest 不寫死任何路徑
 [[actions]]
 id = "open"
 title = "Open sub agent viewer"

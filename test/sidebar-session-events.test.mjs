@@ -537,7 +537,7 @@ describe('reading only the end of a transcript', () => {
       { id: 'bigold1', agentType: 'Explore', startedAtMs: Date.parse('2026-10-10T09:00:00.000Z') },
     ]);
     files.writeSubagent('bigdone1', filler + toJsonLines([assistantToolUse('2026-10-10T09:50:00.000Z', 'SubagentHandback')]));
-    // 結束訊號在尾端 64 KB 之前：讀不到，當成還在跑（README 已知限制）
+    // 結束訊號在尾端 64 KB 之前：讀不到，當成還在跑（docs/sidebar.md 已知限制）
     files.writeSubagent('bigold1', toJsonLines([assistantToolUse('2026-10-10T09:05:00.000Z', 'SubagentHandback')]) + filler);
     const result = harness.run(sessionPayload(stopPayload, files));
     assert.deepEqual(result.removed, [{ id: 'bigdone1', reason: 'handback' }]);
