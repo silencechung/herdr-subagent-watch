@@ -123,7 +123,7 @@ claude
 ```
 
 - Only running sub agents (`●`) are listed, without numbers. When a sub agent ends (`SubagentStop`), its line is removed and the rest are redrawn.
-- A sub agent that ended without `SubagentStop` (for example stopped by an API error such as a usage limit) is removed at the next hook event of that session, at the latest when the main session finishes its next turn (`Stop`, or `StopFailure` when that turn itself ends with an API error).
+- A sub agent that ended without `SubagentStop` (for example stopped by an API error such as a usage limit) is removed at the first hook event of that session that comes 2 minutes or more after its last write, for example when the main session finishes its next turn (`Stop`, or `StopFailure` when that turn itself ends with an API error). This is only a safety net: a sub agent without an end signal (or a resumed one whose new run has not written anything yet) is never removed, however long it is silent.
 - When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the tree is redrawn for that session right away.
 - With more than 5 running, the fifth line becomes `└─ +N more`.
 - With nothing running, only the claude row is left.
@@ -193,7 +193,7 @@ So after `/resume` or restarting `claude`, the popup switches to the new session
 
 ### Sidebar tree
 
-Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks (`StopFailure` fires instead of `Stop` when a turn ends with an API error); `hooks/sidebar-hook.mjs` (run through `bin/run.sh`) updates a state file and calls `herdr pane report-metadata` to write the tree lines into pane tokens `sub1`…`sub5`, which the `claude` rows added by setup display. The hook also writes the pane map used in step 2 above (on every event except `Stop` and `StopFailure`). On every event it also removes sub agents of that session whose transcript shows they have ended (a `SubagentHandback`, an API error, an interruption, a task notification, and so on), because some of them never get a `SubagentStop`. The hook applies to every Claude Code session, so it always exits 0, prints nothing and finishes within its time budget. See [`docs/sidebar.md`](docs/sidebar.md) for the details.
+Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks (`StopFailure` fires instead of `Stop` when a turn ends with an API error); `hooks/sidebar-hook.mjs` (run through `bin/run.sh`) updates a state file and calls `herdr pane report-metadata` to write the tree lines into pane tokens `sub1`…`sub5`, which the `claude` rows added by setup display. The hook also writes the pane map used in step 2 above (on every event except `Stop` and `StopFailure`). On every event it also removes sub agents of that session whose transcript ends with an end signal (a `SubagentHandback`, an API error, an interruption, a task notification, and so on) from this run and has not been written for 2 minutes, because some of them never get a `SubagentStop`. The hook applies to every Claude Code session, so it always exits 0, prints nothing and finishes within its time budget. See [`docs/sidebar.md`](docs/sidebar.md) for the details.
 
 ### How Node is found
 

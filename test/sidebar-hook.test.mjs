@@ -146,10 +146,11 @@ describe('applyEvent', () => {
     assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
   });
 
-  test('a repeated start without stop keeps one entry and its original start time', () => {
+  // resume 時上一輪的 stop 沒記到：啟動時間沿用舊的話，上一輪的結束訊號會被當成這一輪的，正在跑的 sub 被清掉
+  test('a repeated start without stop (a resume whose stop was missed) keeps one entry with the new start time', () => {
     let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
     state = applyEvent(state, startEvent, 3000).state;
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 1000, 'general-purpose')]);
+    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
   });
 });
 

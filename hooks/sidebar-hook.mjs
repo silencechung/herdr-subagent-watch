@@ -20,7 +20,7 @@ import {
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isExecutableFile, resolveHerdrBinPath } from '../lib/herdr.mjs';
-import { applyMeta, applyNotification, applyRecord, createSubAgentState, getSubAgentStatus } from '../lib/subagent-state.mjs';
+import { applyMeta, applyRecord, createSubAgentState, getSubAgentStatus } from '../lib/subagent-state.mjs';
 import { parseJsonLine, parseTaskNotifications, parseTimestampMs } from '../lib/transcript.mjs';
 
 export const metadataSource = 'subagent.watch';
@@ -32,12 +32,11 @@ export const runningIcon = '●';
 export const transcriptTailBytes = 64 * 1024;
 // transcript 還不存在的 sub 先留著：SubagentStart 觸發時 sub 可能還沒寫出第一行，超過這段時間仍不存在才當成沒有成功啟動
 export const missingTranscriptGraceMs = 2 * 60 * 1000;
-// 沒有任何結束訊號、但 transcript 這麼久沒寫：Claude Code 本身被砍掉時 sub 不會留下任何訊號，只能靠時間。
-// 門檻取 Bash tool 單次上限（10 分鐘）的 6 倍：sub 等指令、等 API 回應都不會這麼久沒寫入；
-// 真的會更久的只有前景 sub 卡在權限確認沒人按，那種情況這一行會被提早拿掉（README 已知限制）
-export const abandonedAfterMs = 60 * 60 * 1000;
-// 結束訊號比 SubagentStart 早太多，是 resume 之前那一輪留下的；容許一點誤差：hook 的 now() 可能比 sub 的第一筆紀錄晚一點才取
-const startClockToleranceMs = 2000;
+// 清除只是 SubagentStop 漏掉時的安全網：看到結束訊號之後，最後一筆紀錄與 transcript mtime 都要過了這麼久才清。
+// resume（SendMessage）會觸發新的 SubagentStart，但新一輪寫出第一筆紀錄之前，transcript 尾端還是上一輪的結束訊號（review 的 E2E：上一輪結束約 2 秒後就 resume）。
+// 本機 21 次 resume：SendMessage 到新一輪第一筆紀錄最多約 5 秒、到第一筆 assistant 回應最多約 10 秒。
+// 用本機 210 個 sub（231 輪）的真實時間軸模擬：舊規則（訊號不早於 SubagentStart 前 2 秒就清）誤刪 4 次，這個規則 0 次；代價是漏掉 SubagentStop 的 sub 要等 2 分鐘後的下一次 hook 才拿掉
+export const quietAfterEndSignalMs = 2 * 60 * 1000;
 const maximumMetaBytes = 64 * 1024;
 const interruptedMessagePrefix = '[Request interrupted by user';
 const sessionEventNames = new Set(['SessionStart', 'Stop', 'StopFailure']);
@@ -165,9 +164,10 @@ export function applyEvent(state, event, nowMs) {
   }
   const existing = state.subagents.find((subagent) => subagent.id === event.agentId);
   if (event.eventName === 'SubagentStart') {
-    // 同一個 sub 還在清單裡又收到 start（例如前一次的 stop 因 lock 逾時沒記到）：只留一筆，保留原本的啟動順序
+    // 同一個 sub 還在清單裡又收到 start（resume 時上一輪的 stop 沒記到，例如 lock 逾時）：只留一筆，啟動時間換成這一次的。
+    // 沿用舊的話，上一輪的結束訊號會晚於啟動時間，正在跑的這一輪會被當成已經結束
     const others = state.subagents.filter((subagent) => subagent.id !== event.agentId);
-    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: existing?.startedAtMs ?? nowMs };
+    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: nowMs };
     return { changed: true, state: { ...state, subagents: [...others, started] } };
   }
   // 沒看過 start 的 stop 不收：可能是內部 agent，或 hook 安裝前就啟動的 sub
@@ -252,44 +252,86 @@ function isInterruptedMessage(record) {
   });
 }
 
-// 回傳結束原因，還在跑（或判斷不了）回傳 null。records 是 sub transcript 尾端解出來的紀錄，lastWriteMs 是 transcript 的 mtime。
-// 1. 沿用 viewer 的規則（lib/subagent-state.mjs）：SubagentHandback、非背景 sub 的 end_turn、main transcript 的 task-notification
-// 2. 最後一筆 user／assistant 是 API 錯誤（isApiErrorMessage）：本機 3 個遇到 API 錯誤的 sub 都停在這一筆，之後沒有任何紀錄；
-//    其中一個額度用完的，側邊欄一直沒收到它的 SubagentStop（Claude Code 為什麼沒觸發未驗證）
-// 3. 最後一筆 user／assistant 是 `[Request interrupted by user…]`：本機 3 個被中斷的背景 sub 都停在這一行，main transcript 同一刻記 killed
-// 4. 很久沒寫入（abandonedAfterMs）
-// 早於 startedAtMs 的訊號不算：resume 的 sub 在寫出新紀錄之前，尾端還是上一輪的結束訊號
-export function detectSubagentEnd({ startedAtMs, records, meta = null, notification = null, lastWriteMs, nowMs }) {
-  const startMs = Number.isFinite(startedAtMs) ? startedAtMs : 0;
-  const earliestSignalMs = startMs - startClockToleranceMs;
-  const state = createSubAgentState({ agentId: 'tail', discoveredAtMs: nowMs });
-  applyMeta(state, meta);
+function isToolResultOnly(record, toolUseIds = null) {
+  const content = record.message?.content;
+  return record.type === 'user' && Array.isArray(content) && content.length > 0 && content.every((part) => {
+    return part?.type === 'tool_result' && (toolUseIds === null || toolUseIds.has(part.tool_use_id));
+  });
+}
+
+function findLatestTimestampMs(records) {
+  let latestMs = null;
   for (const record of records) {
-    applyRecord(state, record);
+    const timestampMs = parseTimestampMs(record.timestamp);
+    if (timestampMs !== null && (latestMs === null || timestampMs > latestMs)) {
+      latestMs = timestampMs;
+    }
   }
-  if (notification !== null) {
-    applyNotification(state, notification);
+  return latestMs;
+}
+
+// 最後一筆 assistant 是 SubagentHandback 或非背景 sub 的 end_turn（沿用 viewer 的 lib/subagent-state.mjs）：
+// 之後只能接它自己 tool_use 的 tool_result（SubagentHandback 那一筆），有別的紀錄就代表 sub 還在動
+function findTurnEndSignal(messages, meta) {
+  const assistantIndex = messages.findLastIndex((record) => record.type === 'assistant');
+  if (assistantIndex === -1) {
+    return null;
   }
-  // state.lastWriteMs 留 null，不用 viewer 的 10 分鐘 stale：viewer 的 ✓ 之後有寫入會變回 ●，側邊欄拿掉的那一行不會再回來，所以改用第 4 條較長的門檻
-  const status = getSubAgentStatus(state, nowMs);
-  if (status.isDone && status.atMs >= earliestSignalMs) {
-    return status.reason;
+  const assistant = messages[assistantIndex];
+  const parts = Array.isArray(assistant.message?.content) ? assistant.message.content : [];
+  const toolUseIds = new Set(parts.filter((part) => part?.type === 'tool_use').map((part) => part.id));
+  if (!messages.slice(assistantIndex + 1).every((record) => isToolResultOnly(record, toolUseIds))) {
+    return null;
   }
-  const lastMessage = records.findLast((record) => record.type === 'user' || record.type === 'assistant');
+  const state = createSubAgentState({ agentId: 'tail', discoveredAtMs: 0 });
+  applyMeta(state, meta);
+  applyRecord(state, assistant);
+  // state.lastWriteMs 留 null，不用 viewer 的 10 分鐘 stale：沒有結束訊號的 sub 一律留著
+  const status = getSubAgentStatus(state, 0);
+  return status.isDone ? { atMs: status.atMs, reason: status.reason } : null;
+}
+
+// 最後一筆有效紀錄（user／assistant）是不是結束訊號，是的話回傳 { atMs, reason }：
+// 1. main transcript 的 task-notification（completed／killed／failed），時間不早於最後一筆有效紀錄；
+//    最後一筆是新送進來的指令（不是 tool_result 的 user）時不信：resume 送進來的指令之後 sub 會繼續跑，通知是上一輪的
+// 2. 最後一筆是 API 錯誤（isApiErrorMessage）：本機 3 個遇到 API 錯誤的 sub 都停在這一筆，之後沒有任何紀錄；
+//    其中一個額度用完的，側邊欄一直沒收到它的 SubagentStop（Claude Code 為什麼沒觸發未驗證）
+// 3. 最後一筆是 `[Request interrupted by user…]`：本機 3 個被中斷的背景 sub 都停在這一行，main transcript 同一刻記 killed
+// 4. SubagentHandback、非背景 sub 的 end_turn（findTurnEndSignal）
+function findEndSignal(records, meta, notification) {
+  const messages = records.filter((record) => record.type === 'user' || record.type === 'assistant');
+  const lastMessage = messages.at(-1);
   const lastMessageMs = parseTimestampMs(lastMessage?.timestamp);
-  if (lastMessageMs !== null && lastMessageMs >= earliestSignalMs) {
-    if (lastMessage.type === 'assistant' && lastMessage.isApiErrorMessage === true) {
-      return 'api_error';
-    }
-    if (lastMessage.type === 'user' && isInterruptedMessage(lastMessage)) {
-      return 'interrupted';
-    }
+  if (lastMessageMs === null) {
+    return null;
   }
-  // resume 的 sub 在寫出新紀錄之前 mtime 還是上一輪的，從 startedAtMs 起算
-  if (Number.isFinite(lastWriteMs) && nowMs - Math.max(lastWriteMs, startMs) > abandonedAfterMs) {
-    return 'abandoned';
+  const isNewPrompt = lastMessage.type === 'user' && !isToolResultOnly(lastMessage);
+  if (notification !== null && notification.timestampMs !== null && notification.timestampMs >= lastMessageMs && !isNewPrompt) {
+    return { atMs: notification.timestampMs, reason: notification.status };
   }
-  return null;
+  if (lastMessage.type === 'assistant' && lastMessage.isApiErrorMessage === true) {
+    return { atMs: lastMessageMs, reason: 'api_error' };
+  }
+  if (lastMessage.type === 'user' && isInterruptedMessage(lastMessage)) {
+    return { atMs: lastMessageMs, reason: 'interrupted' };
+  }
+  return findTurnEndSignal(messages, meta);
+}
+
+// 回傳結束原因，還在跑（或判斷不了）回傳 null。records 是 sub transcript 尾端解出來的紀錄，lastWriteMs 是 transcript 的 mtime。
+// 只當 SubagentStop 漏掉時的安全網，三個條件都成立才算結束：
+// 1. 最後一筆有效紀錄是結束訊號（findEndSignal）
+// 2. 訊號不早於這一輪的 SubagentStart（startedAtMs，不留誤差）：resume 的 sub 在寫出新紀錄之前，尾端還是上一輪的結束訊號
+// 3. 最後一筆紀錄、transcript mtime、訊號本身都已經過了 quietAfterEndSignalMs：resume 後新一輪還沒寫紀錄的那幾秒不會被清
+// 沒有結束訊號就一直留著。舊版另有「60 分鐘沒寫入就清」，但本機 2 個 sub 在同一輪內 7 小時、23 小時沒寫入之後繼續跑（推測是電腦睡眠，未驗證），會被誤刪
+export function detectSubagentEnd({ startedAtMs, records, meta = null, notification = null, lastWriteMs, nowMs }) {
+  const signal = findEndSignal(records, meta, notification);
+  const startMs = Number.isFinite(startedAtMs) ? startedAtMs : 0;
+  if (signal === null || signal.atMs < startMs) {
+    return null;
+  }
+  const lastActivityMs = Math.max(signal.atMs, findLatestTimestampMs(records) ?? signal.atMs, Number.isFinite(lastWriteMs) ? lastWriteMs : signal.atMs);
+  return nowMs - lastActivityMs >= quietAfterEndSignalMs ? signal.reason : null;
 }
 
 function readSmallJsonFile(filePath, maximumBytes, readTail) {
@@ -310,7 +352,13 @@ function collectTaskNotifications(mainTail) {
     lines.shift();
   }
   for (const line of lines) {
-    for (const notification of parseTaskNotifications(line)) {
+    const parsed = parseTaskNotifications(line);
+    // 只取 enqueue（通知產生的時間）。remove 是主 session 把通知出列的時間，可能晚於 resume 或 sub 之後的紀錄：
+    // 本機一個 sub 在 SubagentHandback 之後因排隊訊息繼續跑 Bash，那則通知的出列時間比當時最後一筆紀錄晚，會被當成新的結束訊號
+    if (parsed.length === 0 || parseJsonLine(line)?.operation !== 'enqueue') {
+      continue;
+    }
+    for (const notification of parsed) {
       const previous = latestByAgentId.get(notification.agentId);
       if (previous === undefined || (notification.timestampMs ?? 0) >= (previous.timestampMs ?? 0)) {
         latestByAgentId.set(notification.agentId, notification);

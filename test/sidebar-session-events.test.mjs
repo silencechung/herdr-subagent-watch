@@ -66,13 +66,33 @@ function userToolResult(timestamp) {
   return { type: 'user', timestamp, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_x', content: 'ok' }] } };
 }
 
-function notificationLine(agentId, status, timestamp) {
+function notificationLine(agentId, status, timestamp, operation = 'enqueue') {
   const content = `<task-notification>\n<task-id>${agentId}</task-id>\n<status>${status}</status>\n<summary>Agent finished</summary>\n</task-notification>`;
-  return JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp, sessionId: 's', content });
+  return JSON.stringify({ type: 'queue-operation', operation, timestamp, sessionId: 's', content });
+}
+
+function userToolResultFor(timestamp, toolUseTimestamp) {
+  return { type: 'user', timestamp, message: { content: [{ type: 'tool_result', tool_use_id: `toolu_${toolUseTimestamp}`, content: 'ok' }] } };
+}
+
+function userPrompt(timestamp, text) {
+  return { type: 'user', timestamp, message: { content: text } };
 }
 
 function toJsonLines(records) {
   return `${records.map((record) => JSON.stringify(record)).join('\n')}\n`;
+}
+
+// Claude Code 每寫一筆紀錄 mtime 就跟著變：測試寫的 transcript 預設把 mtime 設成最後一筆紀錄的時間（清除要看最後一次寫入過了多久）
+function findLatestRecordMs(text) {
+  let latestMs = null;
+  for (const line of text.split('\n')) {
+    const timestampMs = line.trim() === '' ? NaN : Date.parse(JSON.parse(line).timestamp);
+    if (Number.isFinite(timestampMs) && (latestMs === null || timestampMs > latestMs)) {
+      latestMs = timestampMs;
+    }
+  }
+  return latestMs;
 }
 
 // Claude Code 的 transcript 版面：<projects>/<project>/<session>.jsonl，sub 在 <session>/subagents/agent-<id>.jsonl
@@ -92,8 +112,9 @@ function createSessionFiles(sessionId = 'aaaa0000-0000-4000-8000-0000000000aa') 
       if (meta !== null) {
         writeFileSync(join(subagentsDirectory, `agent-${agentId}.meta.json`), JSON.stringify(meta));
       }
-      if (modifiedMs !== null) {
-        const modifiedDate = new Date(modifiedMs);
+      const effectiveModifiedMs = modifiedMs ?? findLatestRecordMs(text);
+      if (effectiveModifiedMs !== null) {
+        const modifiedDate = new Date(effectiveModifiedMs);
         utimesSync(filePath, modifiedDate, modifiedDate);
       }
       return filePath;
@@ -409,8 +430,7 @@ describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
 describe('when a sub agent counts as ended', () => {
   const nowMs = Date.parse('2026-10-10T10:00:00.000Z');
   const startedAtMs = Date.parse('2026-10-10T09:00:00.000Z');
-  const recentWriteMs = nowMs - 1000;
-  const judge = (records, overrides = {}) => hook.detectSubagentEnd({ startedAtMs, records, lastWriteMs: recentWriteMs, nowMs, ...overrides });
+  const judge = (records, overrides = {}) => hook.detectSubagentEnd({ startedAtMs, records, nowMs, ...overrides });
 
   test('the real API error tail (usage limit) counts as ended', () => {
     assert.equal(judge(parseRecords(apiErrorTailText)), 'api_error');
@@ -436,25 +456,73 @@ describe('when a sub agent counts as ended', () => {
     assert.equal(judge([assistantToolUse('2026-10-10T09:30:00.000Z', 'Bash')], { notification }), 'killed');
   });
 
-  test('a running sub agent waiting on a tool result does not count, even after 59 minutes without writes', () => {
+  // 舊版有「60 分鐘沒寫入就清」：本機 2 個 sub 在同一輪內 7 小時、23 小時沒寫入之後繼續跑，會被誤刪
+  test('a sub agent without an end signal is kept however long its transcript has not been written', () => {
     const running = [assistantToolUse('2026-10-10T09:01:00.000Z', 'Bash', { command: 'make' }), userToolResult('2026-10-10T09:01:30.000Z')];
     assert.equal(judge(running), null);
-    const earlyStartMs = Date.parse('2026-10-10T08:00:00.000Z');
-    assert.equal(judge(running, { startedAtMs: earlyStartMs, lastWriteMs: nowMs - 59 * minuteMs }), null);
-    assert.equal(judge(running, { startedAtMs: earlyStartMs, lastWriteMs: nowMs - 61 * minuteMs }), 'abandoned');
+    const earlyStartMs = Date.parse('2026-10-09T08:00:00.000Z');
+    for (const silentMs of [59 * minuteMs, 61 * minuteMs, 7 * 60 * minuteMs, 23 * 60 * minuteMs]) {
+      assert.equal(judge(running, { startedAtMs: earlyStartMs, lastWriteMs: nowMs - silentMs, nowMs }), null, `${silentMs / minuteMs} minutes`);
+    }
+    const waitingOnTool = [assistantToolUse('2026-10-09T09:00:00.000Z', 'Bash', { command: 'sleep' })];
+    assert.equal(judge(waitingOnTool, { startedAtMs: earlyStartMs }), null);
   });
 
-  test('a resumed sub agent is not abandoned while its transcript still has the old modification time', () => {
-    const running = [assistantToolUse('2026-10-10T07:00:00.000Z', 'Bash')];
-    assert.equal(judge(running, { startedAtMs: nowMs - 5000, lastWriteMs: nowMs - 3 * 60 * minuteMs }), null);
+  test('only the last message counts: a hand back followed by more work is not an end, its own tool result is', () => {
+    const handbackAt = '2026-10-10T09:30:00.000Z';
+    const handback = assistantToolUse(handbackAt, 'SubagentHandback', { message: 'done' });
+    assert.equal(judge([handback, userToolResultFor('2026-10-10T09:30:00.200Z', handbackAt)]), 'handback');
+    // 排隊的訊息讓 sub 在 SubagentHandback 之後繼續跑
+    const continued = [handback, userToolResultFor('2026-10-10T09:30:00.200Z', handbackAt), userPrompt('2026-10-10T09:30:00.500Z', 'one more thing'), assistantToolUse('2026-10-10T09:30:05.000Z', 'Bash')];
+    assert.equal(judge(continued), null);
+    assert.equal(judge([handback, userPrompt('2026-10-10T09:31:00.000Z', 'resume with this')]), null);
   });
 
-  test('end signals from before the SubagentStart (an earlier run) do not count, apart from a small clock tolerance', () => {
+  test('an end signal counts only after 2 minutes without any record or write', () => {
+    assert.equal(hook.quietAfterEndSignalMs, 2 * minuteMs);
+    const signalMs = Date.parse('2026-10-10T09:30:00.000Z');
+    const handback = [assistantToolUse('2026-10-10T09:30:00.000Z', 'SubagentHandback')];
+    assert.equal(judge(handback, { nowMs: signalMs + hook.quietAfterEndSignalMs - 1, lastWriteMs: signalMs }), null);
+    assert.equal(judge(handback, { nowMs: signalMs + hook.quietAfterEndSignalMs, lastWriteMs: signalMs }), 'handback');
+    // transcript 之後還有寫入（mtime 較晚）：從那次寫入重新算
+    const laterWriteMs = signalMs + minuteMs;
+    assert.equal(judge(handback, { nowMs: signalMs + hook.quietAfterEndSignalMs, lastWriteMs: laterWriteMs }), null);
+    assert.equal(judge(handback, { nowMs: laterWriteMs + hook.quietAfterEndSignalMs, lastWriteMs: laterWriteMs }), 'handback');
+    // 結束訊號之後的 attachment 不改變結束判斷，但也算一次寫入
+    const withAttachment = [...handback, { type: 'attachment', timestamp: '2026-10-10T09:30:30.000Z' }];
+    assert.equal(judge(withAttachment, { nowMs: signalMs + hook.quietAfterEndSignalMs }), null);
+    assert.equal(judge(withAttachment, { nowMs: signalMs + 30 * 1000 + hook.quietAfterEndSignalMs }), 'handback');
+  });
+
+  // 本機 a1581f8f：額度用完停在 API 錯誤那一筆，沒收到 SubagentStop；main transcript 不久後記了 failed 的通知
+  test('a sub agent stopped by an API error without a SubagentStop is removed 2 minutes after its last record', () => {
+    const records = parseRecords(apiErrorTailText);
+    const lastRecordMs = Date.parse('2026-10-10T09:33:03.829Z');
+    const options = { startedAtMs: Date.parse('2026-10-10T09:28:10.847Z'), lastWriteMs: lastRecordMs };
+    assert.equal(judge(records, { ...options, nowMs: lastRecordMs + hook.quietAfterEndSignalMs - 1 }), null);
+    assert.equal(judge(records, { ...options, nowMs: lastRecordMs + hook.quietAfterEndSignalMs }), 'api_error');
+    const notification = { agentId: 'a1581f8ff64effcfe', status: 'failed', timestampMs: Date.parse('2026-10-10T09:33:04.386Z') };
+    assert.equal(judge(records, { ...options, notification, nowMs: notification.timestampMs + hook.quietAfterEndSignalMs - 1 }), null);
+    assert.equal(judge(records, { ...options, notification, nowMs: notification.timestampMs + hook.quietAfterEndSignalMs }), 'failed');
+  });
+
+  test('end signals from before this run\'s SubagentStart (an earlier run) do not count, with no tolerance', () => {
     const handback = [assistantToolUse('2026-10-10T09:30:00.000Z', 'SubagentHandback')];
     assert.equal(judge(handback, { startedAtMs: Date.parse('2026-10-10T09:35:00.000Z') }), null);
+    assert.equal(judge(handback, { startedAtMs: Date.parse('2026-10-10T09:30:00.001Z') }), null);
+    assert.equal(judge(handback, { startedAtMs: Date.parse('2026-10-10T09:30:00.000Z') }), 'handback');
     assert.equal(judge(parseRecords(apiErrorTailText), { startedAtMs: Date.parse('2026-10-10T09:40:00.000Z') }), null);
-    // hook 的 now() 比 sub 第一筆紀錄晚一點點取：立刻遇到 API 錯誤的 sub 仍要算結束
-    assert.equal(judge(parseRecords(apiErrorTailText), { startedAtMs: Date.parse('2026-10-10T09:33:04.500Z') }), 'api_error');
+    assert.equal(judge(parseRecords(apiErrorTailText), { startedAtMs: Date.parse('2026-10-10T09:33:04.500Z') }), null);
+  });
+
+  test('a task notification counts only when it is not older than the last message and that message is not a new prompt', () => {
+    const killed = (timestamp) => ({ agentId: 'x', status: 'killed', timestampMs: Date.parse(timestamp) });
+    const waitingOnTool = [assistantToolUse('2026-10-10T09:30:00.000Z', 'Bash'), userToolResultFor('2026-10-10T09:30:10.000Z', '2026-10-10T09:30:00.000Z')];
+    assert.equal(judge(waitingOnTool, { notification: killed('2026-10-10T09:31:00.000Z') }), 'killed');
+    assert.equal(judge(waitingOnTool, { notification: killed('2026-10-10T09:30:05.000Z') }), null);
+    // resume 送進來的指令之後 sub 會繼續跑：比它晚的通知也不信
+    const resumed = [assistantToolUse('2026-10-10T09:30:00.000Z', 'SubagentHandback'), userPrompt('2026-10-10T09:31:00.000Z', 'resume with this')];
+    assert.equal(judge(resumed, { startedAtMs: Date.parse('2026-10-10T09:30:59.000Z'), notification: killed('2026-10-10T09:31:30.000Z') }), null);
   });
 });
 
@@ -504,6 +572,88 @@ describe('reading only the end of a transcript', () => {
     const startedAtMs = Date.now();
     assert.equal(hook.readFileTail(fifoPath, hook.transcriptTailBytes), null);
     assert.ok(Date.now() - startedAtMs < 500);
+  });
+});
+
+// 清除只當 SubagentStop 漏掉時的安全網：resume、排隊訊息、長時間沒寫入的 sub 都不能被誤刪
+describe('the safety net never removes a sub agent that is still running', () => {
+  // review 的 E2E（claude -p，foreground sub，SendMessage resume）實際的 hook 與紀錄時間
+  const agentId = 'a480a48b30c999a29';
+  const firstStartMs = Date.parse('2026-10-10T18:22:59.589Z');
+  const firstStopMs = Date.parse('2026-10-10T18:23:00.595Z');
+  const resumeStartMs = Date.parse('2026-10-10T18:23:02.526Z');
+  const firstRun = [
+    userPrompt('2026-10-10T18:22:59.558Z', 'Reply with the single word ALPHA. Do not use any tools.'),
+    assistantEndTurn('2026-10-10T18:23:00.541Z'),
+    { type: 'attachment', timestamp: '2026-10-10T18:23:00.565Z' },
+  ];
+  const resumePrompt = userPrompt('2026-10-10T18:23:02.494Z', 'The coordinator sent a message while you were working:\nReply with the single word BETA.');
+  const foregroundMeta = { agentType: 'general-purpose', requestShape: 'foreground' };
+
+  function startResumeCase({ isFirstStopRecorded }) {
+    const harness = createHarness({ clockMs: firstStartMs });
+    const files = createSessionFiles();
+    const subagentEvent = (eventName) => ({ ...subagentStartPayload, hook_event_name: eventName, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: agentId, agent_type: 'general-purpose' });
+    files.writeSubagent(agentId, toJsonLines(firstRun.slice(0, 1)), { meta: foregroundMeta });
+    harness.run(subagentEvent('SubagentStart'));
+    files.writeSubagent(agentId, toJsonLines(firstRun), { meta: foregroundMeta });
+    harness.advanceClock(firstStopMs - firstStartMs);
+    if (isFirstStopRecorded) {
+      harness.run(subagentEvent('SubagentStop'));
+    }
+    harness.advanceClock(resumeStartMs - firstStopMs);
+    harness.run(subagentEvent('SubagentStart'));
+    return { harness, files };
+  }
+
+  for (const isFirstStopRecorded of [true, false]) {
+    test(`a sub agent resumed 2 seconds after its previous end is kept until its new run ends (first SubagentStop ${isFirstStopRecorded ? 'recorded' : 'missed'})`, () => {
+      const { harness, files } = startResumeCase({ isFirstStopRecorded });
+      assert.deepEqual(harness.readState(files.sessionId).subagents, [{ id: agentId, agentType: 'general-purpose', startedAtMs: resumeStartMs }]);
+      // 新一輪還沒寫任何紀錄：尾端還是上一輪的 end_turn
+      harness.advanceClock(500);
+      assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+      // 新一輪的指令寫進來了，sub 還沒回應
+      files.writeSubagent(agentId, toJsonLines([...firstRun, resumePrompt]), { meta: foregroundMeta, modifiedMs: harness.nowMs() });
+      harness.advanceClock(hook.quietAfterEndSignalMs);
+      assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+      assert.deepEqual(harness.readState(files.sessionId).subagents.map((subagent) => subagent.id), [agentId]);
+    });
+  }
+
+  test('when the new run ends and its SubagentStop is missed, it is removed on the first hook 2 minutes after its last record', () => {
+    const { harness, files } = startResumeCase({ isFirstStopRecorded: true });
+    const secondEndMs = Date.parse('2026-10-10T18:23:03.434Z');
+    files.writeSubagent(agentId, toJsonLines([...firstRun, resumePrompt, assistantEndTurn('2026-10-10T18:23:03.434Z')]), { meta: foregroundMeta });
+    harness.advanceClock(Date.parse('2026-10-10T18:23:04.298Z') - resumeStartMs);
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+    harness.advanceClock(secondEndMs + hook.quietAfterEndSignalMs - harness.nowMs());
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)).removed, [{ id: agentId, reason: 'end_turn' }]);
+  });
+
+  test('a sub agent that has written nothing for hours without an end signal is kept', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'sleeping1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-09T08:00:00.000Z') }]);
+    files.writeSubagent('sleeping1', toJsonLines([assistantToolUse('2026-10-09T11:00:00.000Z', 'Bash', { command: 'make' })]));
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
+  });
+
+  // 本機 a5b8bfbe：SubagentHandback 之後因排隊訊息繼續跑 Bash；那則通知的 remove（出列）時間比當時最後一筆紀錄晚
+  test('a task notification counts by its enqueue time, not by when the main session took it off the queue', () => {
+    const harness = createHarness();
+    const files = createSessionFiles();
+    harness.writeState(files.sessionId, [{ id: 'queued1', agentType: 'Plan', startedAtMs: Date.parse('2026-10-10T09:30:00.000Z') }]);
+    const handbackAt = '2026-10-10T09:40:00.000Z';
+    files.writeSubagent('queued1', toJsonLines([
+      assistantToolUse(handbackAt, 'SubagentHandback', { message: 'done' }),
+      userToolResultFor('2026-10-10T09:40:00.200Z', handbackAt),
+      userPrompt('2026-10-10T09:40:00.500Z', 'The coordinator sent a message while you were working:\nAlso run the tests.'),
+      assistantToolUse('2026-10-10T09:40:05.000Z', 'Bash', { command: 'npm test' }),
+    ]));
+    files.appendMain(notificationLine('queued1', 'completed', '2026-10-10T09:40:00.300Z', 'enqueue'));
+    files.appendMain(notificationLine('queued1', 'completed', '2026-10-10T09:40:06.000Z', 'remove'));
+    assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
   });
 });
 

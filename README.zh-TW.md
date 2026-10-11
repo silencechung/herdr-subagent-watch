@@ -2,7 +2,7 @@
 
 [English](README.md) | 繁體中文
 
-herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出還在跑的 sub agent（見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)）。側邊欄不留歷程，sub 一結束那一行就消失；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，最晚在主 session 下一次回合結束（`Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`）時拿掉；pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的樹。結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。純 Node 內建模組，不需要 `npm install`。
+herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出還在跑的 sub agent（見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)）。側邊欄不留歷程，sub 一結束那一行就消失；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，在它最後一次寫入 2 分鐘後的下一次 hook 事件拿掉（例如主 session 下一次回合結束的 `Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`），這只是安全網：沒有結束訊號的 sub（或 resume 後新一輪還沒寫紀錄的）不管多久沒寫入都留著；pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的樹。結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。純 Node 內建模組，不需要 `npm install`。
 
 - **只支援 Claude Code**：讀的是 Claude Code 的 transcript 與 `SessionStart`／`SubagentStart`／`SubagentStop`／`Stop`／`StopFailure` hook，其他 agent 的 pane 會顯示 `This pane is not running Claude Code (detected: <agent>)`。
 - 需求：herdr ≥ 0.9.3、Node.js ≥ 22、Linux（sidebar hook 靠 `/proc` 與 `XDG_RUNTIME_DIR`）。
