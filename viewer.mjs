@@ -93,7 +93,7 @@ function describeSession(session) {
 
 function createController({ options, environment, onChange }) {
   let session = null;
-  // herdr、pane map 上一次查詢成功時回報的 session：已經接上 session 之後，只有來源的值變了才換（見 chooseSession）
+  // herdr、pane map 上一次查詢成功時回報的 session：pane map 沒有 SessionStart 標記時，已經接上 session 之後只有來源的值變了才換（見 chooseSession）
   let lastSeenSessionIds = { herdr: null, paneMap: null };
   let source = null;
   let selectedAgentId = null;

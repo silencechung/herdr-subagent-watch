@@ -13,35 +13,49 @@ claude
 ```
 
 - Only running sub agents (`●`) are listed, without numbers. When a sub agent ends (`SubagentStop`), its line is removed, the rest move up, and `├─` / `└─` are recomputed every time.
+- A sub agent that ended without a `SubagentStop` (for example one stopped by an API error such as a usage limit) is removed at the first hook event of that session that comes 2 minutes or more after its last write (for example when the main session finishes its next turn: `Stop`, or `StopFailure` when that turn itself ends with an API error). See [Sub agents that ended without SubagentStop](#sub-agents-that-ended-without-subagentstop).
+- When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the tree is redrawn for that session right away (`SessionStart`); a session without running sub agents clears it.
 - With no running sub agent, the sidebar shows only the claude row.
 - The sidebar keeps no history: finished sub agents and what they did are in the popup viewer (`prefix+.`), see the [README](../README.md).
 
 ## How it works
 
-1. When Claude Code starts or ends a sub agent, it fires the `SubagentStart` / `SubagentStop` hook. `bin/run.sh` finds node and runs `hooks/sidebar-hook.mjs`; the payload arrives on stdin.
+1. Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks. All five run the same command: `bin/run.sh` finds node and runs `hooks/sidebar-hook.mjs`; the payload arrives on stdin and `hook_event_name` tells the events apart.
 2. The hook updates its state file, then calls `herdr pane report-metadata` to write the tree lines into pane tokens `sub1`…`sub5`.
+   - `SessionStart`: writes the pane map (marked as written at session start, see below) and always redraws the tree from that session's state.
+   - `SubagentStart` / `SubagentStop`: adds / removes the sub agent and writes the pane map.
+   - `Stop` (the main session finished a turn) and `StopFailure` (the turn ended with an API error instead, such as a usage limit): only remove sub agents that have ended and redraw when something was removed. They never write the pane map.
+   - Every event first checks the session's other sub agents and removes the ones that have ended (see [below](#sub-agents-that-ended-without-subagentstop)).
 3. `rows_by_agent.claude` in `config.toml` has five extra lines, `$sub1`…`$sub5`. The herdr docs state that a token that has not been reported makes its whole line disappear, so normally no empty lines show.
 
 ### Hook input (tested 2026-10-10 with `claude -p` 2.1.296)
 
-| Field | SubagentStart | SubagentStop |
-| --- | --- | --- |
-| `hook_event_name` | ✓ | ✓ |
-| `session_id`, `transcript_path`, `cwd`, `prompt_id` | ✓ | ✓ |
-| `agent_id` (e.g. `a12e8c491ce2f7f4a`, no `agent-` prefix) | ✓ | ✓ |
-| `agent_type` (e.g. `general-purpose`) | ✓ | ✓ |
-| `permission_mode`, `effort`, `stop_hook_active`, `agent_transcript_path`, `background_tasks`, `session_crons` | | ✓ |
+| Field | SessionStart | SubagentStart | SubagentStop | Stop |
+| --- | --- | --- | --- | --- |
+| `hook_event_name`, `session_id`, `transcript_path`, `cwd` | ✓ | ✓ | ✓ | ✓ |
+| `source` (`startup`, `resume`) | ✓ | | | |
+| `seconds_since_last_response`, `context_tokens`, `prompt_cache_likely_expired`, `estimated_cache_write_usd` | only `resume` | | | |
+| `prompt_id` | | ✓ | ✓ | ✓ |
+| `agent_id` (e.g. `a12e8c491ce2f7f4a`, no `agent-` prefix) | | ✓ | ✓ | |
+| `agent_type` (e.g. `general-purpose`) | | ✓ | ✓ | |
+| `permission_mode`, `effort`, `stop_hook_active`, `last_assistant_message`, `background_tasks`, `session_crons` | | | ✓ | ✓ |
+| `agent_transcript_path` | | | ✓ | |
 
-The official docs say `SubagentStop` has `last_assistant_message`; it was not there in that test. This hook does not use it.
+- `SessionStart`: the official [hooks docs](https://code.claude.com/docs/en/hooks) list `source` as `startup`, `resume` (`--resume`, `--continue`, `/resume`), `clear` (`/clear`), `compact` and `fork`, and optional `model`, `agent_type` (with `claude --agent <name>`) and `session_title`. Only `startup` and `resume` were tested (with `-p`); `/clear` and `/resume` in an interactive session cannot be tested with `-p` and are **not tested on this machine**. An unknown `source` is recorded as `unknown`. `--resume <id>` kept the same `session_id`. With `startup`, the transcript did not exist yet when the hook ran; it is written after the first prompt.
+- `Stop`: per the official docs it fires when Claude finishes responding; when a turn ends because of an API error, `StopFailure` fires instead.
+- `StopFailure`: **not tested on this machine** (it needs a real API error); the fields come from the official docs ([StopFailure input](https://code.claude.com/docs/en/hooks#stopfailure-input)): the common `session_id`, `transcript_path`, `cwd`, `hook_event_name`, plus `error` (`rate_limit`, `overloaded`, `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `invalid_request`, `model_not_found`, `server_error`, `max_output_tokens`, `cloud_credential_error` or `unknown`; this is also what a `matcher` filters on), optional `error_details` and optional `last_assistant_message` (the API error text itself). Claude Code ignores its output and exit code. The hook uses only the common fields, so every error type is handled the same way.
+- `SubagentStop`: `last_assistant_message` was missing in the first test of that day and present in a later one (a foreground sub agent). This hook does not use it.
 
 The hook process inherits Claude Code's environment variables: `HERDR_PANE_ID` (e.g. `w8:pV`), `HERDR_BIN_PATH` and `XDG_RUNTIME_DIR` were all present in testing. Sample payloads are in `test/fixtures/sidebar/`.
 
 ### Files written (`$XDG_RUNTIME_DIR/subagent-watch/`, tmpfs, cleared on reboot)
 
-- `session-<sessionId>.json`: `{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`, where `subagents` holds only running sub agents. `SubagentStop` removes the entry, so the file size depends only on how many sub agents run at the same time and does not keep growing.
+- `session-<sessionId>.json`: `{ sessionId, lastSequence, subagents: [{ id, agentType, startedAtMs }] }`, where `subagents` holds only running sub agents. `SubagentStop` (or the cleanup below) removes the entry, so the file size depends only on how many sub agents run at the same time and does not keep growing. It is only written when something changed, so a session that never starts a sub agent leaves no file.
   - Entries left by an older version with `status` `"done"` are dropped the next time an event reads the file.
-  - A `SubagentStart` for a sub agent that is still in the list keeps a single entry (with its original start order); a `SubagentStart` for one that has already been removed (resume) adds it again at the end.
-- `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads. **The contract is fixed**: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`.
+  - A `SubagentStart` for a sub agent that is still in the list (a resume whose previous `SubagentStop` was missed) keeps a single entry and replaces its start time with this one, so it moves to the end; a `SubagentStart` for one that has already been removed (resume) also adds it again at the end. The start time decides which run an end signal belongs to (see the next section).
+- `pane-<HERDR_PANE_ID>.json`: the mapping file the popup viewer reads: `{"sessionId","transcriptPath","cwd","updatedAtMs"}`, plus `"sessionStartSource"` (the `source` of that `SessionStart`, e.g. `"startup"`) when the file was written by the `SessionStart` of this session. **The four fields are fixed**; the viewer reads `sessionStartSource` only as a mark (see [Which session a pane maps to](../README.md#which-session-a-pane-maps-to)).
+  - `SubagentStart` / `SubagentStop` of the same session rewrite the file and keep the mark; an event of another session writes the file without it, because that session's `SessionStart` may never have been seen.
+  - `Stop` / `StopFailure` never write it.
 
 Before writing, the hook checks the `subagent-watch` folder: it must belong to your uid, must not be a symlink, and must have mode `0700`. Otherwise nothing is written (and `XDG_RUNTIME_DIR` itself is never created when it is missing).
 
@@ -50,10 +64,36 @@ Both files are written to a temporary file and then `rename`d, so the viewer nev
 Read-modify-write for one session is serialized with `session-<id>.json.lock`, so starting several sub agents in parallel loses no data:
 
 - The lock holds the pid of its holder, its start time (field 22 of `/proc/<pid>/stat`) and when it was created. It is written to a temporary file first and then `link`ed into place (like `wx`, this only succeeds when the lock does not exist), so nobody reads a half-written lock.
-- A lock is stale when `process.kill(pid, 0)` finds no such process, the process is a zombie, or the pid now belongs to a process with a different start time (pid reuse). An empty lock left by an older version has no pid and becomes stale after 2 seconds; any lock older than 10 seconds is stale (a safety net for when the pid check cannot be trusted; the hook itself finishes in under 1 second).
+- A lock is stale when `process.kill(pid, 0)` finds no such process, the process is a zombie, or the pid now belongs to a process with a different start time (pid reuse). An empty lock left by an older version has no pid and becomes stale after 2 seconds; any lock older than 10 seconds is stale (a safety net for when the pid check cannot be trusted; the hook's overall budget is 1.5 seconds).
 - A lock is identified by its inode together with its content (pid, start time, creation time). The inode alone is not enough: file systems such as ext4 hand a just-freed inode to the next new file, so a fresh lock created right after a stale one is removed can get the same inode. If the content cannot be read, the lock is not removed.
 - Taking over: the hook first claims the name `<lock>.break-<inode>` with `link`, and only removes the lock if it got that name and the lock it reads back through that name is still the inode and content it judged stale. It never removes a fresh lock someone else just created. A `.break-*` file left by a process killed in between is cleared once it is 2 seconds old.
 - On release, the lock is removed only if it is still the inode and content this run created.
+- Inside the lock the hook only reads and writes the state file and reports to herdr. The transcripts used to spot sub agents that ended (next section) are read before the lock is taken: with those reads inside, every hook of a session started in parallel also waited for each earlier one to finish reading, and one that ran out of budget gave up (`lock-timeout`); a dropped `SubagentStart` never shows up in the sidebar.
+  - Inside the lock the state file is read again, and only sub agents that are still in it with the same start time are removed. One that another hook removed and started again (resume) in between is kept: the transcript that was checked belongs to the previous run.
+  - A `Stop` / `StopFailure` that finds nothing to remove returns without taking the lock.
+  - Measured with 8 `SubagentStart` hooks started at once, a fake herdr that answers in 30 ms, and 5 running sub agents with real transcripts (state and transcripts on btrfs, 20 rounds): the lock is held for about 36 ms (median), almost all of it the herdr call, the same as before sub agent pruning existed. With the transcript reads inside the lock it was about 47 ms; pinned to one CPU shared with 4 busy processes, 46 of 160 updates were lost that way, and none of 640 after the change.
+
+### Sub agents that ended without SubagentStop
+
+A sub agent stopped by an API error can stay in the list forever when only `SubagentStop` removes it: on 2026-10-10 a sub agent that hit the usage limit (its last transcript line is an assistant entry with `isApiErrorMessage: true`) stayed in the sidebar for hours; why Claude Code did not fire `SubagentStop` for it is not verified. So on every hook event (`SessionStart`, `SubagentStart`, `SubagentStop`, `Stop`, `StopFailure`), before taking the session lock, the hook looks at the transcript of every sub agent in that session's state file and removes the ones that have ended:
+
+- Where: `<main transcript without .jsonl>/subagents/agent-<id>.jsonl` and `agent-<id>.meta.json` next to it; task notifications come from the main transcript (`transcript_path` of the event). When the main transcript does not exist or the path is not absolute, nothing is removed: the sub agent paths could not be trusted.
+- Only the last 64 KB of each transcript (and of the main transcript) is read; a cut first line is dropped.
+- This cleanup is only a safety net for a missed `SubagentStop`. A sub agent is removed only when all three hold:
+  1. the last real entry (`user` / `assistant`) of its transcript is an end signal, one of:
+     - the popup viewer's rules (see [README](../README.md#data-sources-and-when-a-sub-agent-counts-as-finished), the same code in `lib/subagent-state.mjs`): a `SubagentHandback` (followed by nothing but its own tool result) or `end_turn` for sub agents that are not background. The viewer's 10-minute "no writes" rule is not used here;
+     - a `<task-notification>` with `completed` / `killed` / `failed` in the main transcript: only the time of its `enqueue` line counts, and it must not be older than the last real entry; it is ignored when that entry is a new instruction (a `user` entry that is not a tool result, such as the message of a resume). The `remove` (dequeue) time is not used: it can come after a resume or after later entries of the sub agent. One local sub agent kept running Bash after its `SubagentHandback` because of a queued message, and its notification was dequeued after what was then its last entry;
+     - an API error (`isApiErrorMessage: true`). The 3 local sub agents with an API error all stop at that entry with nothing after it;
+     - `[Request interrupted by user…]`. The 3 local sub agents that end this way were all interrupted background sub agents, and the main transcript recorded `killed` for them at the same moment (that notification may already be outside the last 64 KB);
+  2. the end signal is not older than this run's `SubagentStart` (no tolerance). A resumed sub agent still has the previous run's ending at the end of its transcript until it writes something new, so every `SubagentStart` (including one for a sub agent that is still in the list) replaces the start time with the time of that event;
+  3. the last entry, the transcript's mtime (and, for a task notification, the notification) are all 2 minutes old or more (`quietAfterEndSignalMs`). The few seconds after a resume, before the new run writes anything, are covered: over 21 local resumes, the new run's first entry came at most about 5 seconds after `SendMessage`, and its first assistant reply at most about 10 seconds after.
+- A transcript that still does not exist 2 minutes after its `SubagentStart` is removed as well (in testing it appeared about 0.1 seconds after `SubagentStart`).
+- A sub agent without an end signal is kept, however long it has not been written. The older "no writes for 60 minutes" rule is gone: 2 local sub agents went on running after 7 and 23 hours without a write within the same run (presumably the computer was asleep; not verified) and would have been removed.
+- The cost: a sub agent whose `SubagentStop` was missed does not disappear right away, only at the first hook event 2 minutes or more after its last write (the main session finishing a turn, another sub agent starting or ending, a session starting).
+- Why these rules: a simulation on the real timelines of the 210 local sub agents (231 runs, 21 of them resumes), with hook events at the main transcript's turn ends and at the starts and ends of the other sub agents of the session. The old rules (a signal counts from 2 seconds before `SubagentStart`, the old start time is kept on a resume, plus the 60-minute rule) removed a running sub agent 4 times; these rules never did (also never when sampling every second). The sub agent stopped by an API error without a `SubagentStop` was removed 120 seconds after its last entry when sampling every second.
+- The sub agent of the event being handled is never checked in that same event (for `SubagentStop` it is removed anyway; for `SubagentStart` it may be a resume whose transcript still ends with the previous run).
+- Time: with 5 sub agents and real transcripts (0.5–1.8 MB each, a 3.4 MB main transcript), the whole hook process took about 42 ms (median of 15 runs, including about 18 ms of node startup). The checks themselves take about 10 ms, and at most about 22 ms with 8 hooks running at once (5 sub agents, real transcripts of 1.4–2.4 MB and a 3.7 MB main transcript). They stop after 100 ms, which is reached when 8 hooks share one CPU, so the event's own update still has time to get the lock (with a 200 ms limit, 8 hooks on one CPU shared with 4 busy processes lost 5 of 640 updates; with 100 ms, none); the remaining sub agents are kept and checked at the next event.
+- The current state of the 210 sub agent transcripts on this machine (2026-10-11) was run through these rules: 208 counted as ended (`SubagentHandback` 165, `end_turn` 32, task notification `completed` 5, API error 3, interrupted 3). Of the 2 kept, one is the sub agent running the check; the other is a background sub agent ending with `end_turn` whose `completed` notification is no longer in the last 64 KB of the (about 10 MB) main transcript (see Known limitations; the hooks at that time could read it).
 
 ### Reporting to herdr
 
@@ -65,6 +105,7 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
 
 When the last running sub agent ends, all five tokens are cleared with `--clear-token`.
 
+- `SessionStart` always reports, so the tree of the previous session is replaced (or cleared) as soon as the pane switches sessions. `SubagentStart` / `SubagentStop` report when the list changed, `Stop` / `StopFailure` only when something was removed; otherwise herdr is not called.
 - Only one source, `subagent.watch`, is used: herdr allows at most 32 sequenced sources per pane for its whole lifetime, and clearing one does not give it back.
 - `--seq` is `Date.now()`; for several events in the same millisecond it uses "previous + 1", so it always increases (herdr ignores an older seq).
 - Order: by start time. With more than 5 running, the fifth line becomes `└─ +N more`, where N counts only running sub agents that are not listed.
@@ -76,13 +117,15 @@ When the last running sub agent ends, all five tokens are cleared with `--clear-
 
 The hook is global and applies to every Claude session:
 
-- It always exits 0 and prints nothing to stdout (herdr's output is sent to `ignore` too), with an overall budget of 800 ms (herdr is killed with `SIGKILL` on timeout); the 5-second timeout in `settings.json` is a safety net.
+- It always exits 0 and prints nothing to stdout (herdr's output is sent to `ignore` too), with an overall budget of 1500 ms, not counting node startup (herdr is killed with `SIGKILL` on timeout); the 5-second timeout in `settings.json` is a safety net.
+  - The budget is a cap that normal runs never reach: with 8 hooks fired at once (real transcripts, a fake herdr that takes 30 ms per call, 20 rounds), the median total time is about 220 ms. Only a busy machine waits longer for the lock: pinned to 1 CPU next to 6 CPU-bound processes, a budget of 800 ms dropped about 70 of 160 updates (`lock-timeout`), while 1500 ms dropped 1, with the slowest hook taking about 2.0 seconds, still 3 seconds short of the 5-second timeout. A dropped `SubagentStart` means that sub agent never shows up in the sidebar, which is worse than waiting an extra second on a busy machine.
 - No `HERDR_PANE_ID`, no `XDG_RUNTIME_DIR`, or no herdr executable → it writes nothing and exits.
 - When `bin/run.sh` cannot find Node.js 22+, it always exits 0 silently for this hook (the other entry points print an error).
-- Events with an empty `agent_type` are skipped: Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`.
+- `SubagentStart` / `SubagentStop` events with an empty `agent_type` are skipped: Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`.
 - A `SubagentStop` without a matching `SubagentStart` seen earlier is skipped.
+- `Stop` fires after every turn of every session (`StopFailure` instead when the turn ends with an API error). Without running sub agents in the state file it only reads that file and calls nothing (about 30 ms for the whole process, most of it node startup); with running sub agents of which none has ended, it also reads their transcripts but neither takes the lock nor calls herdr.
 - The `subagent-watch` folder is not yours, is a symlink, or is not `0700` → nothing is written.
-- Events from another Claude session in the same pane are skipped (for example the claude in the pane running `claude -p` through Bash). Child processes inherit the same `HERDR_PANE_ID`; without this check they would overwrite the main session's tree and mapping file. How it decides:
+- Events from another Claude session in the same pane are skipped (for example the claude in the pane running `claude -p` through Bash). Child processes inherit the same `HERDR_PANE_ID`; without this check they would overwrite the main session's tree and mapping file. The same check applies to all five events. How it decides:
   - It first counts the groups of `claude` processes among its ancestors. `claude` processes that are direct parent and child count as one group, so a wrapper script named claude that does not `exec` is still one group; commands run by the Bash tool always sit behind a shell, so a nested `claude -p` counts as a second group.
   - One group (or none) → the event is accepted and herdr is not asked.
   - Two or more groups → it asks `herdr pane get <pane>` for `agent_session` (reported by herdr's claude integration): only an event whose `session_id` matches updates the sidebar; a different session, a session of another agent, or no answer is skipped. It waits at most 300 ms and never eats into the minimum budget for reporting to herdr.
@@ -90,12 +133,17 @@ The hook is global and applies to every Claude session:
 
 ### Known limitations
 
-- If a session ends or switches to another session while sub agents are still running, the old tree lines stay until the next sub agent event in that pane overwrites them (only `SubagentStart` / `SubagentStop` are hooked, not `SessionStart` / `SessionEnd`).
-- If a sub agent's `SubagentStop` is missed (for example the hook gives up on the event after waiting too long for the lock), its line does not go away by itself within the same session (it is removed only when that sub agent gets another `SubagentStop`); after switching sessions, the next sub agent event overwrites it.
+- Sessions that were already running when the hooks were added (or before setup was run again after upgrading) have had no `SessionStart`: until they restart, `/resume`, `/clear` or compact, the pane map has no mark and switching sessions does not redraw the tree right away. The official docs say edits to hooks in settings files are normally picked up by a file watcher; whether a running session then fires the new `Stop` / `StopFailure` hooks is not verified.
+- When `claude` exits while sub agents are running and no new session starts in that pane, their lines stay (`SessionEnd` is not hooked). Whether herdr still shows the claude rows of a pane that no longer runs Claude Code is not verified.
+- A sub agent that ended without `SubagentStop` is removed only at the first hook event of its session that comes 2 minutes or more after its last write. Per the official docs a turn that ends with an API error fires `StopFailure` instead of `Stop`; after a usage limit that also ends the main turn, if `StopFailure` fires within 2 minutes of the sub agent's last write (how far apart they are is not verified), the line stays until the next turn, sub agent event or session start. `StopFailure` itself is not tested on this machine.
+- The cleanup reads only the last 64 KB of a transcript: an end signal followed by more than 64 KB of other lines, or a task notification no longer in the last 64 KB of the main transcript, is missed, and the line stays until the pane switches sessions. If a future Claude Code moves the sub agent transcripts, every row would be removed by the 2-minute rule at the first hook event after that.
+- A sub agent without an end signal is never removed: the lines of sub agents of a Claude Code process that was killed and left no signal stay until the pane switches sessions.
+- Whether Claude Code ever continues a sub agent after writing an API error entry is not verified (none of the 3 local cases did). If it does, more than 2 minutes later, with a hook event in between, the line is removed early.
 - herdr's `agent_session` can be stale: after the herdr server restarts it can stay on the session restored from `session.json`, the one from before the restart, and later `startup` reports from Claude Code do not overwrite it (seen with herdr 0.9.3; in the same test a `resume` report did not overwrite it either, for an unknown reason). So the hook does not rely on it to tell which session is the pane's main one, and only asks herdr when the ancestor scan finds two or more groups of `claude`. What is still not caught:
   - A nested `claude -p --resume` / `claude -p -c`: if herdr accepts its report and makes it the pane's `agent_session`, its events are treated as the main session's.
   - `exec claude -p`, or an `sh -c 'claude -p …'` that runs only that one command (for example a hook whose command is itself `claude -p …`; sh then execs into claude): the nested claude is a direct child of the main claude and counts as the same group, so it is taken as the main session and its events are accepted. How Claude Code actually starts the hook process is not verified.
   - When Claude Code is installed through npm and its process name is `node` rather than `claude`, the ancestor scan finds 0 groups and every event is accepted, nested ones included (not verified).
+  - Since `SessionStart`, `Stop` and `StopFailure` are hooked too, a nested session that gets through costs more than before: every time it starts, its `SessionStart` rewrites the pane map with the mark (the popup follows it) and redraws the tree for its own session, usually clearing the main session's lines. Before, only its sub agent events got through.
 - The `sh` at the start of the hook command is looked up by Claude Code through your `PATH` before `bin/run.sh` runs, so the `PATH` cleanup in `bin/run.sh` does not cover it.
 - `●` and `─` are ambiguous width characters; their actual width depends on the terminal settings.
 
@@ -117,8 +165,15 @@ Under `hooks` in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` (other settings
     ]
   }
 ],
-"SubagentStop": [ same as above ]
+"SubagentStop": [ same as above ],
+"SessionStart": [ same as above ],
+"Stop": [ same as above ],
+"StopFailure": [ same as above ]
 ```
+
+No `matcher`, so `SessionStart` runs for every `source` and `StopFailure` for every error type. If you already have your own `SessionStart` / `Stop` / `StopFailure` hooks, this entry is added after them and they are left as they are.
+
+Upgrading from a version that only added `SubagentStart` / `SubagentStop`: run setup again. Each event is checked on its own, so the three missing ones are added and the existing two are left as they are (`unchanged`), never added twice; the same goes for any other mix of events already there. Until then everything works as before: the popup uses the older session lookup and a sub agent row goes away only with its `SubagentStop`.
 
 `<plugin dir>` is the absolute path of the plugin when setup runs (the managed checkout from `herdr plugin install`, or the folder given to `herdr plugin link`). node is not written into the command; `bin/run.sh` looks it up every time.
 
@@ -164,7 +219,7 @@ Older versions of setup also wrote `rules = [{ contains = "✓", bold = false }]
 ## How to remove
 
 1. Run `herdr plugin action invoke subagent.watch.remove` (or `sh bin/run.sh scripts/setup.mjs --remove`): it removes this plugin's hooks from `settings.json` (recognized as described in "What setup adds") and the content between the markers in `config.toml`, then runs `herdr server reload-config`.
-2. Settings added by hand without markers have to be removed yourself: in `settings.json`, delete the entry whose `command` points at `sidebar-hook.mjs` (if the array becomes empty, remove the whole key); in `config.toml`, delete the `[[keys.command]]` block for `prefix+.` and `$sub1`…`$sub5` from the `claude` rows, then run `herdr server reload-config`.
+2. Settings added by hand without markers have to be removed yourself: in `settings.json`, delete the entries whose `command` points at `sidebar-hook.mjs` under `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` (if an array becomes empty, remove the whole key); in `config.toml`, delete the `[[keys.command]]` block for `prefix+.` and `$sub1`…`$sub5` from the `claude` rows, then run `herdr server reload-config`.
 3. Clear tokens left on panes (run once for each pane that has claude):
 
    ```
@@ -180,4 +235,4 @@ Older versions of setup also wrote `rules = [{ contains = "✓", bold = false }]
 node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-Covers payload parsing, state updates (stop removes the entry, a stop without a seen start is skipped, old `done` entries are dropped), tree lines (start two → stop one leaves `└─` → stop all clears everything, `+N more` counts only running ones, 80-character truncation, bidi and zero-width characters removed), increasing seq, staying silent outside herdr, falling back to herdr on `PATH` when `HERDR_BIN_PATH` is missing (relative `PATH` entries excluded), `bin/run.sh` running no tool from a relative `PATH` entry, deciding the pane session (one `claude` ancestor updates even when herdr reports a stale `agent_session`, a wrapper named claude still updates, a nested `claude -p` is skipped unless herdr reports its session, tested with a real process tree), the state folder checks (symlink, mode, owner, planted symlinks), the lock (stale detection, taking over or releasing without removing someone else's fresh lock, even one that got the same inode, several hooks racing for one stale lock lose no data), no data loss with parallel starts, and running the script for real with a fake herdr executable (checking exit 0, empty stdout, and finishing within 1 second).
+Covers payload parsing (including the real `SessionStart` startup / resume and `Stop` payloads), state updates (stop removes the entry, a stop without a seen start is skipped, old `done` entries are dropped), `SessionStart` (pane map mark, the mark kept by sub agent events of the same session and dropped for another session, the tree redrawn or cleared when the session changes), `Stop` and `StopFailure` (never write the pane map, call herdr only when something was removed; `StopFailure` with the documented payload removes a sub agent stopped by an API error and goes through the same nested `claude` check), removing sub agents that ended without `SubagentStop` (the real API error and interrupted transcript tails, the viewer rules, only the last real entry counting, removal only after 2 minutes without writes, end signals from before a resume not counting with no tolerance, a resume replacing the start time, the review's E2E timeline where a resume within 2 seconds of the previous end is kept, task notifications counted by their `enqueue` time and ignored after a new instruction, a sub agent without an end signal kept however long it is silent, the 2-minute rule for a missing transcript, only the last 64 KB read, a planted FIFO not waited on, the time budget, every transcript read before the lock is taken, only entries that no other hook changed in between removed, a `Stop` with nothing to remove not taking the lock), tree lines (start two → stop one leaves `└─` → stop all clears everything, `+N more` counts only running ones, 80-character truncation, bidi and zero-width characters removed), increasing seq, staying silent outside herdr, falling back to herdr on `PATH` when `HERDR_BIN_PATH` is missing (relative `PATH` entries excluded), `bin/run.sh` running no tool from a relative `PATH` entry, deciding the pane session (one `claude` ancestor updates even when herdr reports a stale `agent_session`, a wrapper named claude still updates, a nested `claude -p` is skipped unless herdr reports its session, tested with a real process tree), the state folder checks (symlink, mode, owner, planted symlinks), the lock (stale detection, taking over or releasing without removing someone else's fresh lock, even one that got the same inode, several hooks racing for one stale lock lose no data), no data loss with parallel starts, the overall budget staying at most half of the `settings.json` timeout, and running the script for real with a fake herdr executable (checking exit 0, empty stdout, and finishing within 1 second).

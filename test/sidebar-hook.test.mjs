@@ -39,7 +39,9 @@ import {
   readProcessInfo,
   runHook,
   sanitizeText,
+  totalBudgetMs,
 } from '../hooks/sidebar-hook.mjs';
+import { hookTimeoutSeconds } from '../lib/setup-claude.mjs';
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const hookScriptPath = join(testDirectory, '..', 'hooks', 'sidebar-hook.mjs');
@@ -144,10 +146,11 @@ describe('applyEvent', () => {
     assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
   });
 
-  test('a repeated start without stop keeps one entry and its original start time', () => {
+  // resume 時上一輪的 stop 沒記到：啟動時間沿用舊的話，上一輪的結束訊號會被當成這一輪的，正在跑的 sub 被清掉
+  test('a repeated start without stop (a resume whose stop was missed) keeps one entry with the new start time', () => {
     let state = applyEvent(createEmptySessionState('session'), startEvent, 1000).state;
     state = applyEvent(state, startEvent, 3000).state;
-    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 1000, 'general-purpose')]);
+    assert.deepEqual(state.subagents, [subagent('a12e8c491ce2f7f4a', 3000, 'general-purpose')]);
   });
 });
 
@@ -301,6 +304,8 @@ describe('runHook', () => {
       isExecutable: () => true,
       queryPaneAgentSession: () => ({ agent: 'claude', sessionId: startPayload.session_id }),
       countClaudeAncestors: () => 1,
+      // fixture 的 transcript_path 是實測時的真實路徑，開發機上可能真的存在：這組測試不看 transcript，清除死掉 sub 的規則另有測試
+      readFileTail: () => ({ isMissing: true }),
       deadlineMs: Number.POSITIVE_INFINITY,
       ...overrides,
     };
@@ -566,6 +571,12 @@ describe('hook script as Claude Code runs it', () => {
     };
     return { runtimeDirectory, callLogPath, environment };
   }
+
+  // 預算從 main() 開始算，不含 node 啟動；很忙時實測最慢約預算再加 0.5 秒。至少留一半給這些，才不會碰到 Claude Code 的 timeout
+  test('the time budget stays at most half of the hook timeout in settings.json', () => {
+    assert.ok(totalBudgetMs > 0);
+    assert.ok(totalBudgetMs * 2 <= hookTimeoutSeconds * 1000, `budget ${totalBudgetMs}ms, timeout ${hookTimeoutSeconds}s`);
+  });
 
   test('outside herdr: exit 0, no output, nothing written, under 1 second', () => {
     const runtimeDirectory = createTemporaryDirectory();

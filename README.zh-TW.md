@@ -2,9 +2,9 @@
 
 [English](README.md) | 繁體中文
 
-herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出還在跑的 sub agent（見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)）。側邊欄不留歷程，sub 一結束那一行就消失；結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。純 Node 內建模組，不需要 `npm install`。
+herdr plugin `subagent.watch`：用 popup 即時顯示「從哪個 Claude Code pane 開的，就看那個 session 的 sub agent 在做什麼」，另外在 herdr 側邊欄 claude 那一列底下列出還在跑的 sub agent（見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)）。側邊欄不留歷程，sub 一結束那一行就消失；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，在它最後一次寫入 2 分鐘後的下一次 hook 事件拿掉（例如主 session 下一次回合結束的 `Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`），這只是安全網：沒有結束訊號的 sub（或 resume 後新一輪還沒寫紀錄的）不管多久沒寫入都留著；pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的樹。結束的 sub 和它做過的事在 popup 看（結束的 tab 會留著）。純 Node 內建模組，不需要 `npm install`。
 
-- **只支援 Claude Code**：讀的是 Claude Code 的 transcript 與 `SubagentStart`／`SubagentStop` hook，其他 agent 的 pane 會顯示 `This pane is not running Claude Code (detected: <agent>)`。
+- **只支援 Claude Code**：讀的是 Claude Code 的 transcript 與 `SessionStart`／`SubagentStart`／`SubagentStop`／`Stop`／`StopFailure` hook，其他 agent 的 pane 會顯示 `This pane is not running Claude Code (detected: <agent>)`。
 - 需求：herdr ≥ 0.9.3、Node.js ≥ 22、Linux（sidebar hook 靠 `/proc` 與 `XDG_RUNTIME_DIR`）。
 - 不寫死任何路徑、帳號或顏色：node 由 `bin/run.sh` 找，herdr 用 `HERDR_BIN_PATH`（沒有就找 PATH 上的 `herdr`），Claude Code 設定照 `CLAUDE_CONFIG_DIR`，顏色只用 terminal theme 的 ANSI 16 色。
 
@@ -21,9 +21,10 @@ herdr plugin action invoke subagent.watch.setup
 
 `subagent.watch.setup` 會改兩個使用者自己的設定檔，結果用 herdr 通知顯示，細節（包含要手動貼的片段）在 `herdr plugin log list --plugin subagent.watch`：
 
-1. Claude Code：`${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks.SubagentStart`、`hooks.SubagentStop` 各加一筆 `sh "<plugin 目錄>/bin/run.sh" "<plugin 目錄>/hooks/sidebar-hook.mjs"`（timeout 5 秒）。
+1. Claude Code：`${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks.SubagentStart`、`hooks.SubagentStop`、`hooks.SessionStart`、`hooks.Stop`、`hooks.StopFailure` 各加一筆，五個都是同一個 command：`sh "<plugin 目錄>/bin/run.sh" "<plugin 目錄>/hooks/sidebar-hook.mjs"`（timeout 5 秒）。
    - 本 plugin 之前加的 hook（plugin 目錄換過也算），或手動加的舊寫法 `<node 絕對路徑> <絕對路徑>/hooks/sidebar-hook.mjs`，會原地換成新的寫法，不重複加；別的工具的 hook 只是檔名剛好叫 `sidebar-hook.mjs` 不算。
-   - 其他 hook 一個都不動。
+   - 其他 hook 一個都不動；你自己的 `SessionStart`／`Stop`／`StopFailure` hook 留著，本 plugin 的加在它們後面。
+   - **用舊版 setup 過**（只有 `SubagentStart`／`SubagentStop`）：再跑一次 setup，會補上 `SessionStart`、`Stop` 與 `StopFailure`，原本的兩個不動。每個 event 各自檢查，缺哪個補哪個，不會重複。補上之前 popup 照舊版的方式找 session，側邊欄的 sub 也只有收到 `SubagentStop` 才拿掉。已經在跑的 Claude Code session 要等它下一次 `SessionStart`（重開、`/resume`、`/clear` 或 compaction）才會寫 session 對照。
 2. herdr：`$HERDR_CONFIG_PATH`，沒設就是 `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml`。加的內容都包在 `# >>> subagent.watch` ／ `# <<< subagent.watch` 之間。
    - 快捷鍵：沒有任何東西用 `prefix+.` 才加 `[[keys.command]]`；已被別的動作佔用就跳過，log 裡附上可以改成別的鍵的片段。
    - 側邊欄：沒有 `[ui.sidebar.agents.rows_by_agent]` 就整段加上；有這個表但沒有 `claude =` 就插在表頭下一行；已經有自己的 `claude =` 而且沒有 `$sub1` 就不動，log 裡附上要自己貼進去的五行。
@@ -124,10 +125,12 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 這兩種「不是 Claude Code」的情況不會去猜 session；viewer 每 2 秒重問一次，之後在同一個 pane 開 Claude Code 會自動接上。
 
 1. **herdr**：`agent_session`（herdr 的 claude integration 會回報，實測 `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`）。用 session id 在 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/` 找 `<session-id>.jsonl`。herdr 的回報可能過期：實測 herdr server 重啟後，在同一個 pane 開新的 Claude Code，herdr 仍回報重啟前的 session（原因未知）。
-2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。只在 `SubagentStart`／`SubagentStop` 時寫，`/resume` 或重開 `claude` 之後、開下一個 sub 之前都指向上一個 session。
+2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。hook 在 `SessionStart` 時就寫，所以 session 一開始、resume 或 clear 之後就指向這個 pane 現在的 session，檔案裡另外帶 `sessionStartSource` 當標記（同一個 session 的 sub 事件重寫時會留著）。沒有標記的（只在 `SubagentStart`／`SubagentStop` 時寫：舊版 setup 還沒重跑，或加 hook 之前就開的 session）在開下一個 sub 之前可能還指向上一個 session。
 3. **猜**（herdr 和 pane map 都沒有 session 時才用）：用 pane 的 cwd 對到 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd 的 / 換成 ->/`，取最新修改的 `<session-id>.jsonl`。底部分隔線會標 `(guessed: latest session)`：同一個資料夾開多個 Claude Code 時可能猜錯。`/var/home/...` 與 `/home/...` 兩種寫法都會試（Fedora Atomic 的 home 在 `/var/home`）；另外也試把所有非英數字元換成 `-` 的寫法（未驗證 Claude Code 是否這樣編碼含 `.` 的路徑）。
 
-前兩個都可能過期，所以不固定哪一個優先。viewer 還沒有 session（或畫面上的 transcript 被刪掉）時，取 transcript 存在、而且最近寫入的那個 session（同時間取 herdr 的）：兩個都是這個 pane 專屬的，過期的值通常指向已經沒人在寫的舊 session。兩邊說的 session 不同時，底部分隔線會多一段 `herdr says session <id>, pane map says <id>`。兩個的 transcript 都還不存在時（session 剛開、還沒寫任何東西），等 herdr 回報的 session 出現（herdr 沒有就等 pane map 的），不會退回去猜。
+**帶標記、而且 transcript 存在的 pane map 直接用**：不跟 herdr 比、不看寫入時間，pane map 改指別的 session 時 popup 就換過去（herdr 說法不同時，底部分隔線照樣標出 `herdr says session <id>, pane map says <id>`）。新 session 剛開時 transcript 還不存在（Claude Code 2.1.296 實測：第一個 prompt 之後才寫出來），出現之前照下面的規則。
+
+沒有標記時，前兩個都可能過期，所以不固定哪一個優先。viewer 還沒有 session（或畫面上的 transcript 被刪掉）時，取 transcript 存在、而且最近寫入的那個 session（同時間取 herdr 的）：兩個都是這個 pane 專屬的，過期的值通常指向已經沒人在寫的舊 session。兩邊說的 session 不同時，底部分隔線會多一段 `herdr says session <id>, pane map says <id>`。兩個的 transcript 都還不存在時（session 剛開、還沒寫任何東西），等 herdr 回報的 session 出現（herdr 沒有就等 pane map 的），不會退回去猜。
 
 問不到 herdr（找不到 herdr、`herdr pane get` 失敗）時，猜之前只剩 pane map；完全沒有 pane id 時跳過 pane map，只能用猜的（3）。都找不到時顯示 `No Claude Code session found for this pane` 和每一步失敗的原因。
 
@@ -182,8 +185,9 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
 
 ## 已知限制
 
-- 開了新 session 之後 popup 還停在上一個 session：herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它。之後只有 herdr 或 pane map 回報的 session 跟它上一次回報的不同、或畫面上的 transcript 被刪掉，才會換（見「怎麼找到 pane 對應的 session」）。
-- popup 停在較舊的 session：popup 開著時，照上面的規則有兩種情況會這樣：
+- 開了新 session 之後 popup 還停在上一個 session：有 `SessionStart` hook 時，只會持續到新 session 的 transcript 出現（實測在第一個 prompt 之後）。沒有的話（舊版 setup 還沒重跑，或加 hook 之前就開的 session），herdr 與 pane map 都過期時（herdr 停在舊值、新 session 還沒開過 sub），要等第一個 sub 開始、hook 更新 pane map 才會換過去。popup 第一次選 session 時比的是寫入時間：過期的值若指向別的 pane 正在寫的 session，可能選到它。之後只有 herdr 或 pane map 回報的 session 跟它上一次回報的不同、或畫面上的 transcript 被刪掉，才會換（見「怎麼找到 pane 對應的 session」）。
+- popup 換到從這個 pane 跑的 `claude -p`：只有 hook 分不出來的巢狀 `claude -p` 會這樣（見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md#已知限制) 的已知限制）。它的 `SessionStart` 會寫帶標記的 pane map，popup 跟著它走，直到這個 pane 自己的 session 再寫一次 pane map（下一次 sub 事件或 `SessionStart`）。
+- popup 停在較舊的 session：只發生在 pane map 沒有 `SessionStart` 標記時。popup 開著時，照上面的規則有兩種情況會這樣：
   - herdr 的回報變回較舊的 session（例：herdr server 重啟後還原舊值）。這算值變了，popup 不比寫入時間就換過去，之後停在那裡，直到 herdr 或 pane map 回報跟上一次不同的 session。viewer 能不能撐過 herdr server 重啟未驗證。
   - herdr 或 pane map 第一次回報 session（例：popup 開啟時還沒有 pane map 檔，之後開 sub 時 hook 才寫入；或 herdr 一開始失敗、後來恢復），而別的 pane 剛好把舊 session 的 transcript 寫得一樣晚或更晚：popup 停在舊 session，之後這個來源不會再比寫入時間。
   - 兩種情況關掉 popup 再開，都會跟第一次開啟一樣照寫入時間重新選擇。

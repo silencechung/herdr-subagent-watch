@@ -1,5 +1,6 @@
-// Claude Code SubagentStart／SubagentStop hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer）。
-// 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、1 秒內結束。
+// Claude Code SessionStart／SubagentStart／SubagentStop／Stop／StopFailure hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer），
+// 並寫 pane 對照檔給 popup viewer。
+// 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、在 totalBudgetMs 內結束。
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
@@ -11,6 +12,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -18,20 +20,49 @@ import {
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isExecutableFile, resolveHerdrBinPath } from '../lib/herdr.mjs';
+import { applyMeta, applyRecord, createSubAgentState, getSubAgentStatus } from '../lib/subagent-state.mjs';
+import { parseJsonLine, parseTaskNotifications, parseTimestampMs } from '../lib/transcript.mjs';
 
 export const metadataSource = 'subagent.watch';
 export const maximumTreeLines = 5;
 export const maximumTokenLength = 80;
 export const runningIcon = '●';
 
-// 加上 node 啟動與 herdr 最低預算後仍要在 1 秒內結束
-const totalBudgetMs = 800;
+// Stop 每回合都會觸發，transcript 可能上百 MB：判斷 sub 結束只需要最後幾筆，只讀尾端
+export const transcriptTailBytes = 64 * 1024;
+// transcript 還不存在的 sub 先留著：SubagentStart 觸發時 sub 可能還沒寫出第一行，超過這段時間仍不存在才當成沒有成功啟動
+export const missingTranscriptGraceMs = 2 * 60 * 1000;
+// 清除只是 SubagentStop 漏掉時的安全網：看到結束訊號之後，最後一筆紀錄與 transcript mtime 都要過了這麼久才清。
+// resume（SendMessage）會觸發新的 SubagentStart，但新一輪寫出第一筆紀錄之前，transcript 尾端還是上一輪的結束訊號（review 的 E2E：上一輪結束約 2 秒後就 resume）。
+// 本機 21 次 resume：SendMessage 到新一輪第一筆紀錄最多約 5 秒、到第一筆 assistant 回應最多約 10 秒。
+// 用本機 210 個 sub（231 輪）的真實時間軸模擬：舊規則（訊號不早於 SubagentStart 前 2 秒就清）誤刪 4 次，這個規則 0 次；代價是漏掉 SubagentStop 的 sub 要等 2 分鐘後的下一次 hook 才拿掉
+export const quietAfterEndSignalMs = 2 * 60 * 1000;
+const maximumMetaBytes = 64 * 1024;
+const interruptedMessagePrefix = '[Request interrupted by user';
+const sessionEventNames = new Set(['SessionStart', 'Stop', 'StopFailure']);
+const subagentEventNames = new Set(['SubagentStart', 'SubagentStop']);
+// 官方文件：回合因 API 錯誤結束時不觸發 Stop、改觸發 StopFailure。兩個都只清死掉的 sub 與重畫，不寫對照檔；
+// 不接 StopFailure 的話，額度用完的那一回合留下的 sub 要等到這個 session 下一次 hook 事件才拿掉
+const pruneOnlyEventNames = new Set(['Stop', 'StopFailure']);
+// 官方文件列的 source：startup、resume、clear、compact、fork；認不得的記成 unknown，標記照樣成立
+const sessionStartSourcePattern = /^[a-z_]{1,32}$/;
+
+// 整體時間上限，從 main() 開始算（不含 node 啟動）。平常碰不到：實測 8 個 hook 同時觸發（真實 transcript、假 herdr 每次 30 ms、跑 20 輪）總時間中位數約 220 ms，跟預算大小無關。
+// 只有機器很忙、搶 lock 時才會等到上限：鎖在 1 個 CPU、旁邊有 6 個吃滿 CPU 的 process 時，800 ms 的預算 160 次更新掉了約 70 次（lock-timeout），
+// 1500 ms 只掉 1 次，最慢的 hook 約 2.0 秒。漏掉的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄，比很忙時多等 1 秒嚴重。
+// 上限要離 settings.json 的 hook timeout（hookTimeoutSeconds，5 秒）夠遠：最慢的 2.0 秒還差 3 秒；測試檢查預算不超過 timeout 的一半
+export const totalBudgetMs = 1500;
 const minimumHerdrBudgetMs = 100;
 const maximumPaneQueryMs = 300;
+// lock 外判斷 sub 是否結束最多用這麼久，剩下的 sub 留到下一次事件：判斷拖太久的話，這次事件自己的更新反而等不到 lock。
+// 實測 5 個 sub、真實大小 transcript：單獨跑約 10 ms，8 個 hook 同時跑最多約 22 ms。8 個擠在 1 個 CPU 上、旁邊還有 4 個吃滿 CPU 的 process 時，
+// 每個 hook 都會碰到上限，大家同時判斷、搶 CPU，拿 lock 跟著變慢：上限 200 ms 時 640 次更新掉了 5 次（lock-timeout），100 ms 時 640 次都沒掉
+export const maximumPruneMs = 100;
 const lockRetryIntervalMs = 10;
-// 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的
+// 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的。
+// 空 lock 只有舊版 hook 會建（它的預算是 800 ms），現在的 lock 都有 pid、走 isLockOwnerGone，所以不用跟著 totalBudgetMs 調
 const staleLockMs = 2000;
-// hook 整體預算不到 1 秒，超過這個年紀的 lock 不可能還有人在用；pid 查不準時（例如不同 pid namespace）的保險
+// hook 整體預算 1.5 秒（很忙時實測最慢約 2 秒），超過這個年紀的 lock 不可能還有人在用；pid 查不準時（例如不同 pid namespace）的保險
 const maximumLockAgeMs = 10_000;
 const maximumAncestorDepth = 64;
 const safeIdentifierPattern = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -50,6 +81,10 @@ export function sanitizeText(value) {
   return value.replace(invisibleCharacterPattern, '').trim();
 }
 
+function normalizeSessionStartSource(value) {
+  return typeof value === 'string' && sessionStartSourcePattern.test(value) ? value : 'unknown';
+}
+
 export function parseHookPayload(rawInput) {
   let payload;
   try {
@@ -61,10 +96,27 @@ export function parseHookPayload(rawInput) {
     return null;
   }
   const eventName = payload.hook_event_name;
-  if (eventName !== 'SubagentStart' && eventName !== 'SubagentStop') {
+  const isSessionEvent = sessionEventNames.has(eventName);
+  if (!isSessionEvent && !subagentEventNames.has(eventName)) {
     return null;
   }
-  if (!isSafeIdentifier(payload.session_id) || !isSafeIdentifier(payload.agent_id)) {
+  if (!isSafeIdentifier(payload.session_id)) {
+    return null;
+  }
+  // SessionStart／Stop／StopFailure 是整個 session 的事件，沒有 agent_id；`claude --agent <name>` 的 SessionStart 帶的 agent_type 是主 session 的 agent，不是 sub。
+  // StopFailure 的 error 欄位（rate_limit 等）用不到：不管哪種錯誤都一樣檢查
+  if (isSessionEvent) {
+    return {
+      eventName,
+      sessionId: payload.session_id,
+      agentId: null,
+      agentType: null,
+      transcriptPath: typeof payload.transcript_path === 'string' ? payload.transcript_path : '',
+      cwd: typeof payload.cwd === 'string' ? payload.cwd : '',
+      source: eventName === 'SessionStart' ? normalizeSessionStartSource(payload.source) : null,
+    };
+  }
+  if (!isSafeIdentifier(payload.agent_id)) {
     return null;
   }
   const agentType = sanitizeText(payload.agent_type);
@@ -107,11 +159,15 @@ export function normalizeSessionState(candidate, sessionId) {
 
 // 狀態檔只記跑中的 sub：stop 直接移除，檔案大小只跟同時跑的數量有關
 export function applyEvent(state, event, nowMs) {
+  if (event.agentId === null) {
+    return { changed: false, state };
+  }
   const existing = state.subagents.find((subagent) => subagent.id === event.agentId);
   if (event.eventName === 'SubagentStart') {
-    // 同一個 sub 還在清單裡又收到 start（例如前一次的 stop 因 lock 逾時沒記到）：只留一筆，保留原本的啟動順序
+    // 同一個 sub 還在清單裡又收到 start（resume 時上一輪的 stop 沒記到，例如 lock 逾時）：只留一筆，啟動時間換成這一次的。
+    // 沿用舊的話，上一輪的結束訊號會晚於啟動時間，正在跑的這一輪會被當成已經結束
     const others = state.subagents.filter((subagent) => subagent.id !== event.agentId);
-    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: existing?.startedAtMs ?? nowMs };
+    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: nowMs };
     return { changed: true, state: { ...state, subagents: [...others, started] } };
   }
   // 沒看過 start 的 stop 不收：可能是內部 agent，或 hook 安裝前就啟動的 sub
@@ -120,6 +176,269 @@ export function applyEvent(state, event, nowMs) {
   }
   const subagents = state.subagents.filter((subagent) => subagent.id !== event.agentId);
   return { changed: true, state: { ...state, subagents } };
+}
+
+// 對照檔合約（viewer 讀）：sessionId、transcriptPath、cwd、updatedAtMs 四個欄位不准改；
+// sessionStartSource 只在這個 session 的 SessionStart 寫過對照檔時出現，viewer 看到它就信這份對照檔（見 lib/session.mjs）。
+// 同一個 session 的 sub 事件重寫時要留著；換成別的 session 就不能帶過去，那個 session 的 SessionStart 不一定有收到
+export function buildPaneMap(event, previousPaneMap, nowMs) {
+  const paneMap = {
+    sessionId: event.sessionId,
+    transcriptPath: event.transcriptPath,
+    cwd: event.cwd,
+    updatedAtMs: nowMs,
+  };
+  let sessionStartSource = null;
+  if (event.eventName === 'SessionStart') {
+    sessionStartSource = event.source;
+  } else if (previousPaneMap?.sessionId === event.sessionId) {
+    sessionStartSource = previousPaneMap.sessionStartSource;
+  }
+  if (typeof sessionStartSource === 'string' && sessionStartSourcePattern.test(sessionStartSource)) {
+    paneMap.sessionStartSource = sessionStartSource;
+  }
+  return paneMap;
+}
+
+// 回傳 { isMissing: true }、{ isMissing: false, text, isTruncated, modifiedMs }，或 null（讀不了，不知道狀況）。
+// O_NONBLOCK：路徑上若是 FIFO，一般的 open 會卡住等寫入端，hook 就超過時間預算
+export function readFileTail(filePath, maximumBytes) {
+  let descriptor;
+  try {
+    descriptor = openSync(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    return error.code === 'ENOENT' ? { isMissing: true } : null;
+  }
+  try {
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile()) {
+      return null;
+    }
+    const length = Math.min(stats.size, maximumBytes);
+    const start = stats.size - length;
+    const buffer = Buffer.alloc(length);
+    let bytesRead = 0;
+    while (bytesRead < length) {
+      const count = readSync(descriptor, buffer, bytesRead, length - bytesRead, start + bytesRead);
+      if (count === 0) {
+        break;
+      }
+      bytesRead += count;
+    }
+    return { isMissing: false, text: buffer.subarray(0, bytesRead).toString('utf8'), isTruncated: start > 0, modifiedMs: stats.mtimeMs };
+  } catch {
+    return null;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+// 從中間開始讀的話第一行是半截的，丟掉；最後一行若還在寫（沒有換行），parseJsonLine 解不出來自然略過
+function parseTailRecords(tail) {
+  const lines = tail.text.split('\n');
+  if (tail.isTruncated) {
+    lines.shift();
+  }
+  return lines.map(parseJsonLine).filter((record) => record !== null);
+}
+
+function isInterruptedMessage(record) {
+  const content = record.message?.content;
+  if (typeof content === 'string') {
+    return content.startsWith(interruptedMessagePrefix);
+  }
+  return Array.isArray(content) && content.some((part) => {
+    return part?.type === 'text' && typeof part.text === 'string' && part.text.startsWith(interruptedMessagePrefix);
+  });
+}
+
+function isToolResultOnly(record, toolUseIds = null) {
+  const content = record.message?.content;
+  return record.type === 'user' && Array.isArray(content) && content.length > 0 && content.every((part) => {
+    return part?.type === 'tool_result' && (toolUseIds === null || toolUseIds.has(part.tool_use_id));
+  });
+}
+
+function findLatestTimestampMs(records) {
+  let latestMs = null;
+  for (const record of records) {
+    const timestampMs = parseTimestampMs(record.timestamp);
+    if (timestampMs !== null && (latestMs === null || timestampMs > latestMs)) {
+      latestMs = timestampMs;
+    }
+  }
+  return latestMs;
+}
+
+// 最後一筆 assistant 是 SubagentHandback 或非背景 sub 的 end_turn（沿用 viewer 的 lib/subagent-state.mjs）：
+// 之後只能接它自己 tool_use 的 tool_result（SubagentHandback 那一筆），有別的紀錄就代表 sub 還在動
+function findTurnEndSignal(messages, meta) {
+  const assistantIndex = messages.findLastIndex((record) => record.type === 'assistant');
+  if (assistantIndex === -1) {
+    return null;
+  }
+  const assistant = messages[assistantIndex];
+  const parts = Array.isArray(assistant.message?.content) ? assistant.message.content : [];
+  const toolUseIds = new Set(parts.filter((part) => part?.type === 'tool_use').map((part) => part.id));
+  if (!messages.slice(assistantIndex + 1).every((record) => isToolResultOnly(record, toolUseIds))) {
+    return null;
+  }
+  const state = createSubAgentState({ agentId: 'tail', discoveredAtMs: 0 });
+  applyMeta(state, meta);
+  applyRecord(state, assistant);
+  // state.lastWriteMs 留 null，不用 viewer 的 10 分鐘 stale：沒有結束訊號的 sub 一律留著
+  const status = getSubAgentStatus(state, 0);
+  return status.isDone ? { atMs: status.atMs, reason: status.reason } : null;
+}
+
+// 最後一筆有效紀錄（user／assistant）是不是結束訊號，是的話回傳 { atMs, reason }：
+// 1. main transcript 的 task-notification（completed／killed／failed），時間不早於最後一筆有效紀錄；
+//    最後一筆是新送進來的指令（不是 tool_result 的 user）時不信：resume 送進來的指令之後 sub 會繼續跑，通知是上一輪的
+// 2. 最後一筆是 API 錯誤（isApiErrorMessage）：本機 3 個遇到 API 錯誤的 sub 都停在這一筆，之後沒有任何紀錄；
+//    其中一個額度用完的，側邊欄一直沒收到它的 SubagentStop（Claude Code 為什麼沒觸發未驗證）
+// 3. 最後一筆是 `[Request interrupted by user…]`：本機 3 個被中斷的背景 sub 都停在這一行，main transcript 同一刻記 killed
+// 4. SubagentHandback、非背景 sub 的 end_turn（findTurnEndSignal）
+function findEndSignal(records, meta, notification) {
+  const messages = records.filter((record) => record.type === 'user' || record.type === 'assistant');
+  const lastMessage = messages.at(-1);
+  const lastMessageMs = parseTimestampMs(lastMessage?.timestamp);
+  if (lastMessageMs === null) {
+    return null;
+  }
+  const isNewPrompt = lastMessage.type === 'user' && !isToolResultOnly(lastMessage);
+  if (notification !== null && notification.timestampMs !== null && notification.timestampMs >= lastMessageMs && !isNewPrompt) {
+    return { atMs: notification.timestampMs, reason: notification.status };
+  }
+  if (lastMessage.type === 'assistant' && lastMessage.isApiErrorMessage === true) {
+    return { atMs: lastMessageMs, reason: 'api_error' };
+  }
+  if (lastMessage.type === 'user' && isInterruptedMessage(lastMessage)) {
+    return { atMs: lastMessageMs, reason: 'interrupted' };
+  }
+  return findTurnEndSignal(messages, meta);
+}
+
+// 回傳結束原因，還在跑（或判斷不了）回傳 null。records 是 sub transcript 尾端解出來的紀錄，lastWriteMs 是 transcript 的 mtime。
+// 只當 SubagentStop 漏掉時的安全網，三個條件都成立才算結束：
+// 1. 最後一筆有效紀錄是結束訊號（findEndSignal）
+// 2. 訊號不早於這一輪的 SubagentStart（startedAtMs，不留誤差）：resume 的 sub 在寫出新紀錄之前，尾端還是上一輪的結束訊號
+// 3. 最後一筆紀錄、transcript mtime、訊號本身都已經過了 quietAfterEndSignalMs：resume 後新一輪還沒寫紀錄的那幾秒不會被清
+// 沒有結束訊號就一直留著。舊版另有「60 分鐘沒寫入就清」，但本機 2 個 sub 在同一輪內 7 小時、23 小時沒寫入之後繼續跑（推測是電腦睡眠，未驗證），會被誤刪
+export function detectSubagentEnd({ startedAtMs, records, meta = null, notification = null, lastWriteMs, nowMs }) {
+  const signal = findEndSignal(records, meta, notification);
+  const startMs = Number.isFinite(startedAtMs) ? startedAtMs : 0;
+  if (signal === null || signal.atMs < startMs) {
+    return null;
+  }
+  const lastActivityMs = Math.max(signal.atMs, findLatestTimestampMs(records) ?? signal.atMs, Number.isFinite(lastWriteMs) ? lastWriteMs : signal.atMs);
+  return nowMs - lastActivityMs >= quietAfterEndSignalMs ? signal.reason : null;
+}
+
+function readSmallJsonFile(filePath, maximumBytes, readTail) {
+  const file = readTail(filePath, maximumBytes);
+  if (file === null || file.isMissing || file.isTruncated) {
+    return null;
+  }
+  return parseJsonLine(file.text);
+}
+
+function collectTaskNotifications(mainTail) {
+  const latestByAgentId = new Map();
+  if (mainTail === null || mainTail.isMissing) {
+    return latestByAgentId;
+  }
+  const lines = mainTail.text.split('\n');
+  if (mainTail.isTruncated) {
+    lines.shift();
+  }
+  for (const line of lines) {
+    const parsed = parseTaskNotifications(line);
+    // 只取 enqueue（通知產生的時間）。remove 是主 session 把通知出列的時間，可能晚於 resume 或 sub 之後的紀錄：
+    // 本機一個 sub 在 SubagentHandback 之後因排隊訊息繼續跑 Bash，那則通知的出列時間比當時最後一筆紀錄晚，會被當成新的結束訊號
+    if (parsed.length === 0 || parseJsonLine(line)?.operation !== 'enqueue') {
+      continue;
+    }
+    for (const notification of parsed) {
+      const previous = latestByAgentId.get(notification.agentId);
+      if (previous === undefined || (notification.timestampMs ?? 0) >= (previous.timestampMs ?? 0)) {
+        latestByAgentId.set(notification.agentId, notification);
+      }
+    }
+  }
+  return latestByAgentId;
+}
+
+// 只靠 SubagentStop 移除的話，因 API 錯誤中斷的 sub 沒收到 SubagentStop（實際發生過，原因未驗證）就會一直卡在側邊欄。每次 hook 觸發時檢查這個 session 每個 sub 的 transcript 尾端。
+// sub transcript 在 `<main transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`；main transcript 路徑不像樣或不存在時不判斷（路徑可能對不上，寧可留著）。
+// 只讀檔、不改狀態，回傳判斷為已結束的 sub（含判斷當下的 startedAtMs）：runHook 在 lock 外呼叫，讀 transcript 的時間不算進持有 lock 的時間
+export function findEndedSubagents(state, event, { nowMs, readTail = readFileTail, hasTimeLeft = () => true }) {
+  const mainTranscriptPath = event.transcriptPath;
+  if (state.subagents.length === 0 || !isAbsolute(mainTranscriptPath) || !mainTranscriptPath.endsWith('.jsonl')) {
+    return [];
+  }
+  const mainTail = readTail(mainTranscriptPath, transcriptTailBytes);
+  if (mainTail === null || mainTail.isMissing) {
+    return [];
+  }
+  const notifications = collectTaskNotifications(mainTail);
+  const subagentsDirectory = join(mainTranscriptPath.slice(0, -'.jsonl'.length), 'subagents');
+  const ended = [];
+  for (const subagent of state.subagents) {
+    // 這次事件的 sub 不判斷：SubagentStart 的（可能是 resume）transcript 還停在上一輪；SubagentStop 的本來就會被 applyEvent 拿掉，不用多讀一次
+    if (subagent.id === event.agentId || !isSafeIdentifier(subagent.id)) {
+      continue;
+    }
+    if (!hasTimeLeft()) {
+      break;
+    }
+    const reason = judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, readTail });
+    if (reason !== null) {
+      ended.push({ id: subagent.id, startedAtMs: subagent.startedAtMs, reason });
+    }
+  }
+  return ended;
+}
+
+// lock 內呼叫，不讀任何檔案。判斷之後、拿到 lock 之前，別的 hook 可能已經改過狀態檔：
+// 已經不在的不用拿；startedAtMs 不一樣的是被拿掉後又重新 SubagentStart（resume）的新一輪，判斷的是上一輪，不能拿
+export function removeEndedSubagents(state, ended) {
+  const removed = [];
+  const kept = state.subagents.filter((subagent) => {
+    const match = ended.find((entry) => entry.id === subagent.id && entry.startedAtMs === subagent.startedAtMs);
+    if (match === undefined) {
+      return true;
+    }
+    removed.push({ id: subagent.id, reason: match.reason });
+    return false;
+  });
+  if (removed.length === 0) {
+    return { state, removed };
+  }
+  return { state: { ...state, subagents: kept }, removed };
+}
+
+export function pruneEndedSubagents(state, event, options) {
+  return removeEndedSubagents(state, findEndedSubagents(state, event, options));
+}
+
+function judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, readTail }) {
+  const transcriptPath = join(subagentsDirectory, `agent-${subagent.id}.jsonl`);
+  const tail = readTail(transcriptPath, transcriptTailBytes);
+  if (tail === null) {
+    return null;
+  }
+  if (tail.isMissing) {
+    const startedAtMs = Number.isFinite(subagent.startedAtMs) ? subagent.startedAtMs : 0;
+    return nowMs - startedAtMs > missingTranscriptGraceMs ? 'missing-transcript' : null;
+  }
+  return detectSubagentEnd({
+    startedAtMs: subagent.startedAtMs,
+    records: parseTailRecords(tail),
+    meta: readSmallJsonFile(join(subagentsDirectory, `agent-${subagent.id}.meta.json`), maximumMetaBytes, readTail),
+    notification: notifications.get(subagent.id) ?? null,
+    lastWriteMs: tail.modifiedMs,
+    nowMs,
+  });
 }
 
 export function formatTreeLine(branch, agentType) {
@@ -474,6 +793,7 @@ const defaultDependencies = {
   queryPaneAgentSession,
   countClaudeAncestors: () => countClaudeAncestors(process.ppid),
   getUserId: () => process.getuid(),
+  readFileTail,
 };
 
 export function runHook(rawInput, environment, overrides = {}) {
@@ -513,35 +833,53 @@ export function runHook(rawInput, environment, overrides = {}) {
   if (stateDirectory === null) {
     return { action: 'skipped', reason: 'unsafe-state-directory' };
   }
-  // 對照檔合約（viewer 讀）：欄位固定為 sessionId、transcriptPath、cwd、updatedAtMs，不准改
-  writeJsonFileAtomically(join(stateDirectory, `pane-${paneId}.json`), {
-    sessionId: event.sessionId,
-    transcriptPath: event.transcriptPath,
-    cwd: event.cwd,
-    updatedAtMs: dependencies.now(),
-  });
+  // SessionStart 一開 session 就寫，popup 不用再從可能過期的 herdr 猜；Stop 每回合都會觸發（API 錯誤結束的回合改觸發 StopFailure），只清死掉的 sub 與重畫，不動對照檔
+  if (!pruneOnlyEventNames.has(event.eventName)) {
+    const paneMapPath = join(stateDirectory, `pane-${paneId}.json`);
+    writeJsonFileAtomically(paneMapPath, buildPaneMap(event, readJsonFile(paneMapPath), dependencies.now()));
+  }
 
   const statePath = join(stateDirectory, `session-${event.sessionId}.json`);
   const lockPath = `${statePath}.lock`;
+  // 判斷 sub 是否結束要讀 main 與每個 sub 的 transcript 尾端，放在 lock 外：放在 lock 內的話同一個 session 平行觸發的 hook
+  // 每個都要多等前面每一個讀完，排在後面的等不到 lock 就放棄，放棄的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄。
+  // 狀態檔是 rename 換上的，lock 外讀到的一定是某個完整版本；lock 內再讀一次最新的，只拿掉這裡判斷過的（見 removeEndedSubagents）
+  const pruneDeadlineMs = Math.min(dependencies.now() + maximumPruneMs, deadlineMs - minimumHerdrBudgetMs);
+  const endedSubagents = findEndedSubagents(normalizeSessionState(readJsonFile(statePath), event.sessionId), event, {
+    nowMs: dependencies.now(),
+    readTail: dependencies.readFileTail,
+    hasTimeLeft: () => dependencies.now() < pruneDeadlineMs,
+  });
+  // Stop／StopFailure 只會拿掉上面判斷為結束的 sub：一個都沒有的話 lock 內什麼都不會改，不用跟別的 hook 搶 lock（Stop 每回合都會觸發）
+  if (pruneOnlyEventNames.has(event.eventName) && endedSubagents.length === 0) {
+    return { action: 'unchanged' };
+  }
   const ownLock = acquireLock(lockPath, deadlineMs - minimumHerdrBudgetMs, dependencies.now);
   if (ownLock === null) {
     return { action: 'skipped', reason: 'lock-timeout' };
   }
   try {
+    // lock 內不讀 transcript：只有狀態檔的讀寫與回報 herdr
     const nowMs = dependencies.now();
     const currentState = normalizeSessionState(readJsonFile(statePath), event.sessionId);
-    const { changed, state } = applyEvent(currentState, event, nowMs);
-    if (!changed) {
+    const applied = applyEvent(currentState, event, nowMs);
+    const pruned = removeEndedSubagents(applied.state, endedSubagents);
+    const isStateChanged = applied.changed || pruned.removed.length > 0;
+    // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的樹（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋
+    if (!isStateChanged && event.eventName !== 'SessionStart') {
       return { action: 'unchanged' };
     }
-    const sequence = nextSequence(state.lastSequence, nowMs);
-    const nextState = { ...state, lastSequence: sequence };
-    writeJsonFileAtomically(statePath, nextState);
+    const sequence = nextSequence(pruned.state.lastSequence, nowMs);
+    const nextState = { ...pruned.state, lastSequence: sequence };
+    // 狀態沒變（例：沒有 sub 的新 session）就不寫檔：每個 session 都會觸發 SessionStart，不要每次都在 tmpfs 留一個空的狀態檔
+    if (isStateChanged) {
+      writeJsonFileAtomically(statePath, nextState);
+    }
     const lines = buildTreeLines(nextState.subagents);
     const argumentList = buildMetadataArguments(paneId, lines, sequence);
     const herdrTimeoutMs = Math.max(minimumHerdrBudgetMs, deadlineMs - dependencies.now());
     dependencies.runHerdr(herdrBinaryPath, argumentList, herdrTimeoutMs);
-    return { action: 'reported', lines, argumentList };
+    return { action: 'reported', lines, argumentList, removed: pruned.removed };
   } finally {
     releaseLock(lockPath, ownLock);
   }

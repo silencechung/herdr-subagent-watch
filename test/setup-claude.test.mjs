@@ -31,13 +31,15 @@ test('a plugin path that would break the shell command is refused', () => {
 test('install adds one hook per event and leaves every other hook alone', () => {
   const settings = { model: 'opus', hooks: structuredClone(otherHooks) };
   const { settings: next, changes } = installSidebarHooks(settings, command);
-  assert.deepEqual(changes, { SubagentStart: 'added', SubagentStop: 'added' });
+  assert.deepEqual(changes, { SubagentStart: 'added', SubagentStop: 'added', SessionStart: 'added', Stop: 'added', StopFailure: 'added' });
   assert.deepEqual(next.hooks.PreToolUse, otherHooks.PreToolUse);
   assert.deepEqual(next.hooks.SubagentStart, [
     otherHooks.SubagentStart[0],
     { hooks: [{ type: 'command', command, timeout: 5 }] },
   ]);
-  assert.deepEqual(next.hooks.SubagentStop, [{ hooks: [{ type: 'command', command, timeout: 5 }] }]);
+  for (const eventName of ['SubagentStop', 'SessionStart', 'Stop', 'StopFailure']) {
+    assert.deepEqual(next.hooks[eventName], [{ hooks: [{ type: 'command', command, timeout: 5 }] }], eventName);
+  }
   assert.equal(next.model, 'opus');
   assert.deepEqual(settings.hooks, otherHooks, 'input must not be mutated');
 });
@@ -46,7 +48,7 @@ test('install is idempotent', () => {
   const once = installSidebarHooks({ hooks: structuredClone(otherHooks) }, command).settings;
   const twice = installSidebarHooks(once, command);
   assert.deepEqual(twice.settings, once);
-  assert.deepEqual(twice.changes, { SubagentStart: 'unchanged', SubagentStop: 'unchanged' });
+  assert.deepEqual(twice.changes, { SubagentStart: 'unchanged', SubagentStop: 'unchanged', SessionStart: 'unchanged', Stop: 'unchanged', StopFailure: 'unchanged' });
 });
 
 test('an older sidebar-hook command is updated in place and duplicates are dropped', () => {
@@ -61,7 +63,7 @@ test('an older sidebar-hook command is updated in place and duplicates are dropp
     },
   };
   const { settings: next, changes } = installSidebarHooks(settings, command);
-  assert.deepEqual(changes, { SubagentStart: 'updated', SubagentStop: 'updated' });
+  assert.deepEqual(changes, { SubagentStart: 'updated', SubagentStop: 'updated', SessionStart: 'added', Stop: 'added', StopFailure: 'added' });
   assert.deepEqual(next.hooks.SubagentStart, [
     { hooks: [{ type: 'command', command, timeout: 5 }, { type: 'command', command: 'keep-me.sh' }] },
   ]);
@@ -71,8 +73,8 @@ test('an older sidebar-hook command is updated in place and duplicates are dropp
 test('remove takes out only the sidebar hooks and drops event arrays that end up empty', () => {
   const installed = installSidebarHooks({ hooks: structuredClone(otherHooks) }, command).settings;
   const { settings: next, changes, removedCount } = removeSidebarHooks(installed);
-  assert.equal(removedCount, 2);
-  assert.deepEqual(changes, { SubagentStart: 'removed', SubagentStop: 'removed' });
+  assert.equal(removedCount, 5);
+  assert.deepEqual(changes, { SubagentStart: 'removed', SubagentStop: 'removed', SessionStart: 'removed', Stop: 'removed', StopFailure: 'removed' });
   assert.deepEqual(next, { hooks: otherHooks });
 });
 
@@ -131,4 +133,67 @@ test('formatting keeps CRLF line endings and one-line files stay on one line', (
   assert.equal(formatSettings({ a: 'line\nbreak' }, '{\r\n\t"a": 0\r\n}'), '{\r\n\t"a": "line\\nbreak"\r\n}');
   assert.equal(formatSettings({ a: 1, b: 2 }, '{"a":0}\n'), '{"a":1,"b":2}\n');
   assert.equal(formatSettings({ a: 1 }, '{}\n'), '{\n  "a": 1\n}\n');
+});
+
+test('an install from the version before SessionStart (only SubagentStart and SubagentStop) gets SessionStart, Stop and StopFailure added, nothing doubled', () => {
+  const userHooks = {
+    SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: 'herdr-agent-state.sh session', timeout: 10 }] }],
+    Stop: [{ hooks: [{ type: 'command', command: 'notify.sh' }] }],
+  };
+  const previousInstall = {
+    hooks: {
+      ...structuredClone(userHooks),
+      SubagentStart: [{ hooks: [{ type: 'command', command, timeout: 5 }] }],
+      SubagentStop: [{ hooks: [{ type: 'command', command, timeout: 5 }] }],
+    },
+  };
+  const { settings: next, changes } = installSidebarHooks(previousInstall, command);
+  assert.deepEqual(changes, { SubagentStart: 'unchanged', SubagentStop: 'unchanged', SessionStart: 'added', Stop: 'added', StopFailure: 'added' });
+  const ours = { hooks: [{ type: 'command', command, timeout: 5 }] };
+  assert.deepEqual(next.hooks.SessionStart, [...userHooks.SessionStart, ours]);
+  assert.deepEqual(next.hooks.Stop, [...userHooks.Stop, ours]);
+  assert.deepEqual(next.hooks.StopFailure, [ours]);
+  assert.deepEqual(next.hooks.SubagentStart, [ours]);
+  assert.deepEqual(installSidebarHooks(next, command).settings, next, 'running setup again changes nothing');
+
+  const removed = removeSidebarHooks(next);
+  assert.equal(removed.removedCount, 5);
+  assert.deepEqual(removed.settings, { hooks: userHooks });
+});
+
+test('a SessionStart or Stop entry that is not an array is reported instead of edited', () => {
+  assert.match(findSettingsShapeProblem({ hooks: { SessionStart: {} } }), /hooks\.SessionStart/);
+  assert.match(findSettingsShapeProblem({ hooks: { Stop: 'x' } }), /hooks\.Stop/);
+});
+
+// 官方文件：回合因 API 錯誤結束時不觸發 Stop、改觸發 StopFailure；已經裝了其他四個 event 的設定重跑 setup 要能補上
+test('a settings.json that already has the other four events gets only StopFailure added; the user\'s own StopFailure hook stays and remove takes all five out', () => {
+  const ours = { hooks: [{ type: 'command', command, timeout: 5 }] };
+  const userHooks = {
+    Stop: [{ hooks: [{ type: 'command', command: 'notify.sh' }] }],
+    StopFailure: [{ matcher: 'rate_limit', hooks: [{ type: 'command', command: 'alert.sh' }] }],
+  };
+  const previousInstall = {
+    hooks: {
+      ...structuredClone(userHooks),
+      SubagentStart: [structuredClone(ours)],
+      SubagentStop: [structuredClone(ours)],
+      SessionStart: [structuredClone(ours)],
+    },
+  };
+  previousInstall.hooks.Stop.push(structuredClone(ours));
+  const { settings: next, changes } = installSidebarHooks(previousInstall, command);
+  assert.deepEqual(changes, { SubagentStart: 'unchanged', SubagentStop: 'unchanged', SessionStart: 'unchanged', Stop: 'unchanged', StopFailure: 'added' });
+  assert.deepEqual(next.hooks.StopFailure, [...userHooks.StopFailure, ours]);
+  assert.deepEqual(next.hooks.Stop, [...userHooks.Stop, ours]);
+  assert.deepEqual(installSidebarHooks(next, command).settings, next, 'running setup again changes nothing');
+
+  const removed = removeSidebarHooks(next);
+  assert.equal(removed.removedCount, 5);
+  assert.equal(removed.changes.StopFailure, 'removed');
+  assert.deepEqual(removed.settings, { hooks: userHooks });
+});
+
+test('a StopFailure entry that is not an array is reported instead of edited', () => {
+  assert.match(findSettingsShapeProblem({ hooks: { StopFailure: {} } }), /hooks\.StopFailure/);
 });

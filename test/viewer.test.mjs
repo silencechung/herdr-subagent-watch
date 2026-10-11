@@ -661,6 +661,37 @@ function isProcessAlive(pid) {
   }
 }
 
+// hook 收到 SessionStart 時寫的 pane map：fixture session 的 transcript 改成比較舊，herdr 停在比較新的第二個 session
+function writeSessionStartSetup(name, sessions, paneMapSessionId) {
+  const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
+  const olderDate = new Date(Date.now() - 60_000);
+  fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
+  const runtimeDirectory = path.join(temporaryRoot, `${name}-runtime`);
+  fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
+  const writePaneMap = (sessionId, source) => {
+    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
+      sessionId,
+      transcriptPath: path.join(sessions.projectDirectory, `${sessionId}.jsonl`),
+      cwd: sessions.workDirectory,
+      updatedAtMs: Date.now(),
+      sessionStartSource: source,
+    }));
+  };
+  writePaneMap(paneMapSessionId, 'resume');
+  return { runtimeDirectory, writePaneMap };
+}
+
+test('--once follows a pane map written at SessionStart even when herdr names a session written more recently', () => {
+  const sessions = writeTwoSessions('session-start-once');
+  const { runtimeDirectory } = writeSessionStartSetup('session-start-once', sessions, fixtureSessionId);
+  const herdr = writeScriptedHerdr('session-start-once-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
+  const result = runViewer(['--once'], { environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout.split('\n')[0], /\[● Explore\]/);
+  assert.doesNotMatch(result.stdout, /Plan/);
+  assert.match(result.stdout, /session 11111111 · herdr says session 22222222, pane map says 11111111/);
+});
+
 describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'util-linux script is not available' }, () => {
   test('only the app\'s own escape sequences reach the terminal', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', writeHostileSession('hostile-pty')]);
@@ -786,6 +817,36 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
       const screen = pty.getScreenLines();
       assert.ok(isSecondSession(screen), screen.join('\n'));
       assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('with a pane map written at SessionStart, herdr changing its session does not move the popup, the pane map changing does', { timeout: 30_000 }, async () => {
+    const sessions = writeTwoSessions('session-start-pty');
+    const { runtimeDirectory, writePaneMap } = writeSessionStartSetup('session-start-pty', sessions, fixtureSessionId);
+    const herdr = writeScriptedHerdr('session-start-pty-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
+    const pty = startInPty([], { columns: 160, environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
+    const isFixtureSession = (lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /── session 11111111 /.test(line));
+    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
+    try {
+      await pty.waitForScreen(isFixtureSession, 'the session from the SessionStart pane map');
+      // /clear 或 /resume：SessionStart 改寫 pane map
+      writePaneMap(secondSessionId, 'clear');
+      await pty.waitForScreen(isSecondSession, 'the new session from the rewritten pane map', 10_000);
+      // herdr 的值改成另一個 session（例：server 重啟後還原的舊值）：畫面不動
+      fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, fixtureSessionId)));
+      const finishedLookups = countFinishedLookups();
+      await waitUntil(() => countFinishedLookups() >= finishedLookups + 2, 'two lookups after herdr changed', 10_000);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 300);
+      });
+      const screen = pty.getScreenLines();
+      assert.ok(isSecondSession(screen), screen.join('\n'));
+      assert.ok(screen.some((line) => /session 22222222 · herdr says session 11111111, pane map says 22222222/.test(line)), screen.join('\n'));
       pty.send('q');
       assert.equal(await pty.exited, 0);
     } finally {

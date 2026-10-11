@@ -128,11 +128,12 @@ test('setup adds the hooks and the herdr config, keeps every other hook and back
   const settings = readJson(testCase.settingsPath);
   const original = JSON.parse(originalSettingsText);
   assert.deepEqual(settings.hooks.PreToolUse, original.hooks.PreToolUse);
-  assert.deepEqual(settings.hooks.Stop, original.hooks.Stop);
   assert.deepEqual(settings.statusLine, original.statusLine);
-  for (const eventName of ['SubagentStart', 'SubagentStop']) {
-    assert.deepEqual(settings.hooks[eventName], [{ hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] }]);
+  for (const eventName of ['SubagentStart', 'SubagentStop', 'SessionStart', 'StopFailure']) {
+    assert.deepEqual(settings.hooks[eventName], [{ hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] }], eventName);
   }
+  // 使用者原本的 Stop hook 留著，本 plugin 的加在後面
+  assert.deepEqual(settings.hooks.Stop, [...original.hooks.Stop, { hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] }]);
   assert.equal(fs.readFileSync(`${testCase.settingsPath}.subagent-watch.bak`, 'utf8'), originalSettingsText);
 
   const config = fs.readFileSync(testCase.configPath, 'utf8');
@@ -191,7 +192,10 @@ test('an older hook pointing at sidebar-hook.mjs is rewritten in place, and --re
   assert.match(result.stdout, /SubagentStart: updated/);
   const settings = readJson(testCase.settingsPath);
   assert.deepEqual(settings.hooks.SubagentStart, [{ hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] }]);
-  assert.deepEqual(settings.hooks.SessionStart, JSON.parse(settingsText).hooks.SessionStart);
+  assert.deepEqual(settings.hooks.SessionStart, [
+    ...JSON.parse(settingsText).hooks.SessionStart,
+    { hooks: [{ type: 'command', command: expectedCommand, timeout: 5 }] },
+  ]);
 
   assert.equal(runSetup(testCase, ['--remove']).status, 0);
   assert.deepEqual(readJson(testCase.settingsPath), { hooks: { SessionStart: JSON.parse(settingsText).hooks.SessionStart } });
@@ -468,4 +472,66 @@ test('another tool\'s hook that merely mentions sidebar-hook.mjs is neither repl
 
   assert.equal(runSetup(testCase, ['--remove']).status, 0);
   assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), settingsText);
+});
+
+test('rerunning setup over the version before SessionStart (SubagentStart and SubagentStop only) adds SessionStart, Stop and StopFailure, keeps CRLF, and remove takes all five out', () => {
+  const ours = { type: 'command', command: expectedCommand, timeout: 5 };
+  const userSettings = JSON.parse(originalSettingsText);
+  const previousInstall = structuredClone(userSettings);
+  previousInstall.hooks.SubagentStart = [{ hooks: [ours] }];
+  previousInstall.hooks.SubagentStop = [{ hooks: [ours] }];
+  const settingsText = `${JSON.stringify(previousInstall, null, 2)}\n`.replace(/\n/g, '\r\n');
+  const testCase = createCase({ settingsText });
+  const result = runSetup(testCase);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /SubagentStart: unchanged/);
+  assert.match(result.stdout, /SubagentStop: unchanged/);
+  assert.match(result.stdout, /SessionStart: added/);
+  assert.match(result.stdout, /^  Stop: added$/m);
+  assert.match(result.stdout, /^  StopFailure: added$/m);
+  const written = fs.readFileSync(testCase.settingsPath, 'utf8');
+  assert.doesNotMatch(written, /[^\r]\n/, 'CRLF is kept');
+  const settings = JSON.parse(written);
+  assert.deepEqual(settings.hooks.SessionStart, [{ hooks: [ours] }]);
+  assert.deepEqual(settings.hooks.Stop, [...userSettings.hooks.Stop, { hooks: [ours] }]);
+  assert.deepEqual(settings.hooks.StopFailure, [{ hooks: [ours] }]);
+  assert.deepEqual(settings.hooks.SubagentStart, [{ hooks: [ours] }]);
+
+  const again = runSetup(testCase);
+  assert.match(again.stdout, /already set up, file not touched/);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), written);
+
+  assert.equal(runSetup(testCase, ['--remove']).status, 0);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), originalSettingsText.replace(/\n/g, '\r\n'));
+});
+
+test('rerunning setup over a settings.json that already has the other four events adds only StopFailure, the second run touches nothing, and remove gives the file back', () => {
+  const ours = { type: 'command', command: expectedCommand, timeout: 5 };
+  const userSettings = JSON.parse(originalSettingsText);
+  const previousInstall = structuredClone(userSettings);
+  previousInstall.hooks.SubagentStart = [{ hooks: [ours] }];
+  previousInstall.hooks.SubagentStop = [{ hooks: [ours] }];
+  previousInstall.hooks.SessionStart = [{ hooks: [ours] }];
+  previousInstall.hooks.Stop = [...userSettings.hooks.Stop, { hooks: [ours] }];
+  const settingsText = `${JSON.stringify(previousInstall, null, 2)}\n`;
+  const testCase = createCase({ settingsText });
+  const result = runSetup(testCase);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  for (const eventName of ['SubagentStart', 'SubagentStop', 'SessionStart', 'Stop']) {
+    assert.match(result.stdout, new RegExp(`^  ${eventName}: unchanged$`, 'm'), eventName);
+  }
+  assert.match(result.stdout, /^  StopFailure: added$/m);
+  const settings = readJson(testCase.settingsPath);
+  assert.deepEqual(settings, { ...previousInstall, hooks: { ...previousInstall.hooks, StopFailure: [{ hooks: [ours] }] } });
+
+  const written = fs.readFileSync(testCase.settingsPath, 'utf8');
+  const again = runSetup(testCase);
+  assert.match(again.stdout, /^  StopFailure: unchanged$/m);
+  assert.match(again.stdout, /already set up, file not touched/);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), written);
+
+  const removal = runSetup(testCase, ['--remove']);
+  assert.equal(removal.status, 0, removal.stdout + removal.stderr);
+  assert.match(removal.stdout, /^  StopFailure: removed$/m);
+  assert.equal(fs.readFileSync(testCase.settingsPath, 'utf8'), originalSettingsText);
 });

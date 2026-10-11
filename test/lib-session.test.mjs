@@ -738,3 +738,66 @@ async function waitUntil(predicate, description, timeoutMs = 3000) {
     });
   }
 }
+
+// hook 收到 SessionStart 時寫的 pane map（sessionStartSource）：transcript 在就直接用，不跟 herdr 比 mtime
+function writeSessionStartPaneMap(runtimeDirectory, paneId, sessionId, transcriptPath, source = 'startup') {
+  writePaneMap(runtimeDirectory, paneId, { sessionId, transcriptPath, cwd: '/srv/work', updatedAtMs: Date.now(), sessionStartSource: source });
+}
+
+test('a pane map written at SessionStart is used as is, even when the stale herdr session was written more recently', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const staleId = 'aaab440d-0000-4000-8000-0000000000a1';
+  const ownId = '3cd69807-0000-4000-8000-0000000000a2';
+  writeTranscript(projectsDirectory, '/srv/work', staleId, Date.now());
+  const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, Date.now() - 60_000);
+  writeSessionStartPaneMap(runtimeDirectory, 'w1:p1', ownId, ownPath, 'resume');
+  const result = await resolveSession({ paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(staleId)).runCommand });
+  assert.equal(result.transcriptPath, ownPath);
+  assert.equal(result.source, 'pane-map');
+  assert.equal(result.isSessionStart, true);
+  assert.equal(result.statusNote, 'herdr says session aaab440d, pane map says 3cd69807');
+});
+
+test('with a SessionStart pane map, herdr changing its value does not move the viewer, the pane map changing does', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const ownId = 'b1b1b1b1-0000-4000-8000-0000000000b1';
+  const herdrFirstId = 'b1b1b1b1-0000-4000-8000-0000000000b2';
+  const herdrNextId = 'b1b1b1b1-0000-4000-8000-0000000000b3';
+  const nextOwnId = 'b1b1b1b1-0000-4000-8000-0000000000b4';
+  const ownPath = writeTranscript(projectsDirectory, '/srv/work', ownId, Date.now() - 60_000);
+  writeTranscript(projectsDirectory, '/srv/work', herdrFirstId, Date.now() - 30_000);
+  writeSessionStartPaneMap(runtimeDirectory, 'w1:p1', ownId, ownPath);
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr' };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrReturning(herdrClaudePane(herdrFirstId)).runCommand })).transcriptPath, ownPath);
+  // herdr 的值變了、指向寫得最近的 transcript（例：herdr server 重啟後還原的舊值，在別的 pane 被寫）：不換
+  writeTranscript(projectsDirectory, '/srv/work', herdrNextId, Date.now() + 10_000);
+  const herdrNext = herdrReturning(herdrClaudePane(herdrNextId)).runCommand;
+  assert.equal(follower.offer(await resolveSession({ ...base, runCommand: herdrNext })).transcriptPath, ownPath);
+  assert.equal(follower.switches, 0);
+  // /clear、/resume：SessionStart 改寫 pane map，就算新 transcript 比 herdr 的舊也換過去
+  const nextOwnPath = writeTranscript(projectsDirectory, '/srv/work', nextOwnId, Date.now() - 120_000);
+  writeSessionStartPaneMap(runtimeDirectory, 'w1:p1', nextOwnId, nextOwnPath, 'clear');
+  const switched = follower.offer(await resolveSession({ ...base, runCommand: herdrNext }));
+  assert.equal(switched.transcriptPath, nextOwnPath);
+  assert.equal(switched.source, 'pane-map');
+  assert.equal(follower.switches, 1);
+});
+
+test('a SessionStart pane map whose transcript does not exist yet keeps the old rules until it appears, then wins', async () => {
+  const { projectsDirectory, runtimeDirectory } = createCase();
+  const herdrId = 'c2c2c2c2-0000-4000-8000-0000000000c1';
+  const newId = 'c2c2c2c2-0000-4000-8000-0000000000c2';
+  const herdrPath = writeTranscript(projectsDirectory, '/srv/work', herdrId, Date.now());
+  // 實測（2.1.296）：SessionStart（startup）觸發時 transcript 還不存在，第一個 prompt 之後才寫出來
+  const newPath = path.join(projectsDirectory, encodeProjectDirectoryName('/srv/work'), `${newId}.jsonl`);
+  writeSessionStartPaneMap(runtimeDirectory, 'w1:p1', newId, newPath);
+  const base = { paneId: 'w1:p1', projectsDirectory, runtimeDirectory, herdrBinPath: '/fake/herdr', runCommand: herdrReturning(herdrClaudePane(herdrId)).runCommand };
+  const follower = createSessionFollower();
+  assert.equal(follower.offer(await resolveSession(base)).transcriptPath, herdrPath);
+  // transcript 出現了，寫入時間比 herdr 那個舊：仍然換過去
+  writeTranscript(projectsDirectory, '/srv/work', newId, Date.now() - 60_000);
+  const current = follower.offer(await resolveSession(base));
+  assert.equal(current.transcriptPath, newPath);
+  assert.equal(current.isSessionStart, true);
+});
