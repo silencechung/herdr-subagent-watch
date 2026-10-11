@@ -2,7 +2,7 @@
 
 [English](README.md) | 繁體中文
 
-herdr plugin `subagent.watch`：即時看 Claude Code 的 sub agent 在做什麼，有 popup viewer 與側邊欄樹狀行兩種。純 Node 內建模組，不需要 `npm install`。
+herdr plugin `subagent.watch`：即時看 Claude Code 的 sub agent 在做什麼，有 popup viewer 與側邊欄數量兩種。純 Node 內建模組，不需要 `npm install`。
 
 > **只支援 Claude Code**：讀的是 Claude Code 的 transcript 與 `SessionStart`／`SubagentStart`／`SubagentStop`／`Stop`／`StopFailure` hook，其他 agent 的 pane 會顯示 `This pane is not running Claude Code (detected: <agent>)`。
 
@@ -28,7 +28,7 @@ setup 會改兩個使用者自己的設定檔：在 Claude Code 的 `settings.js
 
 **popup viewer**：在跑 Claude Code 的 pane 按 `prefix+.`，popup 會顯示「從哪個 pane 開的，就看那個 session」的 sub agent 在做什麼，一個 sub 一個 tab，每個 tool 呼叫一行（`HH:MM:SS  <tool>  <參數摘要>`）。結束的 tab 會留著，還看得到它做過的事。popup 開、關都手動。
 
-**側邊欄樹狀行**：herdr 側邊欄 claude 那一列底下，用最多 5 行列出還在跑的 sub agent。側邊欄不留歷程，sub 一結束那一行就消失。見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)。
+**側邊欄數量**：herdr 側邊欄 claude 那一列底下，用一行顯示還在跑的 sub agent 有幾個（`● 3 running`）。側邊欄不留歷程，sub 一結束數量就減一，都沒在跑時那一行就消失。見 [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)。
 
 | 按鍵 | 作用 |
 | --- | --- |
@@ -50,7 +50,7 @@ herdr plugin uninstall subagent.watch    # link 的話用 herdr plugin unlink su
 
 ## 疑難排解
 
-- **沒有側邊欄樹狀行，或按 `prefix+.` 沒反應**：看 setup 的 log。`prefix+.` 已被別的動作佔用時 setup 不加快捷鍵；已經有自己的 `claude =` 側邊欄 rows 時 setup 不動它；這兩種情況 log 裡都附上要自己貼的片段。用舊版 setup 過的話，再跑一次 setup。
+- **側邊欄沒有數量，或按 `prefix+.` 沒反應**：看 setup 的 log。`prefix+.` 已被別的動作佔用時 setup 不加快捷鍵；已經有自己的 `claude =` 側邊欄 rows 時 setup 不動它；這兩種情況 log 裡都附上要自己貼的片段。用舊版 setup 過的話，再跑一次 setup。
 - **popup 還停在上一個 session，或顯示 `(guessed: latest session)`**：開了新 session 之後，新 session 的 transcript 一出現 popup 就換過去（第一個 prompt 之後才寫出來），前提是這一版的 setup 已經加上 `SessionStart` hook。猜的 session 是用 pane 的 cwd 猜的，同一個資料夾開多個 Claude Code 時可能猜錯。見[怎麼找到 pane 對應的 session](docs/internals.zh-TW.md#怎麼找到-pane-對應的-session)。
 - **`No Claude Code session in this pane`**：herdr 回報那個 pane 沒有 agent（純 shell）。popup 每 2 秒重問一次，之後在同一個 pane 開 Claude Code 會自動接上。
 - **找不到 Node.js 22+**：會印出原因。要指定 node 就在啟動 herdr 與 Claude Code 的環境裡設 `SUBAGENT_WATCH_NODE`。
@@ -60,7 +60,7 @@ herdr plugin uninstall subagent.watch    # link 的話用 herdr plugin unlink su
 
 ## 更多
 
-- [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)：側邊欄樹狀行的原理、setup 會加什麼、怎麼手動移除。
+- [`docs/sidebar.zh-TW.md`](docs/sidebar.zh-TW.md)：側邊欄數量的原理、setup 會加什麼、怎麼手動移除。
 - [`docs/internals.zh-TW.md`](docs/internals.zh-TW.md)：給想了解運作或參與開發的人：怎麼找 session、sub 什麼時候算結束、執行模式與測試。
 
 ## 授權

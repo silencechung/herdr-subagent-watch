@@ -217,7 +217,7 @@ describe('SessionStart writes the pane map and redraws the sidebar for the new s
     const files = createSessionFiles();
     const result = harness.run(sessionPayload(startupPayload, files));
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, []);
+    assert.equal(result.line, null);
     assert.deepEqual(harness.herdrCalls[0].slice(7), allTokensCleared);
     assert.deepEqual(harness.readPaneMap(), {
       sessionId: files.sessionId,
@@ -230,27 +230,27 @@ describe('SessionStart writes the pane map and redraws the sidebar for the new s
     assert.deepEqual(readdirSync(harness.stateDirectory), [`pane-${testPaneId}.json`]);
   });
 
-  test('switching to another session replaces the old tree right away instead of waiting for the next sub agent event', () => {
+  test('switching to another session replaces the old count right away instead of waiting for the next sub agent event', () => {
     const harness = createHarness();
     const oldFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000001');
     const newFiles = createSessionFiles('aaaa0000-0000-4000-8000-000000000002');
     harness.run({ ...subagentStartPayload, session_id: oldFiles.sessionId, transcript_path: oldFiles.transcriptPath, agent_id: 'oldrunning1', agent_type: 'Explore' });
-    assert.ok(harness.herdrCalls[0].includes('sub1=└─ Explore ●'));
+    assert.ok(harness.herdrCalls[0].includes('sub1=● 1 running'));
     harness.advanceClock(1000);
     const result = harness.run(sessionPayload(startupPayload, newFiles, { source: 'clear' }));
-    assert.deepEqual(result.lines, []);
+    assert.equal(result.line, null);
     assert.deepEqual(harness.herdrCalls[1].slice(7), allTokensCleared);
     assert.equal(harness.readPaneMap().sessionId, newFiles.sessionId);
     assert.equal(harness.readPaneMap().sessionStartSource, 'clear');
   });
 
-  test('resuming a session that still has running sub agents draws that session\'s tree', () => {
+  test('resuming a session that still has running sub agents shows that session\'s count', () => {
     const harness = createHarness();
     const files = createSessionFiles();
     harness.writeSubagents(files.sessionId, [{ id: 'stillrunning1', agentType: 'Plan', startedAtMs: harness.nowMs() - 1000 }]);
     files.writeSubagent('stillrunning1', toJsonLines([assistantToolUse('2026-10-10T09:59:59.000Z', 'Bash', { command: 'ls' })]));
     const result = harness.run(sessionPayload(resumePayload, files));
-    assert.deepEqual(result.lines, ['└─ Plan ●']);
+    assert.equal(result.line, '● 1 running');
     assert.equal(harness.readPaneMap().sessionStartSource, 'resume');
   });
 
@@ -305,7 +305,7 @@ describe('Stop only prunes and redraws', () => {
     assert.equal(harness.herdrCalls.length, 0);
   });
 
-  test('review 23:19 (w8:pV): a sub agent stopped by an API error is removed on the next Stop and the tree is redrawn', () => {
+  test('review 23:19 (w8:pV): a sub agent stopped by an API error is removed on the next Stop and the count is redrawn', () => {
     const harness = createHarness();
     const files = createSessionFiles();
     harness.writeSubagents(files.sessionId, [
@@ -317,7 +317,7 @@ describe('Stop only prunes and redraws', () => {
     const result = harness.run(sessionPayload(stopPayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(result.line, '● 1 running');
     assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2']);
   });
 
@@ -332,7 +332,7 @@ describe('Stop only prunes and redraws', () => {
     files.writeSubagent('resumed1', toJsonLines([assistantToolUse('2026-10-10T09:45:00.000Z', 'SubagentHandback', { message: 'old' })]));
     const result = harness.run({ ...subagentStartPayload, session_id: files.sessionId, transcript_path: files.transcriptPath, agent_id: 'resumed1', agent_type: 'Explore' });
     assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(result.line, '● 1 running');
     // 下一個事件：resume 後的 sub 還沒寫新紀錄，舊的 handback 早於它的 SubagentStart，不算
     harness.advanceClock(3000);
     assert.deepEqual(harness.run(sessionPayload(stopPayload, files)), { action: 'unchanged' });
@@ -395,7 +395,7 @@ describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
     assert.equal(hook.parseHookPayload(JSON.stringify({ ...stopFailurePayload, session_id: '../escape' })), null);
   });
 
-  test('a sub agent stopped by the same API error is removed on StopFailure and the tree is redrawn', () => {
+  test('a sub agent stopped by the same API error is removed on StopFailure and the count is redrawn', () => {
     const harness = createHarness();
     const files = createSessionFiles();
     harness.writeSubagents(files.sessionId, [
@@ -407,7 +407,7 @@ describe('StopFailure (a turn ended by an API error) prunes like Stop', () => {
     const result = harness.run(sessionPayload(stopFailurePayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, [{ id: 'aapierror0000001', reason: 'api_error' }]);
-    assert.deepEqual(result.lines, ['└─ Explore ●']);
+    assert.equal(result.line, '● 1 running');
     assert.equal(harness.herdrCalls.length, 1);
     assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2']);
   });
@@ -670,7 +670,7 @@ describe('the safety net never removes a sub agent that is still running', () =>
 
 // 沒有 lock：判斷 sub 是否結束要讀的 transcript、刪結束的 sub 檔，都要在取 seq 之前做完；取 seq 之後才 readdir 畫樹
 describe('pruning happens before the seq is taken', () => {
-  test('every transcript and meta read happens before the seq is taken, and herdr gets the tree read after it', () => {
+  test('every transcript and meta read happens before the seq is taken, and herdr gets the count read after it', () => {
     const files = createSessionFiles();
     const steps = [];
     const harness = createHarness({
@@ -702,7 +702,7 @@ describe('pruning happens before the seq is taken', () => {
       'read agent-running2.meta.json',
     ]);
     assert.deepEqual(result.removed, [{ id: 'finished1', reason: 'handback' }]);
-    assert.deepEqual(result.lines, ['├─ Explore ●', '└─ Explore ●']);
+    assert.equal(result.line, '● 2 running');
     assert.deepEqual(harness.readSubagents(files.sessionId).map((subagent) => subagent.id), ['running2', 'new3']);
   });
 
@@ -741,7 +741,7 @@ describe('pruning happens before the seq is taken', () => {
       { id: 'added3', agentType: 'Explore', startedAtMs: harness.nowMs() },
       { id: 'resumed1', agentType: 'Plan', startedAtMs: harness.nowMs() },
     ]);
-    assert.deepEqual(result.lines, ['├─ Explore ●', '└─ Plan ●']);
+    assert.equal(result.line, '● 2 running');
     assert.deepEqual(readdirSync(harness.stateDirectory).filter((name) => name.endsWith('.tmp')), []);
   });
 
@@ -763,7 +763,7 @@ describe('pruning happens before the seq is taken', () => {
     const result = harness.run(sessionPayload(stopPayload, files));
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, []);
-    assert.deepEqual(result.lines, ['└─ Plan ●']);
+    assert.equal(result.line, '● 1 running');
     assert.equal(harness.herdrCalls.length, 1);
   });
 
@@ -888,10 +888,10 @@ describe('hook script with SessionStart and Stop, as Claude Code runs it', () =>
     const calls = readCalls(scriptCase.callLogPath);
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].filter((argument) => /^sub\d/.test(argument)), [
-      'sub1=├─ worker0 ●',
-      'sub2=├─ worker1 ●',
-      'sub3=├─ worker3 ●',
-      'sub4=└─ worker4 ●',
+      'sub1=● 4 running',
+      'sub2',
+      'sub3',
+      'sub4',
       'sub5',
     ]);
   });

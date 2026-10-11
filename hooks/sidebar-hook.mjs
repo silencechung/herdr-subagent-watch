@@ -1,4 +1,4 @@
-// Claude Code SessionStart／SubagentStart／SubagentStop／Stop／StopFailure hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer），
+// Claude Code SessionStart／SubagentStart／SubagentStop／Stop／StopFailure hook：更新 herdr 側邊欄 claude 那一列底下「● N running」那一行（N 是這個 session 跑中的 sub 數量，歷史看 popup viewer），
 // 並寫 pane 對照檔給 popup viewer。
 // 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、在 totalBudgetMs 內結束。
 // 跑中的 sub 一個一個檔（sub-<sessionId>-<agentId>.json），每個 hook 只改自己那個 sub 的檔，不用 lock；
@@ -27,8 +27,10 @@ import { applyMeta, applyRecord, createSubAgentState, getSubAgentStatus } from '
 import { parseJsonLine, parseTaskNotifications, parseTimestampMs } from '../lib/transcript.mjs';
 
 export const metadataSource = 'subagent.watch';
-export const maximumTreeLines = 5;
-export const maximumTokenLength = 80;
+export const sidebarTokenName = 'sub1';
+// 舊版一個 sub 一行、用到 sub1～sub5，舊安裝的 config.toml 還有這五格（setup 不改寫已經有 $sub1 的 rows）。
+// 每次都清掉 sub2～sub5，舊設定不用重跑 setup 也只會顯示一行；舊版留在 pane 上的樹狀行也會在第一次回報時清掉
+export const legacyTokenNames = ['sub2', 'sub3', 'sub4', 'sub5'];
 export const runningIcon = '●';
 
 // Stop 每回合都會觸發，transcript 可能上百 MB：判斷 sub 結束只需要最後幾筆，只讀尾端
@@ -74,8 +76,8 @@ export function isSafeIdentifier(value) {
   return typeof value === 'string' && safeIdentifierPattern.test(value) && value !== '.' && value !== '..';
 }
 
-// herdr 會移除控制字元並 trim；先做一樣的處理，80 字截斷的長度計算才會跟 herdr 一致。
-// \p{Cf}（U+202E 這類 bidi override、U+200B 零寬字元）也拿掉：herdr 文件只說移除控制字元，留著的話 agent_type 能把側邊欄的字反轉或藏起來
+// agent_type 只用來分辨內部 agent（清掉之後是空字串就略過）並記進 sub 檔，不會送給 herdr。
+// 控制字元與 \p{Cf}（U+202E 這類 bidi override、U+200B 零寬字元）一樣拿掉：只有這些字元的 agent_type 也算空的
 export function sanitizeText(value) {
   if (typeof value !== 'string') {
     return '';
@@ -423,7 +425,7 @@ export function findEndedSubagents(subagents, event, { nowMs, readTail = readFil
 // startedAtMs 不一樣的是又 SubagentStart（resume）的新一輪，判斷的是上一輪，不能刪。
 // 先讀再 unlink 的話，兩步之間 resume 換上的新檔會被刪掉，所以先 rename 到隨機的暫存名「拿走」路徑上那一份，再看拿到的是不是判斷的那一輪：
 // rename 是原子的，拿到的一定是某個完整版本；不是的話用 link 放回去（路徑上已經有更新的檔就不放，link 不會覆蓋）。
-// 拿走到放回之間，別的 hook readdir 會看不到這個 sub；放回之後這次事件一定會取 seq、重新 readdir 再回報，seq 比那些 hook 大，側邊欄最後仍會列出它。
+// 拿走到放回之間，別的 hook readdir 會看不到這個 sub；放回之後這次事件一定會取 seq、重新 readdir 再回報，seq 比那些 hook 大，側邊欄最後仍會算進它。
 // 回傳 'removed'、'gone'（已經不在）或 'restored'（放回，或路徑上已有更新的檔）
 export function removeEndedSubagentFile(stateDirectory, sessionId, ended) {
   const fileName = subagentFileName(sessionId, ended.id);
@@ -468,36 +470,9 @@ function judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, rea
   });
 }
 
-export function formatTreeLine(branch, agentType) {
-  const prefix = `${branch} `;
-  const suffix = ` ${runningIcon}`;
-  const nameBudget = maximumTokenLength - Array.from(prefix).length - Array.from(suffix).length;
-  const nameCharacters = Array.from(agentType);
-  const name = nameCharacters.length > nameBudget
-    ? `${nameCharacters.slice(0, nameBudget - 1).join('')}…`
-    : agentType;
-  return `${prefix}${name}${suffix}`;
-}
-
-// 同一毫秒啟動的用 id 排：readdir 的順序不固定，不排的話平行的 hook 會畫出順序不同的樹
-export function buildTreeLines(runningSubagents) {
-  const ordered = [...runningSubagents].sort((first, second) => {
-    const difference = (first.startedAtMs ?? 0) - (second.startedAtMs ?? 0);
-    if (difference !== 0) {
-      return difference;
-    }
-    return first.id < second.id ? -1 : first.id > second.id ? 1 : 0;
-  });
-  const overflows = ordered.length > maximumTreeLines;
-  const visible = overflows ? ordered.slice(0, maximumTreeLines - 1) : ordered;
-  const lines = visible.map((subagent, index) => {
-    const isLastLine = !overflows && index === visible.length - 1;
-    return formatTreeLine(isLastLine ? '└─' : '├─', sanitizeText(subagent.agentType));
-  });
-  if (overflows) {
-    lines.push(`└─ +${ordered.length - visible.length} more`);
-  }
-  return lines;
+// 側邊欄只顯示跑中的數量（沒有上限）；0 個回傳 null，token 清掉後 herdr 會把那一行收起來
+export function buildSidebarLine(runningCount) {
+  return runningCount > 0 ? `${runningIcon} ${runningCount} running` : null;
 }
 
 // /proc/stat 的 btime：開機時刻（epoch 秒）。讀不到或不像樣回傳 null
@@ -520,7 +495,10 @@ export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePa
 // 沒有 lock 之後，同一個 session 平行的 hook 各自改自己的檔、各自回報，側邊欄最後顯示的是 seq 最大的那一筆。
 // seq 在「改完檔（寫／刪自己的檔、清掉結束的 sub）之後、readdir 之前」取：改檔的 hook 取 seq 時改動已經完成，
 // seq 比它大的回報一定是之後才 readdir，看得到這個改動；在改動完成之前就 readdir 的回報，seq 一定比較小，會被 herdr 忽略。
-// 所以最後留下的一定包含每一個改動。前提是不同 process 取的 seq 夠細、不會撞號（撞號時後到的被忽略）。
+// 所以最後留下的一定包含每一個改動。
+// ns 撞號無害：8 個 hook 同時觸發時，不同核心偶爾在同一個 ns 讀時鐘，拿到一樣的 seq（平行測試連跑 30 次撞了 4 次，最後顯示都等於檔案狀態），herdr 收先到的、忽略後到的。
+// 同一個 seq 代表兩邊在同一個 ns 取號：兩邊取號時自己的改動都已經完成，readdir 又都在取號之後（readdir 至少要幾 µs），所以兩筆都看得到 seq 不大於它的每一個改動；
+// 兩次 readdir 之間若又有別的改動，那個 hook 是改完才取號，seq 一定比較大，會蓋過這兩筆。毫秒的撞號不一樣：同一毫秒內別的 hook 還來得及改完檔，被忽略的那筆可能是唯一看到改動的（下面的 22/60）。
 // POC（8 個 hook 同時觸發、20 輪×3 種情境：同時 start、同時 stop、start 後馬上 stop；一般／taskset -c 0／再加 4 或 6 個吃滿 CPU 的 process）：
 // 這個做法 0 次漏掉；seq 用毫秒時撞號漏 22/60，seq 在寫檔之前取漏 1–2/60，不帶 seq 漏 10–19/60。
 // 值是「開機時刻（btime 秒）× 1e9 ＋ monotonic ns」，BigInt 算、字串傳：monotonic（process.hrtime，所有 process 共用同一個時鐘）解析度夠細，
@@ -536,7 +514,7 @@ export function takeSequence(bootTimeSeconds, monotonicNs) {
   return baseNs + monotonicNs;
 }
 
-export function buildMetadataArguments(paneId, lines, sequence) {
+export function buildMetadataArguments(paneId, line, sequence) {
   const argumentList = [
     'pane',
     'report-metadata',
@@ -546,13 +524,9 @@ export function buildMetadataArguments(paneId, lines, sequence) {
     '--seq',
     String(sequence),
   ];
-  for (let index = 0; index < maximumTreeLines; index += 1) {
-    const tokenName = `sub${index + 1}`;
-    if (index < lines.length) {
-      argumentList.push('--token', `${tokenName}=${lines[index]}`);
-    } else {
-      argumentList.push('--clear-token', tokenName);
-    }
+  argumentList.push(...(line === null ? ['--clear-token', sidebarTokenName] : ['--token', `${sidebarTokenName}=${line}`]));
+  for (const tokenName of legacyTokenNames) {
+    argumentList.push('--clear-token', tokenName);
   }
   return argumentList;
 }
@@ -776,7 +750,7 @@ export function runHook(rawInput, environment, overrides = {}) {
   if (!event) {
     return { action: 'skipped', reason: 'irrelevant-payload' };
   }
-  // pane 裡的 claude 用 Bash 跑 `claude -p` 時，子 process 繼承同一個 HERDR_PANE_ID；不擋的話會蓋掉主 session 的樹與對照檔。
+  // pane 裡的 claude 用 Bash 跑 `claude -p` 時，子 process 繼承同一個 HERDR_PANE_ID；不擋的話會蓋掉主 session 的側邊欄與對照檔。
   // 祖先只有一組 claude 就直接收，不問 herdr：herdr 的 agent_session 在 server 重啟後可能停在重啟前的舊 session，
   // 之後的 startup 回報也不會覆寫（herdr 0.9.3 實測），拿它否決的話主 session 的事件會全部被擋、側邊欄完全不更新。
   // 兩組以上才可能是巢狀：herdr 說的 session 跟 payload 一樣才收（例如名為 claude 的 wrapper 跟 claude 中間隔了 shell），不一樣或查不到就略過
@@ -831,7 +805,7 @@ export function runHook(rawInput, environment, overrides = {}) {
     }
   }
   // 有改過任何檔就一定要回報（放回 resume 的檔也算：放回之前別的 hook 可能 readdir 時沒看到它）。
-  // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的樹（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋。
+  // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的數量（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋。
   // Stop／StopFailure 每回合都會觸發，沒清掉任何 sub 就不呼叫 herdr
   const isChanged = migratedCount > 0 || isOwnFileChanged || removed.length > 0 || isRestored;
   if (!isChanged && event.eventName !== 'SessionStart') {
@@ -839,11 +813,12 @@ export function runHook(rawInput, environment, overrides = {}) {
   }
   // seq 一定要在上面所有改檔之後、下面 readdir 之前取，理由見 takeSequence
   const sequence = takeSequence(dependencies.readBootTimeSeconds(), dependencies.monotonicNs());
-  const lines = buildTreeLines(listSessionSubagents(stateDirectory, event.sessionId));
-  const argumentList = buildMetadataArguments(paneId, lines, sequence);
+  const runningCount = listSessionSubagents(stateDirectory, event.sessionId).length;
+  const line = buildSidebarLine(runningCount);
+  const argumentList = buildMetadataArguments(paneId, line, sequence);
   const herdrTimeoutMs = Math.max(minimumHerdrBudgetMs, deadlineMs - dependencies.now());
   dependencies.runHerdr(herdrBinaryPath, argumentList, herdrTimeoutMs);
-  return { action: 'reported', lines, argumentList, removed };
+  return { action: 'reported', runningCount, line, argumentList, removed };
 }
 
 function main() {

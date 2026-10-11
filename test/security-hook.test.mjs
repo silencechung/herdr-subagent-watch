@@ -126,7 +126,7 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     assert.deepEqual(result, { status: 0, stdout: '' });
     const calls = readCalls(tree.callLogPath);
     assert.equal(calls.length, 1);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.ok(calls[0].includes('sub1=● 1 running'));
   });
 
   test('a wrapper named claude is counted once when herdr has no session for the pane', async () => {
@@ -145,7 +145,7 @@ describe('claude wrapper and nested claude, with a real process tree', () => {
     assert.deepEqual(result, { status: 0, stdout: '' });
     const calls = readCalls(tree.callLogPath);
     assert.equal(calls.length, 1);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.ok(calls[0].includes('sub1=● 1 running'));
     assert.ok(fs.existsSync(path.join(tree.runtimeDirectory, 'subagent-watch', `pane-${paneId}.json`)));
   });
 

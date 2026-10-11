@@ -19,12 +19,10 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildMetadataArguments,
-  buildTreeLines,
+  buildSidebarLine,
   countClaudeAncestors,
   fallbackSequenceBaseNs,
-  formatTreeLine,
   listSessionSubagents,
-  maximumTokenLength,
   parseHookPayload,
   parsePaneAgentSession,
   parseSubagentFile,
@@ -48,13 +46,15 @@ const startPayload = JSON.parse(startPayloadText);
 const testPaneId = 'w1:pTest';
 const testBootTimeSeconds = 1_790_000_000n;
 const testBootTimeNs = testBootTimeSeconds * 1_000_000_000n;
-const allTokensCleared = [
-  '--clear-token', 'sub1',
+// 舊安裝的 config.toml 還有 $sub2～$sub5：每次回報都要清掉
+const legacyTokensCleared = [
   '--clear-token', 'sub2',
   '--clear-token', 'sub3',
   '--clear-token', 'sub4',
   '--clear-token', 'sub5',
 ];
+const allTokensCleared = ['--clear-token', 'sub1', ...legacyTokensCleared];
+const runningTokens = (count) => ['--token', `sub1=● ${count} running`, ...legacyTokensCleared];
 
 const temporaryDirectories = [];
 function createTemporaryDirectory() {
@@ -156,115 +156,35 @@ describe('sub agent files', () => {
   });
 });
 
-describe('buildTreeLines', () => {
-  test('no running sub agents gives no lines', () => {
-    assert.deepEqual(buildTreeLines([]), []);
+describe('buildSidebarLine', () => {
+  test('no running sub agents gives no line', () => {
+    assert.equal(buildSidebarLine(0), null);
   });
 
-  test('single sub agent uses the last-branch glyph', () => {
-    assert.deepEqual(buildTreeLines([subagent('a', 1, 'general-purpose')]), ['└─ general-purpose ●']);
-  });
-
-  test('ordered by start time', () => {
-    const lines = buildTreeLines([
-      subagent('late', 30, 'late'),
-      subagent('early', 5, 'early'),
-      subagent('middle', 10, 'middle'),
-    ]);
-    assert.deepEqual(lines, [
-      '├─ early ●',
-      '├─ middle ●',
-      '└─ late ●',
-    ]);
-  });
-
-  // readdir 的順序不固定：平行的 hook 讀到同一組檔要畫出一樣的樹
-  test('sub agents started in the same millisecond are ordered by id, whatever order they are listed in', () => {
-    const expected = ['├─ first ●', '├─ second ●', '└─ third ●'];
-    assert.deepEqual(buildTreeLines([subagent('b', 7, 'second'), subagent('c', 7, 'third'), subagent('a', 7, 'first')]), expected);
-    assert.deepEqual(buildTreeLines([subagent('c', 7, 'third'), subagent('a', 7, 'first'), subagent('b', 7, 'second')]), expected);
-  });
-
-  test('exactly five fit without a more line', () => {
-    const subagents = [1, 2, 3, 4, 5].map((index) => subagent(`s${index}`, index));
-    const lines = buildTreeLines(subagents);
-    assert.equal(lines.length, 5);
-    assert.equal(lines[4], '└─ type-s5 ●');
-  });
-
-  test('overflow collapses the last line into +N more', () => {
-    const subagents = [1, 2, 3, 4, 5, 6, 7].map((index) => subagent(`s${index}`, index));
-    const lines = buildTreeLines(subagents);
-    assert.deepEqual(lines, [
-      '├─ type-s1 ●',
-      '├─ type-s2 ●',
-      '├─ type-s3 ●',
-      '├─ type-s4 ●',
-      '└─ +3 more',
-    ]);
-  });
-
-  // popup 的 tab 有編號，側邊欄刻意沒有：同 type 重複時也只列名稱，不帶任何數字
-  test('repeated agent types stay unnumbered even though popup tabs are numbered', () => {
-    const lines = buildTreeLines([
-      subagent('a', 1, 'general-purpose'),
-      subagent('b', 2, 'general-purpose'),
-      subagent('c', 3, 'general-purpose'),
-    ]);
-    assert.deepEqual(lines, [
-      '├─ general-purpose ●',
-      '├─ general-purpose ●',
-      '└─ general-purpose ●',
-    ]);
-    for (const line of lines) {
-      assert.doesNotMatch(line, /\d|\[/);
-    }
-  });
-
-  test('lines never contain numbering or a finished mark', () => {
-    const lines = buildTreeLines([subagent('a', 1, 'Plan'), subagent('b', 2, 'Explore')]);
-    for (const line of lines) {
-      assert.match(line, /^(├─|└─) [A-Za-z]+ ●$/);
-    }
-  });
-});
-
-describe('formatTreeLine', () => {
-  test('truncates long agent types to 80 characters and keeps the icon', () => {
-    const line = formatTreeLine('├─', 'x'.repeat(200));
-    assert.equal(Array.from(line).length, maximumTokenLength);
-    assert.ok(line.endsWith('x… ●'));
-  });
-
-  test('counts characters, not UTF-16 units', () => {
-    const line = formatTreeLine('└─', '代'.repeat(100));
-    assert.equal(Array.from(line).length, maximumTokenLength);
-    assert.ok(line.startsWith('└─ 代'));
-    assert.ok(line.endsWith('… ●'));
-  });
-
-  test('short agent types are untouched', () => {
-    assert.equal(formatTreeLine('├─', 'Explore'), '├─ Explore ●');
+  test('shows only the count of running sub agents, with no upper limit', () => {
+    assert.equal(buildSidebarLine(1), '● 1 running');
+    assert.equal(buildSidebarLine(7), '● 7 running');
+    assert.equal(buildSidebarLine(123), '● 123 running');
   });
 });
 
 describe('buildMetadataArguments', () => {
-  test('sets used tokens and clears the rest under one source', () => {
-    const argumentList = buildMetadataArguments('w8:pV', ['├─ Plan ●', '└─ Explore ●'], 1234);
+  test('sets sub1 to the line and always clears sub2 to sub5 left in older configs, under one source', () => {
+    const argumentList = buildMetadataArguments('w8:pV', '● 2 running', 1234);
     assert.deepEqual(argumentList, [
       'pane', 'report-metadata', 'w8:pV',
       '--source', 'subagent.watch',
       '--seq', '1234',
-      '--token', 'sub1=├─ Plan ●',
-      '--token', 'sub2=└─ Explore ●',
+      '--token', 'sub1=● 2 running',
+      '--clear-token', 'sub2',
       '--clear-token', 'sub3',
       '--clear-token', 'sub4',
       '--clear-token', 'sub5',
     ]);
   });
 
-  test('no lines clears all five tokens', () => {
-    assert.deepEqual(buildMetadataArguments('w8:pV', [], 1234).slice(7), allTokensCleared);
+  test('no line clears all five tokens', () => {
+    assert.deepEqual(buildMetadataArguments('w8:pV', null, 1234).slice(7), allTokensCleared);
   });
 });
 
@@ -383,7 +303,8 @@ describe('runHook', () => {
     const harness = createHarness();
     const startResult = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(startResult.action, 'reported');
-    assert.deepEqual(startResult.lines, ['└─ general-purpose ●']);
+    assert.equal(startResult.runningCount, 1);
+    assert.equal(startResult.line, '● 1 running');
     assert.equal(harness.herdrCalls.length, 1);
     assert.equal(harness.herdrCalls[0].binaryPath, '/fake/herdr');
     assert.deepEqual(harness.herdrCalls[0].argumentList.slice(0, 7), [
@@ -409,7 +330,8 @@ describe('runHook', () => {
     harness.advanceClock(2000);
     const stopResult = runHook(stopPayloadText, harness.environment, harness.dependencies);
     assert.equal(stopResult.action, 'reported');
-    assert.deepEqual(stopResult.lines, []);
+    assert.equal(stopResult.runningCount, 0);
+    assert.equal(stopResult.line, null);
     assert.equal(harness.herdrCalls[1].argumentList[6], String(testBootTimeNs + 2n));
     assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7), allTokensCleared);
     assert.equal(existsSync(subagentFilePath), false);
@@ -425,7 +347,7 @@ describe('runHook', () => {
     runHook(stopPayloadText, harness.environment, harness.dependencies);
     harness.advanceClock(1000);
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1);
     assert.deepEqual(harness.readSubagents(), [subagent('a12e8c491ce2f7f4a', 1_002_000, 'general-purpose')]);
   });
 
@@ -435,11 +357,11 @@ describe('runHook', () => {
     runHook(startPayloadText, harness.environment, harness.dependencies);
     harness.advanceClock(2000);
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1);
     assert.deepEqual(harness.readSubagents(), [subagent('a12e8c491ce2f7f4a', 1_002_000, 'general-purpose')]);
   });
 
-  test('start two, stop one, stop the other: two lines, then one └─ line, then everything cleared', () => {
+  test('start two, stop one, stop the other: 2 running, then 1 running, then everything cleared', () => {
     const harness = createHarness();
     const firstStart = payloadWith({ agent_id: 'first', agent_type: 'Explore' });
     const secondStart = payloadWith({ agent_id: 'second', agent_type: 'Plan' });
@@ -449,33 +371,27 @@ describe('runHook', () => {
     runHook(firstStart, harness.environment, harness.dependencies);
     harness.advanceClock(10);
     const bothRunning = runHook(secondStart, harness.environment, harness.dependencies);
-    assert.deepEqual(bothRunning.lines, ['├─ Explore ●', '└─ Plan ●']);
+    assert.deepEqual(bothRunning.argumentList.slice(7), runningTokens(2));
 
     harness.advanceClock(10);
     const oneLeft = runHook(firstStop, harness.environment, harness.dependencies);
-    assert.deepEqual(oneLeft.lines, ['└─ Plan ●']);
-    assert.deepEqual(oneLeft.argumentList.slice(7), [
-      '--token', 'sub1=└─ Plan ●',
-      '--clear-token', 'sub2',
-      '--clear-token', 'sub3',
-      '--clear-token', 'sub4',
-      '--clear-token', 'sub5',
-    ]);
+    assert.deepEqual(oneLeft.argumentList.slice(7), runningTokens(1));
 
     harness.advanceClock(10);
     const noneLeft = runHook(secondStop, harness.environment, harness.dependencies);
-    assert.deepEqual(noneLeft.lines, []);
+    assert.equal(noneLeft.line, null);
     assert.deepEqual(noneLeft.argumentList.slice(7), allTokensCleared);
     assert.equal(harness.herdrCalls.length, 4);
   });
 
-  test('+N more only counts sub agents that are still running', () => {
+  // 舊版最多 5 行、第 5 行是 +N more；現在只有數量，超過 5 個也照實顯示
+  test('the count has no upper limit and only counts sub agents that are still running', () => {
     const harness = createHarness();
     for (let index = 1; index <= 7; index += 1) {
       harness.advanceClock(10);
       runHook(payloadWith({ agent_id: `s${index}`, agent_type: `worker${index}` }), harness.environment, harness.dependencies);
     }
-    assert.equal(harness.herdrCalls.at(-1).argumentList.at(-1), 'sub5=└─ +3 more');
+    assert.deepEqual(harness.herdrCalls.at(-1).argumentList.slice(7), runningTokens(7));
 
     const stop = (index) => {
       harness.advanceClock(10);
@@ -485,20 +401,10 @@ describe('runHook', () => {
         harness.dependencies,
       );
     };
-    assert.deepEqual(stop(1).lines, [
-      '├─ worker2 ●',
-      '├─ worker3 ●',
-      '├─ worker4 ●',
-      '├─ worker5 ●',
-      '└─ +2 more',
-    ]);
-    assert.deepEqual(stop(4).lines, [
-      '├─ worker2 ●',
-      '├─ worker3 ●',
-      '├─ worker5 ●',
-      '├─ worker6 ●',
-      '└─ worker7 ●',
-    ]);
+    assert.equal(stop(1).line, '● 6 running');
+    assert.equal(stop(4).line, '● 5 running');
+    // 已經停掉的再收到一次 stop：檔不在，不算改動、不回報
+    assert.equal(stop(4).action, 'unchanged');
   });
 
   // 升級：舊版 hook 寫的 session 狀態檔裡還在跑的 sub 搬成 sub 檔，不會在升級後第一次重畫時從側邊欄消失
@@ -519,7 +425,7 @@ describe('runHook', () => {
     const legacyLockPath = `${legacyPath}.lock`;
     writeFileSync(legacyLockPath, JSON.stringify({ pid: process.pid, startTime: '1', createdAtMs: 0 }));
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
-    assert.deepEqual(result.lines, ['├─ Plan ●', '├─ Explore ●', '└─ general-purpose ●']);
+    assert.equal(result.line, '● 3 running');
     assert.equal(existsSync(legacyPath), false);
     assert.equal(existsSync(legacyLockPath), true);
     assert.deepEqual(harness.readSubagents().map((entry) => entry.id).sort(), ['a12e8c491ce2f7f4a', 'oldrunning', 'oldrunning2']);
@@ -527,7 +433,7 @@ describe('runHook', () => {
     // 舊版的 sub 收到 SubagentStop 時照常拿掉
     harness.advanceClock(10);
     const stopped = runHook(payloadWith({ hook_event_name: 'SubagentStop', agent_id: 'oldrunning', agent_type: 'Plan' }), harness.environment, harness.dependencies);
-    assert.deepEqual(stopped.lines, ['├─ Explore ●', '└─ general-purpose ●']);
+    assert.equal(stopped.line, '● 2 running');
   });
 
   test('migration never overwrites a sub agent file the new version already wrote', () => {
@@ -555,7 +461,7 @@ describe('runHook', () => {
     assert.equal(result.action, 'reported');
     assert.deepEqual(result.removed, []);
     assert.equal(harness.herdrCalls.length, 1);
-    assert.deepEqual(harness.herdrCalls[0].argumentList.slice(7, 9), ['--token', 'sub1=└─ Plan ●']);
+    assert.deepEqual(harness.herdrCalls[0].argumentList.slice(7), runningTokens(1));
     assert.deepEqual(harness.readSubagents().map((entry) => entry.id), ['oldrunning']);
   });
 
@@ -565,10 +471,7 @@ describe('runHook', () => {
     runHook(payloadWith({ agent_id: 'second', agent_type: 'Explore' }), harness.environment, harness.dependencies);
     assert.equal(harness.herdrCalls[0].argumentList[6], String(testBootTimeNs + 1n));
     assert.equal(harness.herdrCalls[1].argumentList[6], String(testBootTimeNs + 2n));
-    assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7, 11), [
-      '--token', 'sub1=├─ general-purpose ●',
-      '--token', 'sub2=└─ Explore ●',
-    ]);
+    assert.deepEqual(harness.herdrCalls[1].argumentList.slice(7), runningTokens(2));
   });
 
   test('without a readable boot time the seq uses the fallback base', () => {
@@ -643,7 +546,7 @@ describe('runHook', () => {
     writeFileSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`), '{broken');
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1, 'broken and mismatched files are not counted');
   });
 });
 
@@ -723,7 +626,7 @@ describe('hook script as Claude Code runs it', () => {
     assert.equal(result.stderr, '');
   });
 
-  test('inside herdr: calls herdr with the tree tokens, no output, under 1 second', () => {
+  test('inside herdr: calls herdr with the count token, no output, under 1 second', () => {
     const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const result = runScript(environment, startPayloadText);
     assert.equal(result.status, 0);
@@ -733,7 +636,7 @@ describe('hook script as Claude Code runs it', () => {
     const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].slice(0, 5), ['pane', 'report-metadata', testPaneId, '--source', 'subagent.watch']);
-    assert.ok(calls[0].includes('sub1=└─ general-purpose ●'));
+    assert.deepEqual(calls[0].slice(7), runningTokens(1));
     assert.ok(existsSync(join(runtimeDirectory, 'subagent-watch', `pane-${testPaneId}.json`)));
   });
 
@@ -751,23 +654,48 @@ describe('hook script as Claude Code runs it', () => {
     });
   }
 
-  // herdr 的規則（實測）：seq 小於或等於上次收下的就忽略。最後畫在側邊欄上的就是 seq 最大的那一筆，跟送達的先後無關
-  function readShownTokens(callLogPath, previousCallCount) {
-    const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line)).slice(previousCallCount);
-    const sequences = calls.map((call) => BigInt(call[6]));
-    const newest = calls.reduce((best, call) => (BigInt(call[6]) > BigInt(best[6]) ? call : best));
-    return { callCount: previousCallCount + calls.length, sequences, tokens: newest.slice(7) };
+  // 假 herdr 照 herdr 的規則（實測）依送達的先後處理：seq 小於或等於上次收下的就忽略，所以 seq 一樣時收先到的那筆。
+  // call log 的順序就是假 herdr 收到的順序；上次收下的 seq 跟真的 herdr 一樣跨階段保留
+  function createFakeHerdrDisplay(callLogPath) {
+    let readCount = 0;
+    let lastAcceptedSequence = -1n;
+    let shownTokens = null;
+    return () => {
+      const calls = readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line)).slice(readCount);
+      readCount += calls.length;
+      for (const call of calls) {
+        const sequence = BigInt(call[6]);
+        if (sequence > lastAcceptedSequence) {
+          lastAcceptedSequence = sequence;
+          shownTokens = call.slice(7);
+        }
+      }
+      return { calls, shownTokens };
+    };
   }
 
-  // 沒有 lock 之後，平行的 hook 各自改自己的檔、各自回報：不管怎麼交錯，seq 最大的那一筆一定要等於檔案最後的狀態，一次都不能漏
-  test('parallel starts, stops and start-then-stop chains: the newest seq always shows exactly the files left', { timeout: 120_000 }, async () => {
+  // 同一個 seq 被兩個以上的 hook 拿到的組：[{ sequence, count, isNewest }]
+  function findSequenceCollisions(calls) {
+    const countBySequence = new Map();
+    for (const call of calls) {
+      countBySequence.set(call[6], (countBySequence.get(call[6]) ?? 0) + 1);
+    }
+    const newest = calls.reduce((best, call) => (BigInt(call[6]) > best ? BigInt(call[6]) : best), -1n);
+    return [...countBySequence].filter(([, count]) => count > 1).map(([sequence, count]) => ({ sequence, count, isNewest: BigInt(sequence) === newest }));
+  }
+
+  // 沒有 lock 之後，平行的 hook 各自改自己的檔、各自回報：不管怎麼交錯，假 herdr 最後顯示的一定要等於檔案最後的狀態，一次都不能漏。
+  // seq 撞號（不同核心在同一個 ns 讀時鐘）不算錯，不檢查「每個 seq 都不一樣」：同一個 seq 代表兩個 hook 在同一個 ns 取號，
+  // 兩邊取號時自己的改動都已經完成、readdir 都在取號之後，所以兩筆都看得到 seq 不大於它的每一個改動；
+  // 之後才完成的改動，那個 hook 是改完才取號，seq 一定比較大，會蓋過這兩筆。herdr 收先到的那筆也一樣正確。
+  // 最壞的情況是撞號的就是這個階段最大的 seq（之後沒有更大的回報來蓋過）：那幾筆每一筆都要等於檔案狀態，不只是先到的那筆
+  test('parallel starts, stops and start-then-stop chains: what herdr shows always equals the files left, even when two hooks get the same seq', { timeout: 120_000 }, async (context) => {
     const { runtimeDirectory, callLogPath, environment } = createScriptCase();
     const stateDirectory = join(runtimeDirectory, 'subagent-watch');
     const parallelCount = 8;
     const start = (agentId) => payloadWith({ agent_id: agentId, agent_type: `worker-${agentId}` });
     const stop = (agentId) => payloadWith({ hook_event_name: 'SubagentStop', agent_id: agentId, agent_type: `worker-${agentId}` });
-    const expectTokens = (lines) => buildMetadataArguments(testPaneId, lines, 0).slice(7);
-    let callCount = 0;
+    const readDisplay = createFakeHerdrDisplay(callLogPath);
     const checkPhase = async (label, runs, expectedIds) => {
       const results = await Promise.all(runs);
       for (const result of results.flat()) {
@@ -775,10 +703,19 @@ describe('hook script as Claude Code runs it', () => {
       }
       const running = listSessionSubagents(stateDirectory, startPayload.session_id);
       assert.deepEqual(running.map((entry) => entry.id).sort(), [...expectedIds].sort(), label);
-      const shown = readShownTokens(callLogPath, callCount);
-      callCount = shown.callCount;
-      assert.equal(new Set(shown.sequences).size, shown.sequences.length, `${label}: every seq is unique`);
-      assert.deepEqual(shown.tokens, expectTokens(buildTreeLines(running)), label);
+      const expectedTokens = buildMetadataArguments(testPaneId, buildSidebarLine(running.length), 0).slice(7);
+      const { calls, shownTokens } = readDisplay();
+      const collisions = findSequenceCollisions(calls);
+      const isShownCorrect = JSON.stringify(shownTokens) === JSON.stringify(expectedTokens);
+      // 撞號的統計印成 TAP diagnostic（POC 連跑時收集）；先印再 assert，失敗的那一次也看得到
+      for (const collision of collisions) {
+        context.diagnostic(`seq collision: ${label}: ${collision.count} reports share seq ${collision.sequence}${collision.isNewest ? ' (the newest seq of the phase)' : ''}, shown ${isShownCorrect ? 'correct' : 'WRONG'}`);
+      }
+      assert.deepEqual(shownTokens, expectedTokens, label);
+      const newestSequence = calls.reduce((best, call) => (BigInt(call[6]) > best ? BigInt(call[6]) : best), -1n);
+      for (const call of calls.filter((candidate) => BigInt(candidate[6]) === newestSequence)) {
+        assert.deepEqual(call.slice(7), expectedTokens, `${label}: every report with the newest seq`);
+      }
     };
     for (let round = 0; round < 3; round += 1) {
       const ids = Array.from({ length: parallelCount }, (unused, index) => `r${round}a${index}`);
@@ -808,15 +745,18 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
     let lastAcceptedSequence = -1n;
     let shownTokens = null;
     let clockMs = 1_000_000;
+    const reports = [];
     const acceptReport = (argumentList) => {
+      reports.push(argumentList);
       const sequence = BigInt(argumentList[6]);
       if (sequence > lastAcceptedSequence) {
         lastAcceptedSequence = sequence;
         shownTokens = argumentList.slice(7);
       }
     };
-    // pauses：[時機, 要插進來的 hook]；時機 'seq' 是取 seq 的當下（改完檔、readdir 之前），'report' 是送 herdr 的當下（readdir 之後）
-    const run = (payloadText, pauses = {}) => {
+    // pauses：[時機, 要插進來的 hook]；時機 'seq' 是取 seq 的當下（改完檔、readdir 之前），'report' 是送 herdr 的當下（readdir 之後）。
+    // monotonicOverrideNs：讀時鐘時拿到指定的值，用來重現撞號
+    const run = (payloadText, pauses = {}, monotonicOverrideNs = null) => {
       return runHook(payloadText, environment, {
         now: () => {
           clockMs += 1;
@@ -829,8 +769,8 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
         deadlineMs: Number.POSITIVE_INFINITY,
         // 先讀時鐘再插入：插進來的 hook 取到的 seq 一定比這個 hook 大
         monotonicNs: () => {
-          const valueNs = process.hrtime.bigint();
-          pauses.seq?.();
+          const valueNs = monotonicOverrideNs ?? process.hrtime.bigint();
+          pauses.seq?.(valueNs);
           return valueNs;
         },
         runHerdr: (binaryPath, argumentList) => {
@@ -839,9 +779,9 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
         },
       });
     };
-    const expectedTokens = () => buildMetadataArguments(testPaneId, buildTreeLines(listSessionSubagents(stateDirectory, sessionId)), 0).slice(7);
+    const expectedTokens = () => buildMetadataArguments(testPaneId, buildSidebarLine(listSessionSubagents(stateDirectory, sessionId).length), 0).slice(7);
     const ownFileExists = (agentId) => existsSync(join(stateDirectory, subagentFileName(sessionId, agentId)));
-    return { run, shown: () => shownTokens, expectedTokens, ownFileExists, stateDirectory };
+    return { run, shown: () => shownTokens, reports, expectedTokens, ownFileExists, stateDirectory };
   }
 
   const start = (agentId) => payloadWith({ agent_id: agentId, agent_type: `type-${agentId}` });
@@ -858,7 +798,7 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
       },
     });
     assert.equal(isOwnFileWrittenAtSequence, true);
-    assert.deepEqual(interleaving.shown(), ['--token', 'sub1=├─ late ●', '--token', 'sub2=└─ type-first ●', '--clear-token', 'sub3', '--clear-token', 'sub4', '--clear-token', 'sub5']);
+    assert.deepEqual(interleaving.shown(), runningTokens(2));
   });
 
   test('the seq is taken after the own file is removed', () => {
@@ -885,6 +825,27 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
           assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
         });
       }
+    }
+  }
+
+  // 撞號：另一個 hook 在這個 hook 讀時鐘的同一個 ns 取號，拿到一樣的 seq。同一個 ns 代表另一個 hook 取號時，這個 hook 的改動已經完成、readdir 還沒開始，
+  // 所以把它整個插在取 seq 的當下（插在 report 的當下就不是同一個 ns 了：readdir 至少要幾 µs）。插進來的先送到，herdr 收它、忽略這個 hook 的；
+  // 兩筆都看得到兩邊的改動，所以不管收哪一筆都正確
+  for (const [firstLabel, firstPayload] of [['start', start('a')], ['stop', stop('a')]]) {
+    for (const [secondLabel, secondPayload] of [['start', start('b')], ['stop', stop('b')], ['start of a third sub agent', start('c')]]) {
+      test(`a ${secondLabel} that gets the same seq inside a ${firstLabel}: either report shows every change`, () => {
+        const interleaving = createInterleavingCase();
+        interleaving.run(start('a'));
+        interleaving.run(start('b'));
+        const reportCountBefore = interleaving.reports.length;
+        interleaving.run(firstPayload, { seq: (valueNs) => interleaving.run(secondPayload, {}, valueNs) });
+        const collided = interleaving.reports.slice(reportCountBefore);
+        assert.equal(collided.length, 2);
+        assert.equal(collided[0][6], collided[1][6], 'both reports carry the same seq');
+        assert.deepEqual(collided[0].slice(7), interleaving.expectedTokens(), 'the report herdr keeps (first to arrive)');
+        assert.deepEqual(collided[1].slice(7), interleaving.expectedTokens(), 'the report herdr ignores');
+        assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
+      });
     }
   }
 
@@ -1008,7 +969,7 @@ describe('the ancestor scan decides; herdr\'s session is asked only when claude 
     });
     const result = runHook(startPayloadText, harness.environment, harness.dependencies);
     assert.equal(result.action, 'reported');
-    assert.deepEqual(result.lines, ['└─ general-purpose ●']);
+    assert.equal(result.runningCount, 1);
     assert.equal(harness.herdrCalls.length, 1);
     assert.deepEqual(paneQueries, [], 'one claude ancestor is enough; herdr is not asked');
     const stateDirectory = join(harness.runtimeDirectory, 'subagent-watch');
@@ -1068,7 +1029,8 @@ describe('invisible characters in agent_type', () => {
     assert.equal(sanitizeText('代理 Explore'), '代理 Explore');
   });
 
-  test('the review PoC agent_type reaches herdr without any Cc or Cf character', () => {
+  // 側邊欄只顯示數量，agent_type 完全不會送給 herdr
+  test('the review PoC agent_type never reaches herdr: only the count is reported', () => {
     const runtimeDirectory = createTemporaryDirectory();
     const herdrCalls = [];
     const result = runHook(
@@ -1086,10 +1048,9 @@ describe('invisible characters in agent_type', () => {
       },
     );
     assert.equal(result.action, 'reported');
-    const tokens = herdrCalls[0].filter((argument) => argument.startsWith('sub1='));
-    assert.deepEqual(tokens, ['sub1=└─ gp]52;c;QQ==2Jevil ●']);
+    assert.deepEqual(herdrCalls[0].slice(7), runningTokens(1));
     for (const argument of herdrCalls[0]) {
-      assert.doesNotMatch(argument, /[\p{Cc}\p{Cf}]/u);
+      assert.doesNotMatch(argument, /[\p{Cc}\p{Cf}]|gp|evil/u);
     }
   });
 });

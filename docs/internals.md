@@ -14,7 +14,7 @@ The `subagent.watch.setup` action edits two of your own config files. The result
    - **Already set up with an older version** (only `SubagentStart` / `SubagentStop`)? Run setup again: it adds `SessionStart`, `Stop` and `StopFailure` and leaves the existing two as they are. Each event is checked on its own, so whichever are missing get added and none is added twice. Until then the popup uses the older session lookup and a sub agent row goes away only with its `SubagentStop`. A Claude Code session that was already running gets its session mapping at its next `SessionStart` (restart, `/resume`, `/clear` or compaction).
 2. **herdr**: in `$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set. Everything added is wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`.
    - Key binding: a `[[keys.command]]` for `prefix+.` is added only when nothing else uses `prefix+.`. If another action already has it, setup skips it and the log includes a snippet you can use to bind a different key.
-   - Sidebar rows: if there is no `[ui.sidebar.agents.rows_by_agent]`, the whole table is added; if the table exists but has no `claude =`, the rows are inserted right below the table header; if you already have your own `claude =` without `$sub1`, it is left alone and the log includes the five lines to paste yourself.
+   - Sidebar rows: if there is no `[ui.sidebar.agents.rows_by_agent]`, the whole table is added; if the table exists but has no `claude =`, the rows are inserted right below the table header; if you already have your own `claude =` without `$sub1`, it is left alone and the log includes the line to paste yourself. Claude rows that already contain `$sub1`, including the five `$sub1`…`$sub5` lines written by an older setup, count as set up and are not rewritten (see [What setup adds](sidebar.md#what-setup-adds)).
    - The new content is first written to a temporary file next to the config file and checked with `herdr config check`. If it reports new problems, the temporary file is deleted and the error is reported (the original file was never touched, so there is nothing to restore); only when it passes is the temporary file `rename`d into place and `herdr server reload-config` run.
 
 Notes:
@@ -34,7 +34,7 @@ What remove does not touch:
 
 - Settings you added by hand outside the markers are not deleted; the log lists their line numbers.
 - Your other hooks and the rest of both files.
-- Sidebar rows already on screen stay until that pane reports again or herdr restarts. To clear them right away, see [How to remove](sidebar.md#how-to-remove) in `docs/sidebar.md`.
+- The sidebar line already on screen stays until that pane reports again or herdr restarts. To clear them right away, see [How to remove](sidebar.md#how-to-remove) in `docs/sidebar.md`.
 
 ## Popup viewer details
 
@@ -92,20 +92,17 @@ You can also open the popup without the action: `herdr plugin pane open --plugin
 
 ## Sidebar
 
-Under the claude row of the herdr sidebar, up to 5 lines show the sub agents of that session that are **still running**:
+Under the claude row of the herdr sidebar, one line shows how many sub agents of that session are **still running**:
 
 ```
 claude
-├─ Explore ●
-├─ general-purpose ●
-└─ Plan ●
+● 3 running
 ```
 
-- Only running sub agents (`●`) are listed, without numbers. When a sub agent ends (`SubagentStop`), its line is removed and the rest are redrawn.
+- Only the number is shown, without names and without an upper limit. It goes up with every `SubagentStart` and down with every `SubagentStop`.
 - A sub agent that ended without `SubagentStop` (for example stopped by an API error such as a usage limit) is removed at the first hook event of that session that comes 2 minutes or more after its last write, for example when the main session finishes its next turn (`Stop`, or `StopFailure` when that turn itself ends with an API error). This is only a safety net: a sub agent without an end signal (or a resumed one whose new run has not written anything yet) is never removed, however long it is silent.
-- When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the tree is redrawn for that session right away.
-- With more than 5 running, the fifth line becomes `└─ +N more`.
-- With nothing running, only the claude row is left.
+- When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the count is redrawn for that session right away.
+- With nothing running, the line disappears and only the claude row is left.
 - Finished sub agents and what they did are in the popup viewer.
 
 Details are in [`docs/sidebar.md`](sidebar.md).
@@ -156,9 +153,9 @@ So after `/resume` or restarting `claude`, the popup switches to the new session
 - An end signal older than the last assistant activity does not count: a resumed sub agent goes back to `●`.
 - Foreground sub agents: the sample has only one (`"requestShape":"foreground"`), and it ended with `SubagentHandback` (rule 1). Rule 2 (`end_turn`) still applies to them; whether a foreground sub agent can also stop at `end_turn` mid-run is **not verified**.
 
-### Sidebar tree
+### Sidebar count
 
-Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks (`StopFailure` fires instead of `Stop` when a turn ends with an API error); `hooks/sidebar-hook.mjs` (run through `bin/run.sh`) writes or removes one small file per running sub agent (no lock: hooks running in parallel only ever touch their own sub agent's file, and herdr's `--seq` keeps the newest report) and calls `herdr pane report-metadata` to write the tree lines into pane tokens `sub1`…`sub5`, which the `claude` rows added by setup display. The hook also writes the pane map used in step 2 above (on every event except `Stop` and `StopFailure`). On every event it also removes sub agents of that session whose transcript ends with an end signal (a `SubagentHandback`, an API error, an interruption, a task notification, and so on) from this run and has not been written for 2 minutes, because some of them never get a `SubagentStop`. The hook applies to every Claude Code session, so it always exits 0, prints nothing and finishes within its time budget. See [`docs/sidebar.md`](sidebar.md) for the details.
+Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks (`StopFailure` fires instead of `Stop` when a turn ends with an API error); `hooks/sidebar-hook.mjs` (run through `bin/run.sh`) writes or removes one small file per running sub agent (no lock: hooks running in parallel only ever touch their own sub agent's file, and herdr's `--seq` keeps the newest report) and calls `herdr pane report-metadata` to write `● N running` into pane token `sub1`, which the `claude` rows added by setup display (`sub2`…`sub5`, used by older versions, are cleared on every report). The hook also writes the pane map used in step 2 above (on every event except `Stop` and `StopFailure`). On every event it also removes sub agents of that session whose transcript ends with an end signal (a `SubagentHandback`, an API error, an interruption, a task notification, and so on) from this run and has not been written for 2 minutes, because some of them never get a `SubagentStop`. The hook applies to every Claude Code session, so it always exits 0, prints nothing and finishes within its time budget. See [`docs/sidebar.md`](sidebar.md) for the details.
 
 ### How Node is found
 
