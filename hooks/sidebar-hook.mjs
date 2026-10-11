@@ -1,6 +1,8 @@
 // Claude Code SessionStart／SubagentStart／SubagentStop／Stop／StopFailure hook：更新 herdr 側邊欄 claude 那一列底下的 sub agent 樹狀行（只列跑中的，歷史看 popup viewer），
 // 並寫 pane 對照檔給 popup viewer。
 // 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、在 totalBudgetMs 內結束。
+// 跑中的 sub 一個一個檔（sub-<sessionId>-<agentId>.json），每個 hook 只改自己那個 sub 的檔，不用 lock；
+// 平行的 hook 各自回報，靠 herdr 的 --seq 只留最新的一筆（見 takeSequence）
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
@@ -11,6 +13,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   renameSync,
@@ -47,23 +50,22 @@ const pruneOnlyEventNames = new Set(['Stop', 'StopFailure']);
 // 官方文件列的 source：startup、resume、clear、compact、fork；認不得的記成 unknown，標記照樣成立
 const sessionStartSourcePattern = /^[a-z_]{1,32}$/;
 
-// 整體時間上限，從 main() 開始算（不含 node 啟動）。平常碰不到：實測 8 個 hook 同時觸發（真實 transcript、假 herdr 每次 30 ms、跑 20 輪）總時間中位數約 220 ms，跟預算大小無關。
-// 只有機器很忙、搶 lock 時才會等到上限：鎖在 1 個 CPU、旁邊有 6 個吃滿 CPU 的 process 時，800 ms 的預算 160 次更新掉了約 70 次（lock-timeout），
-// 1500 ms 只掉 1 次，最慢的 hook 約 2.0 秒。漏掉的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄，比很忙時多等 1 秒嚴重。
-// 上限要離 settings.json 的 hook timeout（hookTimeoutSeconds，5 秒）夠遠：最慢的 2.0 秒還差 3 秒；測試檢查預算不超過 timeout 的一半
+// 整體時間上限，從 main() 開始算（不含 node 啟動）。沒有 lock 之後不會再「等」別的 hook，剩下的只有搶 CPU、判斷 sub 是否結束（另有 maximumPruneMs）與 herdr 本身；
+// herdr 呼叫的 timeout 就是剩下的預算，herdr 被砍掉就是漏掉一次更新，所以預算不跟著縮：調小只會讓很忙時的 herdr 更容易被砍，平常又碰不到上限。
+// 實測（8 個 hook 同時觸發、假 herdr 每次 30 ms、5 個跑中的 sub 各有約 1 MB 的 transcript；時間含 node 啟動）：一般情況每個 hook 最多約 90 ms（lock 版約 630 ms）；
+// 鎖在 1 個 CPU、旁邊 4 個吃滿 CPU 的 process 時最多約 650 ms（lock 版約 1.3 秒），離 1.5 秒還很遠。
+// 上限要離 settings.json 的 hook timeout（hookTimeoutSeconds，5 秒）夠遠；測試檢查預算不超過 timeout 的一半
 export const totalBudgetMs = 1500;
 const minimumHerdrBudgetMs = 100;
 const maximumPaneQueryMs = 300;
-// lock 外判斷 sub 是否結束最多用這麼久，剩下的 sub 留到下一次事件：判斷拖太久的話，這次事件自己的更新反而等不到 lock。
-// 實測 5 個 sub、真實大小 transcript：單獨跑約 10 ms，8 個 hook 同時跑最多約 22 ms。8 個擠在 1 個 CPU 上、旁邊還有 4 個吃滿 CPU 的 process 時，
-// 每個 hook 都會碰到上限，大家同時判斷、搶 CPU，拿 lock 跟著變慢：上限 200 ms 時 640 次更新掉了 5 次（lock-timeout），100 ms 時 640 次都沒掉
+// 判斷 sub 是否結束最多用這麼久，剩下的 sub 留到下一次事件：判斷拖越久，這次事件自己的回報越晚送出。
+// 實測 5 個 sub、真實大小 transcript：單獨跑約 10 ms，8 個 hook 同時跑最多約 22 ms；8 個擠在 1 個 CPU 上、旁邊還有 4 個吃滿 CPU 的 process 時每個 hook 都會碰到上限
 export const maximumPruneMs = 100;
-const lockRetryIntervalMs = 10;
-// 舊版的 lock 是空檔、沒有 pid 可查，只能看年紀；`.break-*` 檔也用這個年紀判斷是不是被砍掉的 process 留下的。
-// 空 lock 只有舊版 hook 會建（它的預算是 800 ms），現在的 lock 都有 pid、走 isLockOwnerGone，所以不用跟著 totalBudgetMs 調
-const staleLockMs = 2000;
-// hook 整體預算 1.5 秒（很忙時實測最慢約 2 秒），超過這個年紀的 lock 不可能還有人在用；pid 查不準時（例如不同 pid namespace）的保險
-const maximumLockAgeMs = 10_000;
+// 跑中的 sub 一個一個檔；暫存檔（.tmp 結尾）與清除時暫時改名的檔不會被當成 sub
+const subagentFilePrefix = 'sub-';
+const subagentFileSuffix = '.json';
+// herdr 的 --seq 是 u64（實測超過上限 exit 1）；開機時間讀不到時的基準，理由見 takeSequence
+export const fallbackSequenceBaseNs = 10n ** 17n;
 const maximumAncestorDepth = 64;
 const safeIdentifierPattern = /^[A-Za-z0-9_.:-]{1,128}$/;
 const invisibleCharacterPattern = /[\p{Cc}\p{Cf}]/gu;
@@ -134,48 +136,66 @@ export function parseHookPayload(rawInput) {
   };
 }
 
-export function createEmptySessionState(sessionId) {
-  return {
-    sessionId,
-    lastSequence: 0,
-    subagents: [],
-  };
+export function subagentFileName(sessionId, agentId) {
+  return `${subagentFilePrefix}${sessionId}-${agentId}${subagentFileSuffix}`;
 }
 
-export function normalizeSessionState(candidate, sessionId) {
+// sub 檔內容：{ sessionId, id, agentType, startedAtMs }（id、agentType、startedAtMs 沿用舊版狀態檔每一筆的欄位）。
+// 只看檔名前綴的話，某個 session id 剛好是另一個 session id 加上「-…」時會混進來，所以內容的 sessionId 與 id 要跟檔名完全對得上才算
+export function parseSubagentFile(text, sessionId, fileName) {
+  let entry;
+  try {
+    entry = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!entry || typeof entry !== 'object' || entry.sessionId !== sessionId || !isSafeIdentifier(entry.id)) {
+    return null;
+  }
+  if (fileName !== subagentFileName(sessionId, entry.id) || typeof entry.agentType !== 'string' || !Number.isFinite(entry.startedAtMs)) {
+    return null;
+  }
+  return { id: entry.id, agentType: entry.agentType, startedAtMs: entry.startedAtMs };
+}
+
+function readSubagentFile(filePath, sessionId, fileName) {
+  let text;
+  try {
+    text = readFileSync(filePath, 'utf8');
+  } catch {
+    // 讀的當下被別的 hook 刪掉（SubagentStop 或清除）：當成已經結束
+    return null;
+  }
+  return parseSubagentFile(text, sessionId, fileName);
+}
+
+// 這個 session 跑中的 sub。readdir 與逐一讀檔之間別的 hook 可能改了資料夾：讀到的不一定是同一刻的狀態，
+// 但取 seq 在 readdir 之前，比較晚改動的 hook 的 seq 一定比較大，herdr 最後留下的是它的（見 takeSequence）
+export function listSessionSubagents(stateDirectory, sessionId) {
+  const prefix = `${subagentFilePrefix}${sessionId}-`;
+  const subagents = [];
+  for (const name of readdirSync(stateDirectory)) {
+    if (!name.startsWith(prefix) || !name.endsWith(subagentFileSuffix)) {
+      continue;
+    }
+    const subagent = readSubagentFile(join(stateDirectory, name), sessionId, name);
+    if (subagent !== null) {
+      subagents.push(subagent);
+    }
+  }
+  return subagents;
+}
+
+// 舊版（一個 session 一個狀態檔＋lock）留下的跑中 sub：status 為 done 的是更舊版本留下的已結束項目，不搬
+export function readLegacySubagents(candidate) {
   if (!candidate || typeof candidate !== 'object' || !Array.isArray(candidate.subagents)) {
-    return createEmptySessionState(sessionId);
+    return [];
   }
-  const subagents = candidate.subagents.filter((subagent) => {
-    // 舊版狀態檔會留著 status 為 done 的 sub；不丟掉的話升級後它們會被當成跑中
-    return subagent && typeof subagent === 'object' && typeof subagent.id === 'string' && subagent.status !== 'done';
+  return candidate.subagents.filter((subagent) => {
+    return subagent && typeof subagent === 'object' && isSafeIdentifier(subagent.id) && typeof subagent.agentType === 'string' && subagent.status !== 'done';
+  }).map((subagent) => {
+    return { id: subagent.id, agentType: subagent.agentType, startedAtMs: Number.isFinite(subagent.startedAtMs) ? subagent.startedAtMs : 0 };
   });
-  return {
-    sessionId,
-    lastSequence: Number.isFinite(candidate.lastSequence) ? candidate.lastSequence : 0,
-    subagents,
-  };
-}
-
-// 狀態檔只記跑中的 sub：stop 直接移除，檔案大小只跟同時跑的數量有關
-export function applyEvent(state, event, nowMs) {
-  if (event.agentId === null) {
-    return { changed: false, state };
-  }
-  const existing = state.subagents.find((subagent) => subagent.id === event.agentId);
-  if (event.eventName === 'SubagentStart') {
-    // 同一個 sub 還在清單裡又收到 start（resume 時上一輪的 stop 沒記到，例如 lock 逾時）：只留一筆，啟動時間換成這一次的。
-    // 沿用舊的話，上一輪的結束訊號會晚於啟動時間，正在跑的這一輪會被當成已經結束
-    const others = state.subagents.filter((subagent) => subagent.id !== event.agentId);
-    const started = { id: event.agentId, agentType: event.agentType, startedAtMs: nowMs };
-    return { changed: true, state: { ...state, subagents: [...others, started] } };
-  }
-  // 沒看過 start 的 stop 不收：可能是內部 agent，或 hook 安裝前就啟動的 sub
-  if (!existing) {
-    return { changed: false, state };
-  }
-  const subagents = state.subagents.filter((subagent) => subagent.id !== event.agentId);
-  return { changed: true, state: { ...state, subagents } };
 }
 
 // 對照檔合約（viewer 讀）：sessionId、transcriptPath、cwd、updatedAtMs 四個欄位不准改；
@@ -370,10 +390,10 @@ function collectTaskNotifications(mainTail) {
 
 // 只靠 SubagentStop 移除的話，因 API 錯誤中斷的 sub 沒收到 SubagentStop（實際發生過，原因未驗證）就會一直卡在側邊欄。每次 hook 觸發時檢查這個 session 每個 sub 的 transcript 尾端。
 // sub transcript 在 `<main transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`；main transcript 路徑不像樣或不存在時不判斷（路徑可能對不上，寧可留著）。
-// 只讀檔、不改狀態，回傳判斷為已結束的 sub（含判斷當下的 startedAtMs）：runHook 在 lock 外呼叫，讀 transcript 的時間不算進持有 lock 的時間
-export function findEndedSubagents(state, event, { nowMs, readTail = readFileTail, hasTimeLeft = () => true }) {
+// 只讀檔、不改任何檔案，回傳判斷為已結束的 sub（含判斷當下的 startedAtMs），刪檔由 removeEndedSubagentFile 做
+export function findEndedSubagents(subagents, event, { nowMs, readTail = readFileTail, hasTimeLeft = () => true }) {
   const mainTranscriptPath = event.transcriptPath;
-  if (state.subagents.length === 0 || !isAbsolute(mainTranscriptPath) || !mainTranscriptPath.endsWith('.jsonl')) {
+  if (subagents.length === 0 || !isAbsolute(mainTranscriptPath) || !mainTranscriptPath.endsWith('.jsonl')) {
     return [];
   }
   const mainTail = readTail(mainTranscriptPath, transcriptTailBytes);
@@ -383,8 +403,8 @@ export function findEndedSubagents(state, event, { nowMs, readTail = readFileTai
   const notifications = collectTaskNotifications(mainTail);
   const subagentsDirectory = join(mainTranscriptPath.slice(0, -'.jsonl'.length), 'subagents');
   const ended = [];
-  for (const subagent of state.subagents) {
-    // 這次事件的 sub 不判斷：SubagentStart 的（可能是 resume）transcript 還停在上一輪；SubagentStop 的本來就會被 applyEvent 拿掉，不用多讀一次
+  for (const subagent of subagents) {
+    // 這次事件的 sub 不判斷：SubagentStart 的（可能是 resume）transcript 還停在上一輪；SubagentStop 的檔本來就刪了，不用多讀一次
     if (subagent.id === event.agentId || !isSafeIdentifier(subagent.id)) {
       continue;
     }
@@ -399,26 +419,33 @@ export function findEndedSubagents(state, event, { nowMs, readTail = readFileTai
   return ended;
 }
 
-// lock 內呼叫，不讀任何檔案。判斷之後、拿到 lock 之前，別的 hook 可能已經改過狀態檔：
-// 已經不在的不用拿；startedAtMs 不一樣的是被拿掉後又重新 SubagentStart（resume）的新一輪，判斷的是上一輪，不能拿
-export function removeEndedSubagents(state, ended) {
-  const removed = [];
-  const kept = state.subagents.filter((subagent) => {
-    const match = ended.find((entry) => entry.id === subagent.id && entry.startedAtMs === subagent.startedAtMs);
-    if (match === undefined) {
-      return true;
-    }
-    removed.push({ id: subagent.id, reason: match.reason });
-    return false;
-  });
-  if (removed.length === 0) {
-    return { state, removed };
+// 判斷之後到刪檔之前，別的 hook 可能已經改過這個 sub 的檔：已經不在的（SubagentStop 或別的 hook 清掉了）不用刪；
+// startedAtMs 不一樣的是又 SubagentStart（resume）的新一輪，判斷的是上一輪，不能刪。
+// 先讀再 unlink 的話，兩步之間 resume 換上的新檔會被刪掉，所以先 rename 到隨機的暫存名「拿走」路徑上那一份，再看拿到的是不是判斷的那一輪：
+// rename 是原子的，拿到的一定是某個完整版本；不是的話用 link 放回去（路徑上已經有更新的檔就不放，link 不會覆蓋）。
+// 拿走到放回之間，別的 hook readdir 會看不到這個 sub；放回之後這次事件一定會取 seq、重新 readdir 再回報，seq 比那些 hook 大，側邊欄最後仍會列出它。
+// 回傳 'removed'、'gone'（已經不在）或 'restored'（放回，或路徑上已有更新的檔）
+export function removeEndedSubagentFile(stateDirectory, sessionId, ended) {
+  const fileName = subagentFileName(sessionId, ended.id);
+  const filePath = join(stateDirectory, fileName);
+  const claimedPath = createTemporaryPath(filePath);
+  try {
+    renameSync(filePath, claimedPath);
+  } catch {
+    return 'gone';
   }
-  return { state: { ...state, subagents: kept }, removed };
-}
-
-export function pruneEndedSubagents(state, event, options) {
-  return removeEndedSubagents(state, findEndedSubagents(state, event, options));
+  const claimed = readSubagentFile(claimedPath, sessionId, fileName);
+  if (claimed !== null && claimed.startedAtMs === ended.startedAtMs) {
+    removeQuietly(claimedPath);
+    return 'removed';
+  }
+  try {
+    linkSync(claimedPath, filePath);
+  } catch {
+    // 路徑上已經有更新的檔（又一次 SubagentStart），留著新的
+  }
+  removeQuietly(claimedPath);
+  return 'restored';
 }
 
 function judgeSubagent(subagent, { subagentsDirectory, notifications, nowMs, readTail }) {
@@ -452,8 +479,15 @@ export function formatTreeLine(branch, agentType) {
   return `${prefix}${name}${suffix}`;
 }
 
+// 同一毫秒啟動的用 id 排：readdir 的順序不固定，不排的話平行的 hook 會畫出順序不同的樹
 export function buildTreeLines(runningSubagents) {
-  const ordered = [...runningSubagents].sort((first, second) => (first.startedAtMs ?? 0) - (second.startedAtMs ?? 0));
+  const ordered = [...runningSubagents].sort((first, second) => {
+    const difference = (first.startedAtMs ?? 0) - (second.startedAtMs ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+    return first.id < second.id ? -1 : first.id > second.id ? 1 : 0;
+  });
   const overflows = ordered.length > maximumTreeLines;
   const visible = overflows ? ordered.slice(0, maximumTreeLines - 1) : ordered;
   const lines = visible.map((subagent, index) => {
@@ -466,9 +500,40 @@ export function buildTreeLines(runningSubagents) {
   return lines;
 }
 
-// herdr 會忽略同 source 中 seq 不大於上一筆的回報；同一毫秒連發時用 +1 保持遞增
-export function nextSequence(lastSequence, nowMs) {
-  return Math.max(nowMs, (Number.isFinite(lastSequence) ? lastSequence : 0) + 1);
+// /proc/stat 的 btime：開機時刻（epoch 秒）。讀不到或不像樣回傳 null
+export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePath, 'utf8')) {
+  let text;
+  try {
+    text = readText('/proc/stat');
+  } catch {
+    return null;
+  }
+  const match = /^btime (\d{1,19})$/m.exec(text);
+  if (match === null) {
+    return null;
+  }
+  const seconds = BigInt(match[1]);
+  return seconds > 0n ? seconds : null;
+}
+
+// herdr 實測：同一個 (pane, source) 的 --seq 小於或等於上次收下的就忽略（exit 0、沒有訊息），比較大才收；不同 pane、不同 source 各自計算。
+// 沒有 lock 之後，同一個 session 平行的 hook 各自改自己的檔、各自回報，側邊欄最後顯示的是 seq 最大的那一筆。
+// seq 在「改完檔（寫／刪自己的檔、清掉結束的 sub）之後、readdir 之前」取：改檔的 hook 取 seq 時改動已經完成，
+// seq 比它大的回報一定是之後才 readdir，看得到這個改動；在改動完成之前就 readdir 的回報，seq 一定比較小，會被 herdr 忽略。
+// 所以最後留下的一定包含每一個改動。前提是不同 process 取的 seq 夠細、不會撞號（撞號時後到的被忽略）。
+// POC（8 個 hook 同時觸發、20 輪×3 種情境：同時 start、同時 stop、start 後馬上 stop；一般／taskset -c 0／再加 4 或 6 個吃滿 CPU 的 process）：
+// 這個做法 0 次漏掉；seq 用毫秒時撞號漏 22/60，seq 在寫檔之前取漏 1–2/60，不帶 seq 漏 10–19/60。
+// 值是「開機時刻（btime 秒）× 1e9 ＋ monotonic ns」，BigInt 算、字串傳：monotonic（process.hrtime，所有 process 共用同一個時鐘）解析度夠細，
+// 但重開機歸零；herdr 若重開機後還記得舊的 seq（未驗證）就會忽略之後全部的回報，加上開機時刻後跨重開機也遞增。
+// 現在約 1.79e18，離 u64 上限（約 1.8e19）很遠；舊版的 seq 是毫秒（約 1.79e12），升級後新的一定比較大。
+// 讀不到 btime 時改用固定基準 1e17 ＋ monotonic ns：仍然夠細、仍大於舊版的毫秒 seq，只是重開機後會從小的值重來（同上，herdr 是否記得未驗證）。
+// 不用 Date.now()：毫秒解析度在平行 hook 間會撞號（上面的 22/60）；Date.now() 毫秒 × 1e6 ＋ hrtime 的 ns 餘數也不行，
+// 兩個時鐘的毫秒邊界不一致，同一毫秒內的先後會排錯。讀不到 btime 只會發生在沒有 /proc 的環境（README 只支援 Linux），所以不另外想辦法跨重開機。
+// 已知風險：btime 是「現在的系統時間 − 開機後經過的時間」，系統時間被往回調（手動改時間、NTP step）時 btime 跟著變小，
+// 之後幾秒內的 seq 可能小於調整前送出的，那段時間的回報會被忽略，直到下一個事件。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變 btime（未實測）
+export function takeSequence(bootTimeSeconds, monotonicNs) {
+  const baseNs = bootTimeSeconds === null ? fallbackSequenceBaseNs : bootTimeSeconds * 1_000_000_000n;
+  return baseNs + monotonicNs;
 }
 
 export function buildMetadataArguments(paneId, lines, sequence) {
@@ -498,12 +563,10 @@ export function readProcessInfo(processId) {
     const commandEnd = stat.lastIndexOf(')');
     const command = stat.slice(stat.indexOf('(') + 1, commandEnd);
     const fieldsAfterCommand = stat.slice(commandEnd + 2).split(' ');
-    // proc(5)：第 3 欄 state、第 4 欄 ppid、第 22 欄 starttime（開機後的 clock ticks）
+    // proc(5)：第 4 欄 ppid
     return {
       command,
-      state: fieldsAfterCommand[0],
       parentProcessId: Number(fieldsAfterCommand[1]),
-      startTime: fieldsAfterCommand[19] ?? null,
     };
   } catch {
     return null;
@@ -629,165 +692,63 @@ function writeJsonFileAtomically(filePath, data) {
   }
 }
 
-function sleepSync(durationMs) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
-}
-
-export function parseLockOwner(text) {
-  let owner;
+// 路徑上已經有檔就不寫：link 跟 wx 一樣「不存在才建立」，搬舊版狀態檔時不會蓋掉新版 hook 已經寫好的 sub 檔
+function writeJsonFileIfMissing(filePath, data) {
+  const temporaryPath = createTemporaryPath(filePath);
+  writeFileSync(temporaryPath, `${JSON.stringify(data)}\n`, { mode: 0o600, flag: 'wx' });
   try {
-    owner = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  // pid 會交給 process.kill：0 或負數代表整個 process group，一定要是正整數
-  if (!owner || typeof owner !== 'object' || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
-    return null;
-  }
-  return { pid: owner.pid, startTime: typeof owner.startTime === 'string' ? owner.startTime : null };
-}
-
-export function isLockOwnerGone(owner, readInfo = readProcessInfo) {
-  try {
-    process.kill(owner.pid, 0);
-  } catch (error) {
-    if (error.code === 'ESRCH') {
-      return true;
-    }
-    if (error.code !== 'EPERM') {
-      return false;
-    }
-  }
-  const info = readInfo(owner.pid);
-  if (info === null || info.state === 'Z') {
-    return true;
-  }
-  // pid 被重複使用：同一個 pid 但啟動時間不同，原本的持有者已經不在
-  return owner.startTime !== null && info.startTime !== owner.startTime;
-}
-
-// lock 的 inode 與內容要從同一個 fd 讀；先 lstat 再 readFile 的話，中間被換掉會拿到對不起來的兩份資料
-function readLockFile(filePath) {
-  const descriptor = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    return { stats: fstatSync(descriptor), content: readFileSync(descriptor, 'utf8') };
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-// 回傳 null 代表 lock 剛好被釋放，可以馬上再搶；讀不了的 lock 當成有人在用，照常等
-function inspectLock(lockPath) {
-  const unreadableLock = { inode: null, content: null, isStale: false };
-  let lockFile;
-  try {
-    lockFile = readLockFile(lockPath);
-  } catch (error) {
-    return error.code === 'ENOENT' ? null : unreadableLock;
-  }
-  try {
-    const owner = parseLockOwner(lockFile.content);
-    const ageMs = Date.now() - lockFile.stats.mtimeMs;
-    const isStale = ageMs > maximumLockAgeMs || (owner === null ? ageMs > staleLockMs : isLockOwnerGone(owner));
-    return { inode: lockFile.stats.ino, content: lockFile.content, isStale };
-  } catch {
-    return unreadableLock;
-  }
-}
-
-// 好幾個 process 同時判定同一個 lock 失效時只能有一個去刪。直接 unlink 的話，別人可能剛刪掉舊 lock、建好新的，
-// 這裡會刪到新的 lock，兩邊都以為拿到 lock，狀態檔就會掉資料。
-// 做法：用 link 搶「<lock>.break-<inode>」這個名字（已存在就失敗），搶到且確認是判定失效的那個 lock 才刪；
-// 能拿掉這個 lock 的只有它的持有者（已確認不在）和搶到 .break 的人，所以刪的一定是失效的那個。
-// 只比 inode 不夠：ext4 這類檔案系統會把剛釋放的 inode 馬上給下一個新檔，別人接管後新建的 lock 可能拿到同一個 inode，
-// 所以內容（持有者的 pid、啟動時間、建立時間）也要跟判定失效時讀到的一字不差；讀不到就不刪
-export function breakStaleLock(lockPath, staleInode, staleContent) {
-  const breakPath = `${lockPath}.break-${staleInode}`;
-  try {
-    linkSync(lockPath, breakPath);
-  } catch (error) {
-    if (error.code === 'EEXIST') {
-      removeAbandonedBreakFile(breakPath);
-    }
-    return false;
-  }
-  try {
-    const breakFile = readLockFile(breakPath);
-    if (breakFile.stats.ino !== staleInode || breakFile.content !== staleContent) {
-      return false;
-    }
-    unlinkSync(lockPath);
+    linkSync(temporaryPath, filePath);
     return true;
   } catch {
     return false;
-  } finally {
-    removeQuietly(breakPath);
-  }
-}
-
-// 搶到 .break 的 process 在刪 lock 前被砍掉時，.break 會一直擋住這個 lock；它只該存在幾微秒，放久了就是沒人管的
-function removeAbandonedBreakFile(breakPath) {
-  try {
-    if (Date.now() - lstatSync(breakPath).ctimeMs > staleLockMs) {
-      unlinkSync(breakPath);
-    }
-  } catch {
-    // 已經被清掉
-  }
-}
-
-// 內容先寫進暫存檔再 link 成 lock：link 跟 wx 一樣「不存在才建立」，而且別人永遠讀不到還沒寫 pid 的 lock
-function acquireLock(lockPath, deadlineMs, now) {
-  const temporaryPath = createTemporaryPath(lockPath);
-  const owner = { pid: process.pid, startTime: readProcessInfo(process.pid)?.startTime ?? null, createdAtMs: Date.now() };
-  const ownContent = JSON.stringify(owner);
-  let ownInode;
-  try {
-    writeFileSync(temporaryPath, ownContent, { mode: 0o600, flag: 'wx' });
-    ownInode = lstatSync(temporaryPath).ino;
-  } catch {
-    removeQuietly(temporaryPath);
-    return null;
-  }
-  try {
-    while (now() < deadlineMs) {
-      try {
-        linkSync(temporaryPath, lockPath);
-        return { inode: ownInode, content: ownContent };
-      } catch (error) {
-        if (error.code !== 'EEXIST') {
-          return null;
-        }
-      }
-      const lock = inspectLock(lockPath);
-      if (lock === null) {
-        continue;
-      }
-      if (lock.isStale && breakStaleLock(lockPath, lock.inode, lock.content)) {
-        continue;
-      }
-      sleepSync(lockRetryIntervalMs);
-    }
-    return null;
   } finally {
     removeQuietly(temporaryPath);
   }
 }
 
-function releaseLock(lockPath, ownLock) {
+function removeFileIfPresent(filePath) {
   try {
-    // lock 若已被別人當成失效接管，路徑上是別人的 lock，不能刪；別人新建的 lock 可能拿到同一個 inode（ext4 會重用），內容也要是自己寫的才算
-    const lockFile = readLockFile(lockPath);
-    if (lockFile.stats.ino === ownLock.inode && lockFile.content === ownLock.content) {
-      unlinkSync(lockPath);
+    unlinkSync(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return false;
     }
-  } catch {
-    // 已經不在了，或讀不到內容：認不出是自己的就不刪
+    throw error;
   }
+}
+
+// 舊版每個 session 一個 session-<id>.json（用 lock 串起讀改寫）。升級時還在跑的 sub 只記在那個檔裡：不搬的話，升級後這個 session 第一次重畫就把它們從側邊欄拿掉，
+// 之後它們的 SubagentStop 也找不到自己的檔。每個事件都看一下自己 session 的舊檔（不存在只多一次 open 失敗），搬成 sub 檔（已經有的不蓋）後刪掉；
+// 搬過來的若其實已經結束，同一次事件的清除就會判斷。舊版的 .lock、.break-* 不理：新版不讀它們，跟狀態檔一樣在 tmpfs 上，重開機（或登出時 XDG_RUNTIME_DIR 被清掉）就沒了
+function migrateLegacySessionFile(stateDirectory, sessionId) {
+  const legacyPath = join(stateDirectory, `session-${sessionId}.json`);
+  let text;
+  try {
+    text = readFileSync(legacyPath, 'utf8');
+  } catch {
+    return 0;
+  }
+  let candidate = null;
+  try {
+    candidate = JSON.parse(text);
+  } catch {
+    // 壞掉的舊檔：沒有能搬的，照樣刪掉
+  }
+  let migratedCount = 0;
+  for (const subagent of readLegacySubagents(candidate)) {
+    if (writeJsonFileIfMissing(join(stateDirectory, subagentFileName(sessionId, subagent.id)), { sessionId, ...subagent })) {
+      migratedCount += 1;
+    }
+  }
+  removeQuietly(legacyPath);
+  return migratedCount;
 }
 
 const defaultDependencies = {
   now: () => Date.now(),
+  monotonicNs: () => process.hrtime.bigint(),
+  readBootTimeSeconds: () => readBootTimeSeconds(),
   runHerdr,
   isExecutable: isExecutableFile,
   queryPaneAgentSession,
@@ -839,50 +800,50 @@ export function runHook(rawInput, environment, overrides = {}) {
     writeJsonFileAtomically(paneMapPath, buildPaneMap(event, readJsonFile(paneMapPath), dependencies.now()));
   }
 
-  const statePath = join(stateDirectory, `session-${event.sessionId}.json`);
-  const lockPath = `${statePath}.lock`;
-  // 判斷 sub 是否結束要讀 main 與每個 sub 的 transcript 尾端，放在 lock 外：放在 lock 內的話同一個 session 平行觸發的 hook
-  // 每個都要多等前面每一個讀完，排在後面的等不到 lock 就放棄，放棄的若是 SubagentStart，那個 sub 永遠不會出現在側邊欄。
-  // 狀態檔是 rename 換上的，lock 外讀到的一定是某個完整版本；lock 內再讀一次最新的，只拿掉這裡判斷過的（見 removeEndedSubagents）
+  const migratedCount = migrateLegacySessionFile(stateDirectory, event.sessionId);
+  // 每個 hook 只改自己那個 sub 的檔，不跟別的 hook 搶同一個檔
+  let isOwnFileChanged = false;
+  const ownFilePath = event.agentId === null ? null : join(stateDirectory, subagentFileName(event.sessionId, event.agentId));
+  if (event.eventName === 'SubagentStart') {
+    // resume 時檔案還在（上一輪的 SubagentStop 沒收到）也直接覆寫，啟動時間換成這一次的：
+    // 沿用舊的話，上一輪的結束訊號會晚於啟動時間，正在跑的這一輪會被當成已經結束
+    writeJsonFileAtomically(ownFilePath, { sessionId: event.sessionId, id: event.agentId, agentType: event.agentType, startedAtMs: dependencies.now() });
+    isOwnFileChanged = true;
+  } else if (event.eventName === 'SubagentStop') {
+    // 檔不存在（沒看過 start 的 stop：可能是內部 agent，或 hook 安裝前就啟動的 sub）不算改動
+    isOwnFileChanged = removeFileIfPresent(ownFilePath);
+  }
+
   const pruneDeadlineMs = Math.min(dependencies.now() + maximumPruneMs, deadlineMs - minimumHerdrBudgetMs);
-  const endedSubagents = findEndedSubagents(normalizeSessionState(readJsonFile(statePath), event.sessionId), event, {
+  const endedSubagents = findEndedSubagents(listSessionSubagents(stateDirectory, event.sessionId), event, {
     nowMs: dependencies.now(),
     readTail: dependencies.readFileTail,
     hasTimeLeft: () => dependencies.now() < pruneDeadlineMs,
   });
-  // Stop／StopFailure 只會拿掉上面判斷為結束的 sub：一個都沒有的話 lock 內什麼都不會改，不用跟別的 hook 搶 lock（Stop 每回合都會觸發）
-  if (pruneOnlyEventNames.has(event.eventName) && endedSubagents.length === 0) {
+  const removed = [];
+  let isRestored = false;
+  for (const ended of endedSubagents) {
+    const outcome = removeEndedSubagentFile(stateDirectory, event.sessionId, ended);
+    if (outcome === 'removed') {
+      removed.push({ id: ended.id, reason: ended.reason });
+    } else if (outcome === 'restored') {
+      isRestored = true;
+    }
+  }
+  // 有改過任何檔就一定要回報（放回 resume 的檔也算：放回之前別的 hook 可能 readdir 時沒看到它）。
+  // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的樹（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋。
+  // Stop／StopFailure 每回合都會觸發，沒清掉任何 sub 就不呼叫 herdr
+  const isChanged = migratedCount > 0 || isOwnFileChanged || removed.length > 0 || isRestored;
+  if (!isChanged && event.eventName !== 'SessionStart') {
     return { action: 'unchanged' };
   }
-  const ownLock = acquireLock(lockPath, deadlineMs - minimumHerdrBudgetMs, dependencies.now);
-  if (ownLock === null) {
-    return { action: 'skipped', reason: 'lock-timeout' };
-  }
-  try {
-    // lock 內不讀 transcript：只有狀態檔的讀寫與回報 herdr
-    const nowMs = dependencies.now();
-    const currentState = normalizeSessionState(readJsonFile(statePath), event.sessionId);
-    const applied = applyEvent(currentState, event, nowMs);
-    const pruned = removeEndedSubagents(applied.state, endedSubagents);
-    const isStateChanged = applied.changed || pruned.removed.length > 0;
-    // SessionStart 一定重畫：換 session 後側邊欄要換成新 session 的樹（沒有 sub 就清空），不能等下一個 sub 事件才覆蓋
-    if (!isStateChanged && event.eventName !== 'SessionStart') {
-      return { action: 'unchanged' };
-    }
-    const sequence = nextSequence(pruned.state.lastSequence, nowMs);
-    const nextState = { ...pruned.state, lastSequence: sequence };
-    // 狀態沒變（例：沒有 sub 的新 session）就不寫檔：每個 session 都會觸發 SessionStart，不要每次都在 tmpfs 留一個空的狀態檔
-    if (isStateChanged) {
-      writeJsonFileAtomically(statePath, nextState);
-    }
-    const lines = buildTreeLines(nextState.subagents);
-    const argumentList = buildMetadataArguments(paneId, lines, sequence);
-    const herdrTimeoutMs = Math.max(minimumHerdrBudgetMs, deadlineMs - dependencies.now());
-    dependencies.runHerdr(herdrBinaryPath, argumentList, herdrTimeoutMs);
-    return { action: 'reported', lines, argumentList, removed: pruned.removed };
-  } finally {
-    releaseLock(lockPath, ownLock);
-  }
+  // seq 一定要在上面所有改檔之後、下面 readdir 之前取，理由見 takeSequence
+  const sequence = takeSequence(dependencies.readBootTimeSeconds(), dependencies.monotonicNs());
+  const lines = buildTreeLines(listSessionSubagents(stateDirectory, event.sessionId));
+  const argumentList = buildMetadataArguments(paneId, lines, sequence);
+  const herdrTimeoutMs = Math.max(minimumHerdrBudgetMs, deadlineMs - dependencies.now());
+  dependencies.runHerdr(herdrBinaryPath, argumentList, herdrTimeoutMs);
+  return { action: 'reported', lines, argumentList, removed };
 }
 
 function main() {

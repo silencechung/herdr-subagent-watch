@@ -146,7 +146,7 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 
 ### 側邊欄樹狀行
 
-Claude Code 觸發 `SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure` hook（回合因 API 錯誤結束時改觸發 `StopFailure`，不觸發 `Stop`）；`hooks/sidebar-hook.mjs`（經 `bin/run.sh` 執行）更新狀態檔，再呼叫 `herdr pane report-metadata` 把樹狀行寫進 pane token `sub1`…`sub5`，由 setup 加的 `claude` rows 顯示。上面第 2 步用的 pane map 也是這個 hook 寫的（`Stop` 與 `StopFailure` 以外的每個事件都寫）。每個事件也會拿掉這個 session 裡 transcript 以這一輪的結束訊號結尾（`SubagentHandback`、API 錯誤、中斷、task notification 等）、而且 2 分鐘沒寫入的 sub，因為有些 sub 永遠收不到 `SubagentStop`。這個 hook 套用到每個 Claude Code session，所以永遠 exit 0、不輸出任何東西，並在時間預算內結束。細節見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md)。
+Claude Code 觸發 `SessionStart`、`SubagentStart`、`SubagentStop`、`Stop`、`StopFailure` hook（回合因 API 錯誤結束時改觸發 `StopFailure`，不觸發 `Stop`）；`hooks/sidebar-hook.mjs`（經 `bin/run.sh` 執行）寫入或刪除跑中的 sub 各自的小檔（不用 lock：平行的 hook 只動自己那個 sub 的檔，靠 herdr 的 `--seq` 留下最新的回報），再呼叫 `herdr pane report-metadata` 把樹狀行寫進 pane token `sub1`…`sub5`，由 setup 加的 `claude` rows 顯示。上面第 2 步用的 pane map 也是這個 hook 寫的（`Stop` 與 `StopFailure` 以外的每個事件都寫）。每個事件也會拿掉這個 session 裡 transcript 以這一輪的結束訊號結尾（`SubagentHandback`、API 錯誤、中斷、task notification 等）、而且 2 分鐘沒寫入的 sub，因為有些 sub 永遠收不到 `SubagentStop`。這個 hook 套用到每個 Claude Code session，所以永遠 exit 0、不輸出任何東西，並在時間預算內結束。細節見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md)。
 
 ### Node 怎麼找
 
