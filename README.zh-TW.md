@@ -79,6 +79,8 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 | 按鍵 | 作用 |
 | --- | --- |
 | `←` / `→` | 切換 tab（循環） |
+| `0`–`9` | 輸入 tab 編號直接跳過去（見下面） |
+| 滑鼠點 tab 列 | 點編號或選取的 tab：切到那個 tab；點 `◀` / `▶`：上一個／下一個 tab，和 `←` / `→` 一樣 |
 | `↑` / `↓` | 捲一行（折行後的畫面行，以下同） |
 | `PgUp` / `PgDn` | 捲一頁 |
 | `Home` | 捲到最舊 |
@@ -86,11 +88,13 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 | 滑鼠滾輪 | 一次捲 3 行（見下面的限制） |
 | `q` / `Esc` / `Ctrl+C` | 關閉 |
 
-- tab 列長這樣：`2 running · 3 done │ ◀ [● Explore] [● general-purpose] [✓ claude-code-guide] ▶`
+- tab 列長這樣：`2 running · 3 done │   1 [2 ● general-purpose] 3 4 5`：選取的 tab 顯示編號、狀態與名稱，其他 tab 只顯示編號。
   - 顏色跟著 terminal theme：只用 bold、dim、reverse 和 ANSI 16 色，不寫死任何色碼。
   - 最左邊固定是跑中／結束數量摘要，跑中數字是 ANSI magenta，其餘 dim。
-  - 狀態符號在每個 tab 最前面：`●` 跑中（預設字色＋magenta `●`）、`✓` 結束（整個 dim）。選取的 tab 是 reverse video＋bold。
-  - tab 本身不帶編號，沒有 1–9 直跳。結束的 tab 留著，順序照啟動時間，狀態改變不會重排。
+  - 選取的 tab 是 `[<編號> <狀態> <名稱>]`，reverse video＋bold；`●` 跑中、`✓` 結束。其他 tab 只有編號：跑中 bold、結束 dim（不上色，只用文字屬性）。
+  - 編號從 1 開始，是 tab 在完整清單裡的位置，順序照啟動時間；結束的 tab 留著，狀態改變不會重排，tab 列可見範圍捲動也不會改編號。兩位數、三位數照原樣顯示，不補零。
+  - 輸入編號直接跳到那個 tab。目前輸入的數字還可能是更長編號的開頭時（例：14 個 tab 時按 `1`，可能是 10–14），等 600 ms 看有沒有下一位，沒有就跳到目前輸入的編號；不可能再延伸時（tab 不到 20 個時按 `2`–`9`）立刻跳。`0` 開頭或超過 tab 數的編號忽略並清掉。輸入到一半按其他鍵會丟掉已輸入的數字，那個鍵照常作用。等待期間畫面照常更新。
+  - 滑鼠點擊只對 tab 列有效：點編號或選取的 tab 切到那個 tab，點 `◀` / `▶` 切到上一個／下一個；點其他地方不理。只算左鍵按下（放開不算），可點的欄位範圍取自最後一次畫出來的 tab 列，和畫面用同一套顯示寬度（中文、emoji 算 2 格）。
   - 不是 TTY（`--once` 導到檔案或 pipe）時輸出同樣結構的純文字。
 - tab 名稱用 meta 的 `agentType`；同一個 type 出現多次時接 `description` 片段區分。
 - 新的 `agent-*.jsonl` 出現就即時多一個 tab（`fs.watch` 監看 `subagents/`，每秒 polling 備援）。第一次有 tab 時選最新的跑中 sub，之後選取跟著 agent 走，新 tab 不會搶走目前看的。
@@ -108,8 +112,8 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
   - 預設 follow：新事件進來自動捲到最新。
   - 往上捲就暫停 follow，底部提示列最前面顯示 `↓ N new`（暫停後新進來的事件佔幾個畫面行）；按 `End` 或捲回最底恢復 follow。
   - 每個 tab 各自記住捲動位置，切 tab 不會影響其他 tab。
-  - 底部提示列：`<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`，視窗窄時自動縮短。
-- 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、SIGHUP、未預期的例外都會關）。
+  - 底部提示列：`<-/-> 0-9 click switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`，視窗窄時自動縮短（先省 `click`，`0-9` 留到最後）。
+- 滑鼠：開啟時打開 SGR mouse reporting（`\x1b[?1000h\x1b[?1006h`）收滾輪與點擊，離開時一定關掉（`q`、`Esc`、`Ctrl+C`、SIGTERM、SIGHUP、未預期的例外都會關）。
 - 還沒有 sub 時顯示 `No sub agents yet in this session`。
 
 ## 怎麼找到 pane 對應的 session
@@ -193,9 +197,9 @@ Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test tes
   - 兩種情況關掉 popup 再開，都會跟第一次開啟一樣照寫入時間重新選擇。
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
 - 只有 East Asian Width 為 W 或 F（Unicode 16.0）的字元算 2 格。有些 terminal 只在加了 variation selector 時才畫成 2 格的符號（例 `❤️`），量出來的寬度可能和 terminal 實際畫的不同。emoji ZWJ 序列量的是各部分加總（👨‍👩‍👧 算 6 格），terminal 把它合成一個字畫的話會比量的窄。
-- herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。
+- herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。左鍵點擊已在真的 herdr popup 裡確認：herdr 會以 SGR press／release 轉給 popup，座標以 popup 內容區左上角為 1,1；點 popup 外面不會有事件。
 - 開了 mouse reporting，在 viewer 裡用滑鼠拖曳選字會被 viewer 吃掉、選不到字。部分 terminal 按住 Shift 拖曳可以繞過，herdr popup 裡是否可行未驗證。
 - 摘要在讀 transcript 時只留前 20 行、總寬度 8000 欄（夠在 400 欄寬的摘要欄折滿 20 行）；被截掉的部分在 `+N` 裡每個原始行算一行，原始行很長時實際會更多。
-- 視窗窄時摘要照樣保留，tab 列只顯示選取的 tab 附近幾個，兩端箭頭變 magenta 代表那一側還有藏起來的 tab；單一 tab 比剩下的寬度還寬時只截名稱（結尾 `…`），狀態符號一定看得到。
+- 視窗窄時 tab 列只顯示選取的 tab 附近的編號（左右輪流往外加），哪一側有藏起來的 tab 就在那一側畫 magenta 的 `◀` / `▶`。左邊沒有藏起來的 tab 時 `◀` 的位置留空白，`◀` 出現時後面的編號不會位移；右邊沒有時不畫。選取的 tab 一定完整看得到：比剩下的寬度還寬時只截名稱（結尾 `…`），編號與狀態符號不截；窄到連摘要加上選取 tab 的編號、符號都放不下時，摘要讓位。整列寬度不會超過視窗寬度。
 - setup 沒有 TOML parser，只做逐行文字處理：看不懂的寫法（多行字串、inline table 形式的 `rows_by_agent` 等）會跳過或被 `herdr config check` 擋下（原檔完全沒動過，不需要還原），這時照 log 的片段手動貼。
 - plugin 目錄路徑含 `"`、`$`、`` ` ``、`\` 時 setup 不會寫 hook（會破壞 shell command），要手動設定。

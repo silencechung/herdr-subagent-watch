@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, describe, test } from 'node:test';
+import { displayWidth } from '../lib/text.mjs';
 
 const repositoryDirectory = fileURLToPath(new URL('..', import.meta.url));
 const viewerPath = path.join(repositoryDirectory, 'viewer.mjs');
@@ -46,8 +47,8 @@ test('--once --session prints a frame from a real transcript layout and exits 0 
   assert.equal(result.status, 0, result.stderr);
   const lines = result.stdout.trimEnd().split('\n');
   assert.equal(lines.length, 24);
-  assert.equal(lines[0], '1 running · 3 done │ ◀ [● Explore] [✓ general-purpose: Write the README] ▶');
-  assert.doesNotMatch(lines[0].split('│')[1], /\d/);
+  // 選取的 tab 顯示全名，其他只有編號
+  assert.equal(lines[0], '1 running · 3 done │   [1 ● Explore] 2 3 4');
   // 第一次開啟選最新的跑中 sub：fixture 只有 Explore 還在跑
   assert.match(result.stdout, /Grep {8}emitKeypressEvents/);
   // 多行指令保留換行，第二行縮排到摘要欄
@@ -58,11 +59,11 @@ test('--once --session prints a frame from a real transcript layout and exits 0 
   assert.doesNotMatch(result.stdout, /\x1b\[/);
 });
 
-test('--once --demo prints the summary and demo tabs without index numbers', () => {
+test('--once --demo prints the summary, the selected demo tab in full and the other tabs as numbers', () => {
   const result = runViewer(['--once', '--demo']);
   assert.equal(result.status, 0, result.stderr);
   const [tabBar] = result.stdout.split('\n');
-  assert.equal(tabBar, '2 running · 1 done │ ◀ [● Explore] [✓ claude-code-guide] [● general-purpose] ▶');
+  assert.equal(tabBar, '2 running · 1 done │   1 2 [3 ● general-purpose]');
   assert.match(result.stdout, /demo data/);
   assert.doesNotMatch(result.stdout, /closing in/);
 });
@@ -70,7 +71,7 @@ test('--once --demo prints the summary and demo tabs without index numbers', () 
 test('demo.mjs is a thin wrapper around viewer.mjs --demo', () => {
   const result = runViewer(['--once'], { scriptPath: demoPath });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout.split('\n')[0], /^2 running · 1 done │ ◀ \[● Explore\] \[✓ claude-code-guide\]/);
+  assert.equal(result.stdout.split('\n')[0], '2 running · 1 done │   1 2 [3 ● general-purpose]');
   assert.match(result.stdout, /demo data/);
 });
 
@@ -107,7 +108,7 @@ test('the popup uses the pane id from the open action and labels a cwd guess', (
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /session 11111111 \(guessed: latest session\)/);
-  assert.match(result.stdout, /\[● Explore\]/);
+  assert.match(result.stdout, /\[1 ● Explore\]/);
 });
 
 // 假 herdr：`pane get` 回傳 herdr 0.9.3 實際輸出的 fixture
@@ -254,9 +255,39 @@ function getChildPid(parentPid) {
   return Number.isInteger(pid) && pid > 0 ? pid : null;
 }
 
+// SGR 左鍵 press＋release，和 herdr 轉給 popup 的一樣；x、y 是 1-based
+function click(x, y) {
+  return `\x1b[<0;${x};${y}M\x1b[<0;${x};${y}m`;
+}
+
+// needle 第一個字元在畫面上的欄（1-based，和 SGR mouse 座標同一套）；寬字元算 2 欄，和 viewer 畫的一致
+function columnOf(line, needle) {
+  const index = line.indexOf(needle);
+  assert.ok(index !== -1, `${needle} not in ${line}`);
+  return displayWidth(line.slice(0, index)) + 1;
+}
+
+// count 個跑中的 sub agent，名稱 w1…wN、照編號依序啟動：測兩位數的 tab 編號
+function writeManyAgentsSession(name, count) {
+  const sessionId = 'bbbbbbbb-0000-4000-8000-000000000000';
+  const projectDirectory = path.join(temporaryRoot, name, '-tmp-many');
+  const subagentsDirectory = path.join(projectDirectory, sessionId, 'subagents');
+  fs.mkdirSync(subagentsDirectory, { recursive: true });
+  const nowMs = Date.now();
+  fs.writeFileSync(path.join(projectDirectory, `${sessionId}.jsonl`), `${JSON.stringify({ type: 'user', timestamp: new Date(nowMs).toISOString(), message: { content: 'x' } })}\n`);
+  for (let number = 1; number <= count; number += 1) {
+    const id = `m${String(number).padStart(3, '0')}`;
+    const timestamp = new Date(nowMs - (count - number) * 1000).toISOString();
+    fs.writeFileSync(path.join(subagentsDirectory, `agent-${id}.meta.json`), JSON.stringify({ agentType: `w${number}`, description: `task ${number}` }));
+    const content = [{ type: 'tool_use', id: `t${id}`, name: 'Bash', input: { command: `echo ${number}` } }];
+    fs.writeFileSync(path.join(subagentsDirectory, `agent-${id}.jsonl`), `${JSON.stringify({ type: 'assistant', timestamp, message: { content } })}\n`);
+  }
+  return path.join(projectDirectory, `${sessionId}.jsonl`);
+}
+
 function selectedLabels(output) {
   const labels = [];
-  for (const match of output.matchAll(new RegExp(`${selectedTabPattern}\\[[●✓] ([^\\]]+)\\]`, 'g'))) {
+  for (const match of output.matchAll(new RegExp(`${selectedTabPattern}\\[\\d+ [●✓] ([^\\]]+)\\]`, 'g'))) {
     if (labels.at(-1) !== match[1]) {
       labels.push(match[1]);
     }
@@ -277,23 +308,23 @@ async function waitUntil(predicate, description, timeoutMs = 5000) {
 }
 
 describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script is not available' }, () => {
-  test('left/right cycle through tabs, digits do nothing, q exits 0 and restores the terminal', { timeout: 20_000 }, async () => {
+  test('left/right cycle through tabs, a digit jumps to that tab number, q exits 0 and restores the terminal', { timeout: 20_000 }, async () => {
     const transcriptPath = copyFixtureSession();
     const pty = startInPty(['--session', transcriptPath]);
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       pty.send('\x1b[C');
-      await pty.waitForOutput(new RegExp(`${selectedTabPattern}\\[✓ general-purpose: Write the README\\]`));
-      // 數字鍵不跳 tab：後面接的 ← 處理完時 1 一定也處理完了，再看選取的順序
+      await pty.waitForOutput(new RegExp(`${selectedTabPattern}\\[2 ✓ general-purpose: Write the README\\]`));
+      // 4 個 tab：1 不可能是兩位數的開頭，馬上跳，不用等
       pty.send('1');
+      await waitUntil(() => selectedLabels(pty.session.output).length >= 3, '1 jumps to the first tab');
       pty.send('\x1b[D');
-      await waitUntil(() => selectedLabels(pty.session.output).length >= 3, 'left after 1 selects a tab');
-      assert.deepEqual(selectedLabels(pty.session.output), ['Explore', 'general-purpose: Write the README', 'Explore']);
-      pty.send('\x1b[D');
-      await waitUntil(() => selectedLabels(pty.session.output).length >= 4, 'second left wraps around');
+      await waitUntil(() => selectedLabels(pty.session.output).length >= 4, 'left wraps around');
+      pty.send('3');
+      await waitUntil(() => selectedLabels(pty.session.output).length >= 5, '3 jumps to the third tab');
       pty.send('q');
       assert.equal(await pty.exited, 0);
-      assert.deepEqual(selectedLabels(pty.session.output), ['Explore', 'general-purpose: Write the README', 'Explore', 'fork']);
+      assert.deepEqual(selectedLabels(pty.session.output), ['Explore', 'general-purpose: Write the README', 'Explore', 'fork', 'general-purpose: Run the slow te…']);
       assert.ok(pty.session.output.includes('\x1b[?1049h'));
       assert.ok(pty.session.output.includes('\x1b[?1049l'));
       assert.ok(pty.session.output.includes('\x1b[?25h'));
@@ -307,7 +338,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
   test('Esc closes right away with exit 0', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', copyFixtureSession()]);
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       const sentAtMs = Date.now();
       pty.send('\x1b');
       assert.equal(await pty.exited, 0);
@@ -322,7 +353,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
   test('Ctrl+C exits 0 and restores the terminal', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', copyFixtureSession()]);
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       pty.send('\x03');
       assert.equal(await pty.exited, 0);
       assert.ok(pty.session.output.includes('\x1b[?1049l'));
@@ -336,7 +367,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
   test('SIGTERM exits 0 and turns mouse reporting off', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', copyFixtureSession()]);
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       const viewerPid = getChildPid(pty.pid);
       assert.ok(viewerPid !== null, 'could not find the viewer process under script');
       process.kill(viewerPid, 'SIGTERM');
@@ -355,7 +386,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
     const environment = isolatedEnvironment({ NODE_OPTIONS: `--import=${pathToFileURL(throwerPath).href}` });
     const pty = startInPty(['--session', copyFixtureSession()], { environment });
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       assert.equal(await pty.exited, 1);
       assertMouseReportingRestored(pty.session.output);
       assert.ok(pty.session.output.includes('\x1b[?1049l'));
@@ -405,7 +436,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
       await pty.waitForScreen(isAtOldest, 'back at the oldest event');
 
       pty.send('\x1b[C');
-      screen = await pty.waitForScreen((lines) => /\[✓ general-purpose: Write the README\]/.test(lines[0]) && !/new/.test(footer(lines)), 'other tab follows');
+      screen = await pty.waitForScreen((lines) => /\[2 ✓ general-purpose: Write the README\]/.test(lines[0]) && !/new/.test(footer(lines)), 'other tab follows');
       pty.send('\x1b[D');
       screen = await pty.waitForScreen(isAtOldest, 'Explore keeps its position');
       assert.match(footer(screen), /↓ 2 new/);
@@ -471,11 +502,87 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
     }
   });
 
+  test('clicking a number on the tab bar selects that tab; clicks elsewhere are ignored', { timeout: 20_000 }, async () => {
+    const pty = startInPty(['--session', copyFixtureSession()]);
+    try {
+      let screen = await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │   [1 ● Explore] 2 3 4', 'the first tab bar');
+      const third = columnOf(screen[0], ' 3 4') + 1;
+      // 第 2 行同一欄、tab 列上的空白都不算點到
+      pty.send(click(third, 2));
+      pty.send(click(third - 1, 1));
+      pty.send(click(third, 1));
+      screen = await pty.waitForScreen((lines) => /^1 running · 3 done │ {3}1 2 \[3 ✓ general-purpose: Run the slow te…\] 4$/.test(lines[0]), 'the third tab after a click');
+      pty.send(click(columnOf(screen[0], '│   1 ') + 4, 1));
+      await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │   [1 ● Explore] 2 3 4', 'the first tab after a click');
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+      // 點到第 2 行與空白的那兩下沒有切換
+      assert.deepEqual(selectedLabels(pty.session.output), ['Explore', 'general-purpose: Run the slow te…', 'Explore']);
+      assertMouseReportingRestored(pty.session.output);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('clicking ◀ / ▶ on a narrow tab bar moves to the previous / next tab', { timeout: 20_000 }, async () => {
+    const pty = startInPty(['--session', copyFixtureSession()], { columns: 34 });
+    try {
+      let screen = await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │   [1 ● Ex…] ▶', 'only the selected tab fits');
+      pty.send(click(columnOf(screen[0], '▶'), 1));
+      screen = await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │ ◀ [2 ✓ ge…] ▶', 'the next tab after ▶');
+      pty.send(click(columnOf(screen[0], '▶'), 1));
+      screen = await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │ ◀ [3 ✓ ge…] ▶', 'the third tab after ▶');
+      pty.send(click(columnOf(screen[0], '◀'), 1));
+      await pty.waitForScreen((lines) => lines[0] === '1 running · 3 done │ ◀ [2 ✓ ge…] ▶', 'back to the second tab after ◀');
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
+  test('two-digit tab numbers: a second digit jumps at once, a lone 1 waits, other keys cancel', { timeout: 20_000 }, async () => {
+    const pty = startInPty(['--session', writeManyAgentsSession('many-agents', 12)], { columns: 120 });
+    const tabBar = () => pty.getScreenLines()[0] ?? '';
+    const isSelected = (number) => (lines) => new RegExp(`\\[${number} ● w${number}\\]`).test(lines[0] ?? '');
+    try {
+      await pty.waitForScreen(isSelected(12), 'the newest tab selected first');
+      pty.send('1');
+      pty.send('1');
+      await pty.waitForScreen(isSelected(11), '11 after typing 1 then 1');
+      // 1 還可能是 10–12 的開頭：等 600ms 沒有下一位才跳
+      const sentAtMs = Date.now();
+      pty.send('1');
+      await pty.waitForScreen(isSelected(1), 'tab 1 after the wait');
+      assert.ok(Date.now() - sentAtMs >= 550, `jumped after ${Date.now() - sentAtMs}ms`);
+      // 等待中按 → 會丟掉輸入的 1、照常切到下一個 tab，之後也不會再跳回 1
+      pty.send('\x1b[C');
+      pty.send('\x1b[C');
+      await pty.waitForScreen(isSelected(3), 'right arrows after tab 1');
+      pty.send('1');
+      pty.send('\x1b[C');
+      await pty.waitForScreen(isSelected(4), 'right arrow cancels the half-typed 1');
+      // 13 超出範圍、0 開頭都不跳
+      pty.send('13');
+      pty.send('0');
+      await new Promise((resolve) => {
+        setTimeout(resolve, 900);
+      });
+      assert.ok(isSelected(4)(pty.getScreenLines()), tabBar());
+      pty.send('7');
+      await pty.waitForScreen(isSelected(7), 'a digit still works after ignored input');
+      pty.send('q');
+      assert.equal(await pty.exited, 0);
+    } finally {
+      pty.kill();
+    }
+  });
+
   test('the viewer never closes on its own and adds a tab when a new agent file appears', { timeout: 20_000 }, async () => {
     const transcriptPath = copyFixtureSession();
     const pty = startInPty(['--session', transcriptPath], { columns: 200 });
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       // 先讓所有 sub 都結束：之後還能看到新 tab，代表全部結束後 viewer 仍在跑、照常更新
       fs.appendFileSync(getExploreAgentPath(transcriptPath), `${JSON.stringify({
         type: 'assistant',
@@ -490,7 +597,7 @@ describe('interactive mode in a pty', { skip: !hasScript && 'util-linux script i
         path.join(subagentsDirectory, 'agent-e555late.jsonl'),
         `${JSON.stringify({ type: 'assistant', timestamp: '2026-10-10T01:30:00.000Z', message: { content: [{ type: 'tool_use', id: 'toolu_late', name: 'Glob', input: { pattern: '**/*.mjs' } }] } })}\n`,
       );
-      await pty.waitForOutput(/\[● Plan\]/, 3000);
+      await pty.waitForScreen((lines) => /^1 running · 4 done │ {3}\[1 ✓ Explore\] 2 3 4 5$/.test(lines[0] ?? ''), 'the new tab as number 5', 3000);
       assert.equal(pty.session.exitCode, null);
       pty.send('q');
       assert.equal(await pty.exited, 0);
@@ -527,10 +634,9 @@ test('--once strips every escape sequence, C1 control and bidi character that ca
   const result = runViewer(['--once', '--session', writeHostileSession('hostile-once')]);
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stdout, foreignControlPattern);
-  assert.match(result.stdout, /\[● Exp click\]/);
-  // 8-bit CSI（U+009B）只剝它自己，後面的 2J、31m 是普通文字
+  assert.match(result.stdout, /│ {3}1 2 \[3 ● Exp click\]\n/);
+  // 8-bit CSI（U+009B）只剝它自己，後面的 2J、31m 是普通文字；description 做的 tab 名稱在 pty 測試切過去看
   assert.match(result.stdout, /Bash {8}echo {3}2J red/);
-  assert.match(result.stdout, /\[● general-purpose: 31mevil\]/);
   assert.match(result.stdout, /session aaaaaaaa/);
 });
 
@@ -568,7 +674,7 @@ fs.watch = (...argumentList) => {
     environment: isolatedEnvironment({ NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}` }),
   });
   assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stdout, /\[● Explore\]/);
+  assert.match(result.stdout, /\[1 ● Explore\]/);
   assert.match(result.stderr, /close broke/);
   assert.doesNotMatch(result.stderr, foreignControlPattern, JSON.stringify(result.stderr.match(foreignControlPattern)?.[0]));
 });
@@ -687,7 +793,7 @@ test('--once follows a pane map written at SessionStart even when herdr names a 
   const herdr = writeScriptedHerdr('session-start-once-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
   const result = runViewer(['--once'], { environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout.split('\n')[0], /\[● Explore\]/);
+  assert.match(result.stdout.split('\n')[0], /\[1 ● Explore\]/);
   assert.doesNotMatch(result.stdout, /Plan/);
   assert.match(result.stdout, /session 11111111 · herdr says session 22222222, pane map says 11111111/);
 });
@@ -696,8 +802,13 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
   test('only the app\'s own escape sequences reach the terminal', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', writeHostileSession('hostile-pty')]);
     try {
-      await pty.waitForOutput(/\[● Exp click\]/);
+      await pty.waitForOutput(/\[3 ● Exp click\]/);
       await pty.waitForOutput(/echo {3}2J red/);
+      // 用數字鍵切到另外兩個 tab，讓 description 做的名稱也畫出來
+      pty.send('2');
+      await pty.waitForOutput(/\[2 ● general-purpose: 31mevil\]/);
+      pty.send('1');
+      await pty.waitForOutput(/\[1 ● general-purpose: X Y\]/);
       pty.send('q');
       assert.equal(await pty.exited, 0);
       const ownSequencePattern = /\x1b\[(?:[0-9;]*m|H|2K|2J|\?25[hl]|\?1049[hl]|\?100[06][hl])/g;
@@ -713,10 +824,10 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const herdr = writeScriptedHerdr('switch-herdr', { response: claudePaneResponse(sessions.workDirectory, fixtureSessionId) });
     const pty = startInPty([], { columns: 160, environment: popupEnvironment(herdr.binPath, sessions) });
     try {
-      await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'first session');
+      await pty.waitForScreen((lines) => /\[1 ● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'first session');
       // herdr 回報的值變了就換，不看 transcript 寫入時間
       fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, secondSessionId)));
-      const screen = await pty.waitForScreen((lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 ─/.test(line)), 'second session');
+      const screen = await pty.waitForScreen((lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 ─/.test(line)), 'second session');
       assert.doesNotMatch(screen[0], /Explore/);
       pty.send('q');
       assert.equal(await pty.exited, 0);
@@ -733,9 +844,9 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const herdr = writeScriptedHerdr('guess-herdr', { response: claudePaneResponse(sessions.workDirectory, null) });
     const pty = startInPty([], { columns: 160, environment: popupEnvironment(herdr.binPath, sessions) });
     try {
-      await pty.waitForScreen((lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 \(guessed: latest session\)/.test(line)), 'guessed session');
+      await pty.waitForScreen((lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /session 22222222 \(guessed: latest session\)/.test(line)), 'guessed session');
       fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, fixtureSessionId)));
-      const screen = await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'real session');
+      const screen = await pty.waitForScreen((lines) => /\[1 ● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /session 11111111 ─/.test(line)), 'real session');
       assert.ok(!screen.some((line) => /guessed/.test(line)));
       pty.send('q');
       assert.equal(await pty.exited, 0);
@@ -761,7 +872,7 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const herdr = writeScriptedHerdr('flap-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
     const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
     const pty = startInPty([], { columns: 160, environment });
-    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
     try {
       await pty.waitForScreen(isSecondSession, 'second session');
       // herdr 回不出 pane（和逾時一樣退回 pane map）：等兩次查詢，畫面不能跳回 fixture
@@ -801,7 +912,7 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const herdr = writeScriptedHerdr('stale-writer-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
     const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
     const pty = startInPty([], { columns: 160, environment });
-    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
     const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
     try {
       await pty.waitForScreen(isSecondSession, 'second session');
@@ -829,8 +940,8 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     const { runtimeDirectory, writePaneMap } = writeSessionStartSetup('session-start-pty', sessions, fixtureSessionId);
     const herdr = writeScriptedHerdr('session-start-pty-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
     const pty = startInPty([], { columns: 160, environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
-    const isFixtureSession = (lines) => /\[● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /── session 11111111 /.test(line));
-    const isSecondSession = (lines) => /\[● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
+    const isFixtureSession = (lines) => /\[1 ● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /── session 11111111 /.test(line));
+    const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
     const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
     try {
       await pty.waitForScreen(isFixtureSession, 'the session from the SessionStart pane map');
@@ -878,11 +989,11 @@ process.env = new Proxy(realEnvironment, {
     const pty = startInPty([], { columns: 160, environment });
     const statusLine = (lines) => lines.find((line) => /^── session 11111111/.test(line)) ?? '';
     try {
-      await pty.waitForScreen((lines) => /\[● Explore\]/.test(lines[0] ?? '') && /session 11111111 ─/.test(statusLine(lines)), 'first session');
+      await pty.waitForScreen((lines) => /\[1 ● Explore\]/.test(lines[0] ?? '') && /session 11111111 ─/.test(statusLine(lines)), 'first session');
       fs.writeFileSync(failFlagPath, '');
       const screen = await pty.waitForScreen((lines) => /session 11111111 · session lookup failed: config broke/.test(statusLine(lines)), 'lookup error in the status line');
       assert.match(statusLine(screen), /session lookup failed: config broke second line/);
-      assert.match(screen[0], /\[● Explore\]/);
+      assert.match(screen[0], /\[1 ● Explore\]/);
       // 再失敗兩次：同一個錯誤不重畫，輸出裡只出現一次
       await waitUntil(() => fs.readFileSync(failLogPath, 'utf8').split('\n').filter(Boolean).length >= 3, 'two more failed lookups', 10_000);
       await new Promise((resolve) => {
@@ -943,14 +1054,14 @@ process.env = new Proxy(realEnvironment, {
     const transcriptPath = copyFixtureSession();
     const pty = startInPty(['--session', transcriptPath], { columns: 200 });
     try {
-      await pty.waitForOutput(new RegExp(`${selectedTabPattern}\\[● Explore\\]`));
+      await pty.waitForOutput(new RegExp(`${selectedTabPattern}\\[1 ● Explore\\]`));
       const subagentsDirectory = path.join(path.dirname(transcriptPath), fixtureSessionId, 'subagents');
       fs.writeFileSync(path.join(subagentsDirectory, 'agent-0000early.meta.json'), JSON.stringify({ agentType: 'Plan', description: 'Started first' }));
       fs.writeFileSync(
         path.join(subagentsDirectory, 'agent-0000early.jsonl'),
         `${JSON.stringify({ type: 'assistant', timestamp: '2026-10-10T00:00:00.000Z', message: { content: [{ type: 'tool_use', id: 'toolu_early', name: 'Glob', input: { pattern: '*' } }] } })}\n`,
       );
-      const screen = await pty.waitForScreen((lines) => /◀ \[● Plan\] \[● Explore\]/.test(lines[0] ?? ''), 'the earlier tab appears first');
+      const screen = await pty.waitForScreen((lines) => /│ {3}1 \[2 ● Explore\] 3 4 5$/.test(lines[0] ?? ''), 'the earlier tab appears first');
       assert.match(screen[0], /^2 running/);
       const lastFrame = pty.session.output.split('\x1b[H').at(-1);
       assert.deepEqual(selectedLabels(lastFrame), ['Explore']);
@@ -964,7 +1075,7 @@ process.env = new Proxy(realEnvironment, {
   test('SIGHUP restores the terminal and exits 0', { timeout: 20_000 }, async () => {
     const pty = startInPty(['--session', copyFixtureSession()]);
     try {
-      await pty.waitForOutput(/\[● Explore\]/);
+      await pty.waitForOutput(/\[1 ● Explore\]/);
       const viewerPid = getChildPid(pty.pid);
       assert.ok(viewerPid !== null, 'could not find the viewer process under script');
       process.kill(viewerPid, 'SIGHUP');

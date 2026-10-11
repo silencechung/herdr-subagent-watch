@@ -7,9 +7,11 @@ import {
   buildFooter,
   buildFrame,
   buildTabBar,
+  buildTabBarLayout,
   buildTabLabels,
   buildTabSummary,
   emptySessionMessage,
+  findTabBarAction,
   getVisibleTabRange,
   measureEventRows,
 } from '../lib/render.mjs';
@@ -32,7 +34,7 @@ function stripAnsi(value) {
   return value.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-test('tab bar starts with a running/done summary and puts the glyph before each label', () => {
+test('tab bar starts with a running/done summary, shows the selected tab in full and only numbers for the others', () => {
   const tabs = [
     makeTab('Explore', false),
     makeTab('general-purpose', false),
@@ -40,9 +42,11 @@ test('tab bar starts with a running/done summary and puts the glyph before each 
     makeTab('Plan', true),
     makeTab('fork', true),
   ];
-  const tabBar = buildTabBar(tabs, 0, 120, false);
-  assert.equal(tabBar, '2 running · 3 done │ ◀ [● Explore] [● general-purpose] [✓ claude-code-guide] [✓ Plan] [✓ fork] ▶');
-  assert.doesNotMatch(tabBar.split('│')[1], /\d/);
+  assert.equal(buildTabBar(tabs, 0, 120, false), '2 running · 3 done │   [1 ● Explore] 2 3 4 5');
+  assert.equal(buildTabBar(tabs, 2, 120, false), '2 running · 3 done │   1 2 [3 ✓ claude-code-guide] 4 5');
+  // 沒選取的 tab 不帶括號、符號與名稱
+  const others = buildTabBar(tabs, 4, 120, false).split('│')[1];
+  assert.doesNotMatch(others.replace('[5 ✓ fork]', ''), /[[\]●✓]|Explore|general|claude|Plan/);
 });
 
 test('tab summary counts running and done tabs', () => {
@@ -53,28 +57,27 @@ test('tab summary counts running and done tabs', () => {
 
 test('tab order follows the input even when done and running tabs interleave', () => {
   const tabBar = buildTabBar([makeTab('first', true), makeTab('second', false), makeTab('third', true)], 1, 120, false);
-  assert.equal(tabBar, '1 running · 2 done │ ◀ [✓ first] [● second] [✓ third] ▶');
+  assert.equal(tabBar, '1 running · 2 done │   1 [2 ● second] 3');
 });
 
-test('a label wider than the room is truncated but keeps its glyph and brackets', () => {
+test('a selected label wider than the room is truncated but keeps its number, glyph and brackets', () => {
   const running = buildTabBar([makeTab('general-purpose: Write the README', false)], 0, 40, false);
-  assert.equal(running, '1 running · 0 done │ ◀ [● general-pu…] ▶');
-  assert.equal(displayWidth(running), 40);
+  assert.equal(running, '1 running · 0 done │   [1 ● general-…]');
+  assert.equal(displayWidth(running), 38);
   const done = buildTabBar([makeTab('Explore', false), makeTab('刪除空的 secrets.fish 設定檔', true)], 1, 36, false);
-  assert.equal(done, '1 running · 1 done │ ◀ [✓ 刪除空…] ▶');
-  assert.equal(displayWidth(done), 36);
+  assert.equal(done, '1 running · 1 done │ ◀ [2 ✓ 刪除…]');
+  assert.ok(displayWidth(done) <= 36);
 });
 
-test('selected tab is reverse video bold whether running or done', () => {
-  const tabs = [makeTab('Explore', false), makeTab('general-purpose', true)];
+test('selected tab is reverse video bold; other tabs are bare numbers, bold when running and dim when done', () => {
+  const tabs = [makeTab('Explore', false), makeTab('general-purpose', true), makeTab('Plan', false)];
   const runningSelected = buildTabBar(tabs, 0, 80, true);
-  assert.ok(runningSelected.includes(`${reverse}${bold}[● Explore]${reset}`));
-  assert.ok(runningSelected.includes(`${dim}[✓ general-purpose]${reset}`));
+  assert.ok(runningSelected.includes(`${reverse}${bold}[1 ● Explore]${reset} ${dim}2${reset} ${bold}3${reset}`), runningSelected);
   const doneSelected = buildTabBar(tabs, 1, 80, true);
-  assert.ok(doneSelected.includes(`${reverse}${bold}[✓ general-purpose]${reset}`));
-  // 跑中 tab 用 terminal 預設字色，只有 ● 是 ANSI magenta
-  assert.ok(doneSelected.includes(`${dim}◀ ${reset}[${magenta}●${reset} Explore]`));
-  assert.ok(doneSelected.startsWith(`${magenta}1${reset}${dim} running · 1 done │ ${reset}`));
+  assert.ok(doneSelected.includes(`${bold}1${reset} ${reverse}${bold}[2 ✓ general-purpose]${reset} ${bold}3${reset}`), doneSelected);
+  assert.ok(doneSelected.startsWith(`${magenta}2${reset}${dim} running · 1 done │ ${reset}`));
+  // 編號只用 bold／dim，不上色
+  assert.doesNotMatch(doneSelected.split('│')[1], /\x1b\[3\dm/);
   assert.equal(stripAnsi(doneSelected), buildTabBar(tabs, 1, 80, false));
 });
 
@@ -92,29 +95,151 @@ test('tab labels add a description snippet only when agent types repeat', () => 
   assert.equal(labels[3], 'agent');
 });
 
-test('visible tab range always contains the selected tab', () => {
+test('visible tab range always contains the selected tab and grows on both sides', () => {
   const widths = [10, 10, 10, 10, 10, 10];
   for (let selectedIndex = 0; selectedIndex < widths.length; selectedIndex += 1) {
     const { start, end } = getVisibleTabRange(widths, selectedIndex, 25);
     assert.ok(start <= selectedIndex && selectedIndex <= end);
   }
   assert.deepEqual(getVisibleTabRange(widths, 0, 200), { start: 0, end: 5 });
+  assert.deepEqual(getVisibleTabRange([1, 1, 1, 1, 1, 9, 1, 1, 1, 1, 1], 5, 17), { start: 3, end: 7 });
+  // 一邊到頭了，剩下的寬度給另一邊
+  assert.deepEqual(getVisibleTabRange([9, 1, 1, 1, 1, 1, 1], 0, 15), { start: 0, end: 3 });
 });
 
 test('narrow tab bar keeps the summary and the selected tab visible and fits the width', () => {
   const labels = ['alpha', 'bravo', 'charlie', 'delta', 'echo'];
   const tabs = labels.map((label, index) => makeTab(label, index % 2 === 0));
   for (let selectedIndex = 0; selectedIndex < tabs.length; selectedIndex += 1) {
-    const tabBar = buildTabBar(tabs, selectedIndex, 40, false);
-    assert.ok(tabBar.startsWith('2 running · 3 done │ ◀ '), tabBar);
-    assert.ok(tabBar.endsWith(' ▶'), tabBar);
-    assert.ok(tabBar.includes(` ${labels[selectedIndex]}]`), tabBar);
-    assert.ok(displayWidth(tabBar) <= 40, tabBar);
+    const tabBar = buildTabBar(tabs, selectedIndex, 34, false);
+    assert.ok(tabBar.startsWith('2 running · 3 done │ '), tabBar);
+    assert.ok(tabBar.includes(`[${selectedIndex + 1} `), tabBar);
+    assert.ok(displayWidth(tabBar) <= 34, tabBar);
   }
-  assert.equal(buildTabBar(tabs, 4, 45, false), '2 running · 3 done │ ◀ [● delta] [✓ echo] ▶');
-  const colored = buildTabBar(tabs, 4, 45, true);
-  assert.ok(colored.includes(`${magenta}◀ ${reset}`));
-  assert.ok(colored.includes(`${dim} ▶${reset}`));
+  assert.equal(buildTabBar(tabs, 4, 34, false), '2 running · 3 done │ ◀ [5 ✓ ec…]');
+  assert.equal(buildTabBar(tabs, 0, 34, false), '2 running · 3 done │   [1 ✓ al…] ▶');
+  assert.equal(buildTabBar(tabs, 2, 34, false), '2 running · 3 done │ ◀ [3 ✓ ch…] ▶');
+  const colored = buildTabBar(tabs, 2, 34, true);
+  assert.ok(colored.includes(`${magenta}◀${reset} `), colored);
+  assert.ok(colored.endsWith(` ${magenta}▶${reset}`), colored);
+});
+
+test('the arrows appear only on a side with hidden tabs, and the left one leaves a blank so numbers keep their columns', () => {
+  const tabs = makeNumberedTabs(14);
+  const all = buildTabBar(tabs, 6, 200, false);
+  assert.doesNotMatch(all, /[◀▶]/);
+  assert.equal(all, '9 running · 5 done │   1 2 3 4 5 6 [7 ✓ agent-7] 8 9 10 11 12 13 14');
+  const both = buildTabBar(tabs, 6, 60, false);
+  assert.equal(both, '9 running · 5 done │ ◀ 3 4 5 6 [7 ✓ agent-7] 8 9 10 11 12 ▶');
+  const rightOnly = buildTabBar(tabs, 0, 40, false);
+  assert.equal(rightOnly, '9 running · 5 done │   [1 ✓ agent-1] 2 ▶');
+  const leftOnly = buildTabBar(tabs, 13, 40, false);
+  assert.equal(leftOnly, '9 running · 5 done │ ◀ [14 ● agent-14]');
+  // ◀ 出現與否，摘要後面第一個 tab 都從同一欄開始
+  const firstTabColumn = (tabBar) => displayWidth(tabBar.slice(0, tabBar.indexOf('│') + 1)) + 3;
+  assert.equal(firstTabColumn(rightOnly), firstTabColumn(leftOnly));
+  assert.equal(buildTabBarLayout(tabs, 0, 40, false).regions[0].startColumn, buildTabBarLayout(tabs, 13, 40, false).regions[1].startColumn);
+});
+
+// 真實 session 常有 10 個以上的 sub agent：label 帶自己的編號，才看得出畫面上的編號是不是完整清單裡的位置
+function makeNumberedTabs(count, label = (number) => `agent-${number}`) {
+  return Array.from({ length: count }, (_, index) => makeTab(label(index + 1), index % 3 === 0));
+}
+
+function readShownNumbers(tabBar) {
+  return [...tabBar.split('│')[1].matchAll(/(?:\[)?(\d+)(?= |\]|$)/g)].map((match) => Number(match[1])).filter((number, index, list) => list.indexOf(number) === index);
+}
+
+test('tab numbers are positions in the full list and stay put when the visible range scrolls', () => {
+  const tabs = makeNumberedTabs(14);
+  for (let selectedIndex = 0; selectedIndex < tabs.length; selectedIndex += 1) {
+    const tabBar = buildTabBar(tabs, selectedIndex, 50, false);
+    const selectedNumber = selectedIndex + 1;
+    assert.ok(tabBar.includes(`[${selectedNumber} ${selectedIndex % 3 === 0 ? '✓' : '●'} agent-${selectedNumber}]`), tabBar);
+    const numbers = readShownNumbers(tabBar);
+    // 看得到的編號是連續的一段，而且包含選取的那個
+    assert.ok(numbers.includes(selectedNumber), tabBar);
+    assert.deepEqual(numbers, Array.from({ length: numbers.length }, (_, index) => numbers[0] + index), tabBar);
+    assert.ok(displayWidth(tabBar) <= 50, tabBar);
+  }
+  assert.equal(buildTabBar(tabs, 0, 50, false), '9 running · 5 done │   [1 ✓ agent-1] 2 3 4 5 6 7 ▶');
+  assert.equal(buildTabBar(tabs, 9, 50, false), '9 running · 5 done │ ◀ 8 9 [10 ✓ agent-10] 11 12 ▶');
+});
+
+test('two- and three-digit numbers are shown in full, without zero padding, and fit the width', () => {
+  const tabs = makeNumberedTabs(14);
+  const twelfth = buildTabBar(tabs, 11, 60, false);
+  assert.equal(twelfth, '9 running · 5 done │ ◀ 6 7 8 9 10 11 [12 ● agent-12] 13 14');
+  assert.ok(displayWidth(twelfth) <= 60, twelfth);
+  const wide = buildTabBar(tabs, 0, 400, false);
+  assert.match(wide, / 9 10 11 12 13 14$/);
+  assert.doesNotMatch(wide, /\b0\d/);
+  const hundred = makeNumberedTabs(120, (number) => `general-purpose: task ${number}`);
+  const hundredth = buildTabBar(hundred, 99, 70, false);
+  assert.equal(hundredth, '80 running · 40 done │ ◀ 98 99 [100 ✓ general-purpose: task 100] 101 ▶');
+  assert.ok(displayWidth(hundredth) <= 70, hundredth);
+  assert.match(buildTabBar(hundred, 0, 400, false), / 99 100 101 /);
+});
+
+test('a narrow tab bar keeps two- and three-digit numbers and truncates only the label', () => {
+  const twelfth = buildTabBar(makeNumberedTabs(14), 11, 36, false);
+  assert.equal(twelfth, '9 running · 5 done │ ◀ [12 ● age…] ▶');
+  assert.equal(displayWidth(twelfth), 36);
+  const hundredth = buildTabBar(makeNumberedTabs(100, (number) => `general-purpose: task ${number}`), 99, 35, false);
+  assert.equal(hundredth, '66 running · 34 done │ ◀ [100 ✓ ]');
+  assert.ok(displayWidth(hundredth) <= 35, hundredth);
+});
+
+test('when even the selected number and glyph do not fit next to the summary, the summary gives way', () => {
+  const tabs = makeNumberedTabs(14);
+  const tabBar = buildTabBar(tabs, 11, 24, false);
+  assert.equal(tabBar, '◀ [12 ● agent-12] 13 ▶');
+  assert.ok(displayWidth(tabBar) <= 24);
+  for (let width = 10; width <= 80; width += 1) {
+    for (const selectedIndex of [0, 6, 13]) {
+      const narrow = buildTabBar(tabs, selectedIndex, width, false);
+      assert.ok(displayWidth(narrow) <= width, `${width}: ${narrow}`);
+      assert.ok(narrow.includes(`[${selectedIndex + 1} `), `${width}: ${narrow}`);
+    }
+  }
+});
+
+test('click regions match the drawn columns, including wide CJK and emoji labels', () => {
+  const tabs = [makeTab('Explore', false), makeTab('刪除 🚀 設定檔', true), makeTab('Plan', false)];
+  const { text, regions } = buildTabBarLayout(tabs, 1, 80, true);
+  const plain = stripAnsi(text);
+  assert.equal(plain, '2 running · 1 done │   1 [2 ✓ 刪除 🚀 設定檔] 3');
+  const columnOf = (needle) => displayWidth(plain.slice(0, plain.indexOf(needle))) + 1;
+  assert.deepEqual(regions, [
+    { startColumn: columnOf('1 ['), endColumn: columnOf('1 ['), action: { type: 'tab', index: 0 } },
+    { startColumn: columnOf('[2'), endColumn: columnOf('[2') + displayWidth('[2 ✓ 刪除 🚀 設定檔]') - 1, action: { type: 'tab', index: 1 } },
+    { startColumn: columnOf('] 3') + 2, endColumn: columnOf('] 3') + 2, action: { type: 'tab', index: 2 } },
+  ]);
+  // 選取 tab 的最後一欄是 ]，下一欄是空白
+  assert.equal(findTabBarAction(regions, regions[1].endColumn)?.index, 1);
+  assert.equal(findTabBarAction(regions, regions[1].endColumn + 1), null);
+  assert.equal(regions[2].endColumn, displayWidth(plain));
+  assert.equal(findTabBarAction(regions, 1), null);
+});
+
+test('click regions cover two-digit numbers and the arrows, and never go past the width', () => {
+  const tabs = makeNumberedTabs(14);
+  const { text, regions } = buildTabBarLayout(tabs, 6, 60, false);
+  assert.equal(text, '9 running · 5 done │ ◀ 3 4 5 6 [7 ✓ agent-7] 8 9 10 11 12 ▶');
+  const at = (column) => findTabBarAction(regions, column);
+  const columnOf = (needle) => displayWidth(text.slice(0, text.indexOf(needle))) + 1;
+  assert.deepEqual(at(columnOf('◀')), { type: 'previous' });
+  assert.deepEqual(at(columnOf('▶')), { type: 'next' });
+  assert.equal(at(columnOf('◀') + 1), null);
+  assert.deepEqual(at(columnOf('10')), { type: 'tab', index: 9 });
+  assert.deepEqual(at(columnOf('10') + 1), { type: 'tab', index: 9 });
+  assert.equal(at(columnOf('10') + 2), null);
+  assert.deepEqual(at(columnOf('[7')), { type: 'tab', index: 6 });
+  assert.deepEqual(at(columnOf('agent-7]') + 7), { type: 'tab', index: 6 });
+  for (const region of regions) {
+    assert.ok(region.startColumn <= region.endColumn && region.endColumn <= 60);
+  }
+  assert.deepEqual(buildTabBarLayout([], 0, 60, false).regions, []);
 });
 
 test('event lines follow HH:MM:SS  tool  summary and fit the width', () => {
@@ -228,7 +353,7 @@ test('a summary cut while it was stored still says how much is hidden', () => {
 test('frame without sub agents shows the empty session message', () => {
   const lines = buildFrame({ tabs: [], selectedIndex: 0, width: 60, height: 10, useColor: false, sessionLabel: 'session abc' });
   assert.equal(lines.length, 10);
-  assert.equal(lines[0], '0 running · 0 done │ ◀ ▶');
+  assert.equal(lines[0], '0 running · 0 done │ ');
   assert.equal(lines[2], emptySessionMessage);
   assert.match(lines[8], /session abc/);
 });
@@ -242,16 +367,17 @@ test('frame scrolls to the newest events when they exceed the body height', () =
   assert.match(body[0], /step 24$/);
 });
 
-test('footer advertises switching, scrolling, follow and close keys but no digit jump', () => {
+test('footer advertises switching by arrows, digits and clicks, plus scrolling, follow and close keys', () => {
   const lines = buildFrame({ tabs: [makeTab('Explore', false)], selectedIndex: 0, width: 80, height: 8, useColor: false });
   const footer = lines.at(-1);
-  assert.equal(footer, '<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close');
-  assert.doesNotMatch(footer, /1-9/);
+  assert.equal(footer, '<-/-> 0-9 click switch  ↑/↓ PgUp/PgDn scroll  End follow  q close');
 });
 
 test('footer shortens its hints on narrow widths and never overflows', () => {
-  assert.equal(buildFooter(50, false), '<-/-> switch  ↑/↓ scroll  End follow  q close');
-  assert.equal(buildFooter(30, false), '<-/-> ↑/↓ End q');
+  assert.equal(buildFooter(60, false), '<-/-> 0-9 click switch  ↑/↓ scroll  End follow  q close');
+  assert.equal(buildFooter(50, false), '<-/-> 0-9 switch  ↑/↓ scroll  End follow  q close');
+  assert.equal(buildFooter(30, false), '<-/-> 0-9 ↑/↓ End q');
+  assert.equal(buildFooter(16, false), '<-/-> ↑/↓ End q');
   for (const width of [10, 20, 40, 60]) {
     assert.ok(displayWidth(buildFooter(width, false, { isFollowing: false, newLineCount: 12 })) <= width);
   }
@@ -259,7 +385,7 @@ test('footer shortens its hints on narrow widths and never overflows', () => {
 
 test('footer puts ↓ N new first while follow is paused', () => {
   const paused = buildFooter(80, false, { start: 3, isFollowing: false, newLineCount: 4 });
-  assert.equal(paused, '↓ 4 new  <-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close');
+  assert.equal(paused, '↓ 4 new  <-/-> 0-9 click switch  ↑/↓ PgUp/PgDn scroll  End follow  q close');
   assert.ok(buildFooter(20, false, { isFollowing: false, newLineCount: 4 }).startsWith('↓ 4 new  '));
   assert.ok(buildFooter(80, true, { isFollowing: false, newLineCount: 0 }).startsWith(`${magenta}${bold}↓ 0 new${reset}`));
   assert.doesNotMatch(buildFooter(80, false, { start: 9, isFollowing: true, newLineCount: 0 }), /new/);

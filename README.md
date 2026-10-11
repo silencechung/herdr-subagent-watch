@@ -68,6 +68,8 @@ Press `prefix+.` in a pane running Claude Code. Setup binds `prefix+.` to the ac
 | Key | Action |
 | --- | --- |
 | `←` / `→` | Switch tab (wraps around) |
+| `0`–`9` | Jump to the tab with that number (see below) |
+| Mouse click on the tab bar | A number or the selected tab: switch to it; `◀` / `▶`: previous / next tab, same as `←` / `→` |
 | `↑` / `↓` | Scroll one line (one wrapped screen line; the same unit below) |
 | `PgUp` / `PgDn` | Scroll one page |
 | `Home` | Jump to the oldest line |
@@ -77,11 +79,13 @@ Press `prefix+.` in a pane running Claude Code. Setup binds `prefix+.` to the ac
 
 Tab bar:
 
-- It looks like `2 running · 3 done │ ◀ [● Explore] [● general-purpose] [✓ claude-code-guide] ▶`.
+- It looks like `2 running · 3 done │   1 [2 ● general-purpose] 3 4 5`: the selected tab shows its number, status and name; every other tab shows only its number.
 - Colors follow your terminal theme: only bold, dim, reverse and the 16 ANSI colors, no hard-coded color values.
 - The left end is always a running / finished count. The running number is ANSI magenta; the rest is dim.
-- Each tab starts with its status: `●` running (default text color with a magenta `●`), `✓` finished (the whole tab dim). The selected tab is reverse video + bold.
-- Tabs have no numbers, so there is no 1–9 jump. Finished tabs stay, ordered by start time; a status change does not reorder them.
+- The selected tab is `[<number> <status> <name>]` in reverse video + bold, with `●` for running and `✓` for finished. Other tabs are bare numbers: bold while running, dim once finished (no color, only text attributes).
+- Numbers start at 1 and are the tab's place in the full list, ordered by start time. Finished tabs stay and a status change does not reorder them; scrolling the visible part of the tab bar does not change any number. Two- and three-digit numbers are shown as they are, without zero padding.
+- Typing a number jumps to that tab. When the digits typed so far could still be the start of a longer number (for example `1` with 14 tabs, which could become 10–14), the viewer waits 600 ms for the next digit and then jumps to what was typed; when no longer number is possible (`2`–`9` with fewer than 20 tabs) it jumps right away. A number starting with `0` or larger than the tab count is ignored and cleared. Any other key while typing drops the typed digits and then does what it normally does. The wait never blocks redrawing.
+- Clicking works on the tab bar only: a number or the selected tab switches to that tab, `◀` / `▶` move to the previous / next tab; clicks anywhere else are ignored. Only the left-button press counts (the release is ignored), and the clickable columns are taken from what was last drawn, using the same display width as the drawing (CJK and emoji count as 2).
 - Tab names come from the sub agent's `agentType`; when the same type appears more than once, a piece of its `description` is appended.
 - A new tab appears as soon as a new `agent-*.jsonl` shows up (`fs.watch` on `subagents/`, with 1-second polling as a fallback). The first time there are tabs, the newest running sub agent is selected; after that the selection follows that agent, so a new tab never steals the one you are reading.
 - When the output is not a TTY (`--once` redirected to a file or a pipe), the same structure is printed as plain text.
@@ -105,8 +109,8 @@ Scrolling:
 - Follow is on by default: new events scroll the view to the newest line.
 - Scrolling up pauses follow, and the start of the bottom hint bar shows `↓ N new` (how many screen lines arrived since the pause). Press `End` or scroll back to the bottom to resume follow.
 - Each tab remembers its own scroll position; switching tabs does not affect other tabs.
-- Bottom hint bar: `<-/-> switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`, shortened automatically in narrow windows.
-- Mouse: SGR mouse reporting (`\x1b[?1000h\x1b[?1006h`) is turned on while the popup is open to receive wheel events, and always turned off on exit (`q`, `Esc`, `Ctrl+C`, SIGTERM, SIGHUP and unexpected exceptions all turn it off).
+- Bottom hint bar: `<-/-> 0-9 click switch  ↑/↓ PgUp/PgDn scroll  End follow  q close`, shortened automatically in narrow windows (`click` is dropped first, `0-9` last).
+- Mouse: SGR mouse reporting (`\x1b[?1000h\x1b[?1006h`) is turned on while the popup is open to receive wheel events and clicks, and always turned off on exit (`q`, `Esc`, `Ctrl+C`, SIGTERM, SIGHUP and unexpected exceptions all turn it off).
 - Before any sub agent exists, the popup shows `No sub agents yet in this session`.
 
 You can also open the popup without the action: `herdr plugin pane open --plugin subagent.watch --entrypoint viewer`. The viewer then uses the `focused_pane_id` from the popup's own context JSON.
@@ -225,10 +229,10 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
   - In both cases, closing and reopening the popup picks the session again by write time, the same way as on first open.
 - `◀ ▶ ● ─ │ · … ↑ ↓` are East Asian ambiguous width characters. With a terminal set to treat ambiguous width as wide, the layout breaks.
 - Only characters whose East Asian Width is W or F (Unicode 16.0) count as 2 columns. Symbols that some terminals draw wide only with a variation selector (for example `❤️`) can be measured differently from how the terminal draws them. An emoji ZWJ sequence is measured as the sum of its parts (👨‍👩‍👧 counts as 6 columns), so a terminal that joins it into one glyph draws it narrower than measured.
-- Whether herdr forwards the mouse wheel to the popup is **not verified**. If the wheel does nothing, use `↑` / `↓`.
+- Whether herdr forwards the mouse wheel to the popup is **not verified**. If the wheel does nothing, use `↑` / `↓`. Left clicks were checked in a real herdr popup: herdr forwards them as SGR press / release with coordinates relative to the popup content (top-left is 1,1), and clicks outside the popup do nothing.
 - With mouse reporting on, selecting text by dragging inside the viewer is captured by the viewer, so nothing gets selected. Some terminals let you hold Shift while dragging to get around this; whether that works inside a herdr popup is not verified.
 - When reading the transcript, a summary keeps only its first 20 lines and at most 8000 columns in total (enough to fill 20 lines in a 400-column summary column). In `+N`, each cut original line counts as one line, so the real number of screen lines can be higher when an original line is very long.
-- In narrow windows the summaries stay; the tab bar shows only a few tabs around the selected one, and an arrow at either end turns magenta when tabs are hidden on that side. When a single tab is wider than the space left, only its name is cut (ending in `…`); the status symbol is always visible.
+- In narrow windows the tab bar shows only the numbers around the selected tab (adding one on each side in turn), with a magenta `◀` / `▶` on a side that has hidden tabs. With nothing hidden on the left, the `◀` position stays blank, so the numbers do not shift when it appears; with nothing hidden on the right, nothing is drawn. The selected tab is always fully visible: when it is wider than the space left, only its name is cut (ending in `…`), never its number or status symbol. If the window is too narrow for even the summary plus the selected tab's number and symbol, the summary is left out. The line never exceeds the window width.
 - Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings, `rows_by_agent` written as an inline table, and so on) are skipped, or rejected by `herdr config check` (the original file is left untouched, so nothing needs restoring). In that case paste the snippet from the log by hand.
 - If the plugin directory path contains `"`, `$`, `` ` `` or `\`, setup does not write the hooks (they would break the shell command); set them up by hand.
 

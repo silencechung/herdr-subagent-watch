@@ -2,8 +2,8 @@ import path from 'node:path';
 import { getClaudeProjectsDirectory } from './lib/claude-config.mjs';
 import { createDemoSource } from './lib/demo.mjs';
 import { resolveHerdrBinPath } from './lib/herdr.mjs';
-import { createKeyDecoder } from './lib/keys.mjs';
-import { ansi, buildEventLayout, buildFrame, buildTabLabels, describeEndReason, emptySessionMessage, getBodyHeight } from './lib/render.mjs';
+import { createKeyDecoder, createTabNumberInput, isDigitKey } from './lib/keys.mjs';
+import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { chooseSession, describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
@@ -266,6 +266,27 @@ function createController({ options, environment, onChange }) {
       selectedAgentId = tabs[(index + step + tabs.length) % tabs.length].agentId;
       return true;
     },
+    getTabCount() {
+      return source?.getSubAgents().length ?? 0;
+    },
+    // number 是畫面上的編號（1-based）；等數字鍵的 600ms 期間 tab 可能變少，超出範圍就不動
+    selectTabNumber(number) {
+      const tabs = getTabs(Date.now());
+      if (!Number.isInteger(number) || number < 1 || number > tabs.length) {
+        return false;
+      }
+      selectedAgentId = tabs[number - 1].agentId;
+      return true;
+    },
+    // 點擊用畫出來那一刻的 agentId，不用位置：畫完之後才插進來的 tab 不會讓點擊選到旁邊那個
+    selectAgent(agentId) {
+      const tabs = getTabs(Date.now());
+      if (!tabs.some((tab) => tab.agentId === agentId)) {
+        return false;
+      }
+      selectedAgentId = agentId;
+      return true;
+    },
     // 回傳 key 是不是捲動鍵；只動目前選取的 tab，其他 tab 的位置各自留著
     // width 要和畫面用的一樣：捲動以折行後的畫面行為單位
     scroll(key, width, height) {
@@ -276,7 +297,8 @@ function createController({ options, environment, onChange }) {
       const tab = tabs[getSelectedIndex(tabs)];
       return applyScrollKey(getScrollState(tab.agentId), key, buildEventLayout(tab.events, width), getBodyHeight(height));
     },
-    buildLines(width, height, useColor) {
+    // 回傳 { lines, tabRegions }；tabRegions 的 tab 區域帶著畫出來時的 agentId
+    buildLayout(width, height, useColor) {
       const nowMs = Date.now();
       const tabs = getTabs(nowMs);
       const selectedIndex = getSelectedIndex(tabs);
@@ -294,7 +316,13 @@ function createController({ options, environment, onChange }) {
         layout = buildEventLayout(tab.events, width);
         scrollView = resolveScrollView(getScrollState(tab.agentId), layout, getBodyHeight(height));
       }
-      return buildFrame({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages, scrollView, layout });
+      const frame = buildFrameLayout({ tabs, selectedIndex, width, height, useColor, sessionLabel: getSessionLabel(), messages, scrollView, layout });
+      const tabRegions = frame.tabRegions.map((region) => (
+        region.action.type === 'tab'
+          ? { ...region, action: { ...region.action, agentId: tabs[region.action.index].agentId } }
+          : region
+      ));
+      return { lines: frame.lines, tabRegions };
     },
   };
 }
@@ -304,7 +332,7 @@ async function runOnce(controller) {
   controller.refresh();
   const width = process.stdout.columns || defaultWidth;
   const height = process.stdout.rows || defaultHeight;
-  const lines = controller.buildLines(width, height, Boolean(process.stdout.isTTY));
+  const { lines } = controller.buildLayout(width, height, Boolean(process.stdout.isTTY));
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
@@ -314,6 +342,8 @@ function runInteractive(controller, setOnChange) {
     process.exit(1);
   }
   let lastOutput = '';
+  // 最後一次真的寫到畫面上的 tab 列可點區域：點擊要對照使用者看到的那一版
+  let lastTabRegions = [];
   let isTerminalRestored = false;
   let scheduledRender = null;
   let tickTimer = null;
@@ -321,13 +351,14 @@ function runInteractive(controller, setOnChange) {
   function render(isForced = false) {
     const width = process.stdout.columns || defaultWidth;
     const height = process.stdout.rows || defaultHeight;
-    const lines = controller.buildLines(width, height, true);
+    const { lines, tabRegions } = controller.buildLayout(width, height, true);
     // 先清行再畫，不要畫完再清：滿版的行會讓游標停在 pending-wrap 狀態，這時往後清會吃掉最後一個字
     const output = lines.map((line) => ansi.eraseLine + line).join('\r\n');
     if (!isForced && output === lastOutput) {
       return;
     }
     lastOutput = output;
+    lastTabRegions = tabRegions;
     process.stdout.write((isForced ? ansi.eraseScreen : '') + ansi.cursorHome + output);
   }
 
@@ -366,14 +397,48 @@ function runInteractive(controller, setOnChange) {
     if (tickTimer !== null) {
       clearInterval(tickTimer);
     }
+    tabNumberInput.dispose();
+    keyDecoder.dispose();
     controller.stop();
     restoreTerminal();
     process.exit(exitCode);
   }
 
-  const keyDecoder = createKeyDecoder((key) => {
+  const tabNumberInput = createTabNumberInput((number) => {
+    if (controller.selectTabNumber(number)) {
+      render();
+    }
+  });
+
+  // tab 列是畫面第 1 行；點到編號或選取的 tab 就切過去，◀ ▶ 和 ←／→ 一樣
+  function handleClick({ x, y }) {
+    if (y !== 1) {
+      return;
+    }
+    const action = findTabBarAction(lastTabRegions, x);
+    if (action === null) {
+      return;
+    }
+    const isChanged = action.type === 'tab'
+      ? controller.selectAgent(action.agentId)
+      : controller.moveSelection(action.type === 'previous' ? -1 : 1);
+    if (isChanged) {
+      render();
+    }
+  }
+
+  const keyDecoder = createKeyDecoder((key, detail) => {
     if (key === 'q' || key === 'escape' || key === 'ctrl-c') {
       shutdown(0);
+      return;
+    }
+    if (isDigitKey(key)) {
+      tabNumberInput.press(key, controller.getTabCount());
+      return;
+    }
+    tabNumberInput.cancel();
+    if (key === 'click') {
+      handleClick(detail);
       return;
     }
     if (key === 'left' && controller.moveSelection(-1)) {
