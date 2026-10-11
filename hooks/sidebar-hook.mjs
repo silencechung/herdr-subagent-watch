@@ -529,8 +529,8 @@ export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePa
 // 讀不到 btime 時改用固定基準 1e17 ＋ monotonic ns：仍然夠細、仍大於舊版的毫秒 seq，只是重開機後會從小的值重來（同上，herdr 是否記得未驗證）。
 // 不用 Date.now()：毫秒解析度在平行 hook 間會撞號（上面的 22/60）；Date.now() 毫秒 × 1e6 ＋ hrtime 的 ns 餘數也不行，
 // 兩個時鐘的毫秒邊界不一致，同一毫秒內的先後會排錯。讀不到 btime 只會發生在沒有 /proc 的環境（README 只支援 Linux），所以不另外想辦法跨重開機。
-// 已知風險：btime 是「現在的系統時間 − 開機後經過的時間」，系統時間被往回調（手動改時間、NTP step）時 btime 跟著變小，
-// 之後幾秒內的 seq 可能小於調整前送出的，那段時間的回報會被忽略，直到下一個事件。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變 btime（未實測）
+// 已知風險：btime 是「現在的系統時間 − 開機後經過的時間」，取到秒（無條件捨去），系統時間被往回調（手動改時間、NTP step）時 btime 跟著變小，只往回調幾 ms 也可能退約 1 秒；
+// 在時間追上之前 seq 可能小於調整前送出的，那段時間的回報都會被忽略，往回調多久側邊欄就可能凍結多久（再加最多 1 秒）。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變 btime（未實測）
 export function takeSequence(bootTimeSeconds, monotonicNs) {
   const baseNs = bootTimeSeconds === null ? fallbackSequenceBaseNs : bootTimeSeconds * 1_000_000_000n;
   return baseNs + monotonicNs;

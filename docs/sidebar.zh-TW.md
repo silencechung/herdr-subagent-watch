@@ -83,6 +83,7 @@ sub 檔與 pane 對照檔都用「寫暫存檔再 `rename`」，viewer 與別的
 - 新版每個事件都看一下自己 session 的舊檔（不存在只多一次 open 失敗），把裡面還在跑的 sub 搬成 sub 檔（已經有的不蓋；`status` 是 `"done"` 的是更舊版本留下的已結束項目，不搬），再刪掉舊檔。所以升級時正在跑的 sub 不會從側邊欄消失，之後照常由它的 `SubagentStop` 或清除拿掉；搬過來的若其實已經結束，同一次事件的清除就會判斷。
 - 舊版留下的 `.lock`、`.break-*` 不理也不刪：新版不讀它們，跟其他檔案一樣在 tmpfs 上，重開機（或登出時 `XDG_RUNTIME_DIR` 被清掉）就沒了。活著的 process 名下的 lock 也擋不到新版。
 - 升級那一刻還在跑的舊版 hook 若在搬完之後才寫回舊檔，下一次事件會再搬一次；舊檔裡已經沒有、sub 檔卻還在的 sub 不會因此被刪，要等清除拿掉。
+- 升級那一刻有兩種情況會讓已經停掉的 sub 那一行又出現：上面說的舊檔被寫回，以及兩個新版 hook 同時搬同一個舊檔。見已知限制。
 
 ### 沒收到 SubagentStop 就結束的 sub
 
@@ -161,7 +162,9 @@ herdr pane report-metadata <HERDR_PANE_ID> --source subagent.watch --seq <seq> \
   - 用 npm 安裝的 Claude Code 若 process 名稱是 `node` 而不是 `claude`，祖先掃描算到 0 組，所有事件（包括巢狀的）都會被收（未驗證）。
   - 現在也接了 `SessionStart`、`Stop` 與 `StopFailure`，漏網的巢狀 session 影響比以前大：它每次開始，`SessionStart` 都會用標記改寫 pane 對照檔（popup 跟著它走），並依它自己的 session 重畫樹狀行，通常會把主 session 的那幾行清掉。以前只有它的 sub 事件會漏進來。
 - hook command 開頭的 `sh` 是 Claude Code 在 `bin/run.sh` 執行之前照使用者的 PATH 找的，`bin/run.sh` 清 PATH 管不到這一步。
-- seq 的開機時刻是「系統時間 − 開機後經過的時間」：系統時間被往回調（手動改時間、NTP 直接跳的 step）時開機時刻跟著變小，之後那幾秒內的 seq 可能比調整前送出的小，那段時間的回報會被 herdr 忽略，直到下一個事件。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變它（未實測）。
+- seq 的開機時刻是「系統時間 − 開機後經過的時間」，取到秒（無條件捨去）：系統時間被往回調（手動改時間、NTP 直接跳的 step）時開機時刻跟著變小，又因為只取到秒，就算只往回調幾 ms，seq 也可能退約 1 秒。在時間追上之前，seq 可能比調整前送出的小，那段時間的回報都會被 herdr 忽略，所以往回調多久，側邊欄就可能凍結多久（再加最多 1 秒），不只是幾秒。舊版是同一個 session 上次的 seq＋1，在同一個 session 裡不受影響，這點是小退步。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變它（未實測）。
+- 降回舊版：舊版送的是毫秒 seq（約 1.79×10¹²），herdr 已經記住這個 pane 新版的 seq（約 1.79×10¹⁸），舊版的回報全部會被忽略（exit 0、沒有訊息），樹狀行不再更新。要重開 herdr server 才會恢復（herdr 的存檔沒有記 seq，推論如此，未實測）。
+- 只在升級後頭幾次事件附近：hook B（Y 的 `SubagentStart`）讀了舊版的 `session-<sessionId>.json` 之後、link 成 sub 檔之前，hook A（X 的 `SubagentStop`）整個跑完（搬了同一個舊檔、刪掉舊檔、刪掉 X 的檔），B 接著把 X 的檔放回來並回報，已經停掉的 X 又出現在側邊欄。升級那一刻還在跑的舊版 hook 把含有 X 的舊檔寫回時也一樣（見[從舊版升級](#從舊版升級)）。X 那一行要等清除（結束訊號 2 分鐘後）才拿掉。
 - hook 改完檔之後、送到 herdr 之前被砍掉（例如 herdr 卡住超過預算），這次改動要等同一個 session 的下一次回報才會顯示。
 - 清除時把檔拿走到放回的那幾微秒內，若剛好收到同一個 sub 的 `SubagentStop`，它找不到檔，放回來的那一行要等清除（結束訊號 2 分鐘後）才拿掉。
 - `●`、`─` 是 ambiguous width 字元，實際寬度看終端機設定。
@@ -242,9 +245,11 @@ claude = [
 3. 清掉 pane 上殘留的 token（每個有 claude 的 pane 各跑一次）：
 
    ```
-   herdr pane report-metadata <pane_id> --source subagent.watch --seq "$(date +%s%3N)" \
+   herdr pane report-metadata <pane_id> --source subagent.watch \
      --clear-token sub1 --clear-token sub2 --clear-token sub3 --clear-token sub4 --clear-token sub5
    ```
+
+   不要帶 `--seq`：herdr 會忽略不比上次收下的大的 seq，hook 送的 seq（約 1.79×10¹⁸）比手動帶的 `$(date +%s%3N)`（毫秒，約 1.79×10¹²）大得多，帶了反而清不掉。沒帶 `--seq` 的回報一律會被接受，也不會重設上次的 seq。
 
 4. 狀態檔在 `$XDG_RUNTIME_DIR/subagent-watch/`，重開機會自動清掉，也可以手動刪掉這個資料夾。
 
@@ -254,4 +259,4 @@ claude = [
 node --test test/sidebar*.test.mjs test/security-*.test.mjs
 ```
 
-涵蓋 payload 解析（含實測的 `SessionStart` startup／resume 與 `Stop` payload）、sub 檔（stop 刪檔、沒看過 start 的 stop 略過、resume 換新啟動時間、內容要跟檔名對得上、壞掉的檔略過、同一毫秒依 `id` 排序）、從舊版升級（還在跑的搬成 sub 檔、`done` 項目不搬、不蓋掉已經有的 sub 檔、舊的 lock 不理）、`SessionStart`（pane 對照檔的標記、同一個 session 的 sub 事件留著標記、別的 session 不帶、換 session 時重畫或清空樹狀行）、`Stop` 與 `StopFailure`（不寫 pane 對照檔、有拿掉 sub 才呼叫 herdr；`StopFailure` 用官方文件的 payload，會拿掉因 API 錯誤停下的 sub，也走同一套巢狀 `claude` 判斷）、清除沒收到 `SubagentStop` 就結束的 sub（實測的 API 錯誤與中斷 transcript 尾端、沿用 viewer 的規則、只看最後一筆有效紀錄、結束訊號後 2 分鐘沒寫入才清、resume 前的結束訊號不算（不留誤差）、resume 時啟動時間換新、review E2E 時間軸：上一輪結束 2 秒內 resume 不會被清、task notification 只看 `enqueue` 時間、最後一筆是新指令時不信通知、沒有結束訊號的 sub 不管多久沒寫入都留著、transcript 不存在的 2 分鐘規則、只讀最後 64 KB、預放的 FIFO 不會卡住、時間預算、transcript 都在取 seq 之前讀、只刪中間沒被別的 hook 改過的、resume 的檔放回且照樣重畫、沒有要清的 `Stop` 不取 seq 也不呼叫 herdr）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq（BigInt、開機時刻＋monotonic、跨重開機遞增、比舊版的毫秒 seq 大、讀不到 `btime` 的退路、在改完檔之後與 readdir 之前取）、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、`bin/run.sh` 不執行相對路徑 PATH 項目裡的任何指令、判斷 pane 的 session（祖先只有一組 `claude` 時 herdr 回報舊的 `agent_session` 也照常更新、名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 除非 herdr 回報的就是它的 session 否則略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、不用 lock 的平行更新（用真的 process 讓 8 個 hook 同時 start、同時 stop、start 後馬上 stop、start 與 stop 交錯，假 herdr 照 herdr 的規則只收比較大的 seq，最後顯示的一定等於檔案狀態；把另一個 hook 插進取 seq 或回報的當下的各種組合，以及隨機的巢狀交錯；舊版留下的各種 lock 旁邊 8 個 hook 同時觸發也不掉）、整體預算不超過 `settings.json` timeout 的一半，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。
+涵蓋 payload 解析（含實測的 `SessionStart` startup／resume 與 `Stop` payload）、sub 檔（stop 刪檔、沒看過 start 的 stop 略過、resume 換新啟動時間、內容要跟檔名對得上、壞掉的檔略過、同一毫秒依 `id` 排序）、從舊版升級（還在跑的搬成 sub 檔、`done` 項目不搬、不蓋掉已經有的 sub 檔、舊的 lock 不理、只有搬舊檔的 `Stop` 也會回報）、`SessionStart`（pane 對照檔的標記、同一個 session 的 sub 事件留著標記、別的 session 不帶、換 session 時重畫或清空樹狀行）、`Stop` 與 `StopFailure`（不寫 pane 對照檔、有拿掉 sub 才呼叫 herdr；`StopFailure` 用官方文件的 payload，會拿掉因 API 錯誤停下的 sub，也走同一套巢狀 `claude` 判斷）、清除沒收到 `SubagentStop` 就結束的 sub（實測的 API 錯誤與中斷 transcript 尾端、沿用 viewer 的規則、只看最後一筆有效紀錄、結束訊號後 2 分鐘沒寫入才清、resume 前的結束訊號不算（不留誤差）、resume 時啟動時間換新、review E2E 時間軸：上一輪結束 2 秒內 resume 不會被清、task notification 只看 `enqueue` 時間、最後一筆是新指令時不信通知、沒有結束訊號的 sub 不管多久沒寫入都留著、transcript 不存在的 2 分鐘規則、只讀最後 64 KB、預放的 FIFO 不會卡住、時間預算、transcript 都在取 seq 之前讀、只刪中間沒被別的 hook 改過的、resume 的檔放回且照樣重畫、沒有要清的 `Stop` 不取 seq 也不呼叫 herdr）、樹狀行（start 兩個 → stop 一個剩 `└─` → 全部 stop 全清、`+N more` 只算跑中、80 字截斷、bidi／零寬字元拿掉）、seq（BigInt、開機時刻＋monotonic、跨重開機遞增、比舊版的毫秒 seq 大、讀不到 `btime` 的退路、在改完檔之後與 readdir 之前取）、非 herdr 環境靜默、沒有 `HERDR_BIN_PATH` 時改找 PATH 上的 herdr（相對路徑的 PATH 項目不算）、`bin/run.sh` 不執行相對路徑 PATH 項目裡的任何指令、判斷 pane 的 session（祖先只有一組 `claude` 時 herdr 回報舊的 `agent_session` 也照常更新、名為 claude 的 wrapper 照常更新、巢狀 `claude -p` 除非 herdr 回報的就是它的 session 否則略過，用真的 process 樹測）、狀態資料夾檢查（symlink、權限、owner、預放的 symlink）、不用 lock 的平行更新（用真的 process 讓 8 個 hook 同時 start、同時 stop、start 後馬上 stop、start 與 stop 交錯，假 herdr 照 herdr 的規則只收比較大的 seq，最後顯示的一定等於檔案狀態；把另一個 hook 插進取 seq 或回報的當下的各種組合，以及隨機的巢狀交錯；舊版留下的各種 lock 旁邊 8 個 hook 同時觸發也不掉）、整體預算不超過 `settings.json` timeout 的一半，以及用假的 herdr 執行檔實際跑 script（檢查 exit 0、stdout 空、1 秒內結束）。

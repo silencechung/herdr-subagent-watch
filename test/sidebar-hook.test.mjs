@@ -543,6 +543,22 @@ describe('runHook', () => {
     assert.equal(existsSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`)), false);
   });
 
+  // 搬舊檔是這次事件唯一的改動時也要回報：Stop 沒拿掉任何 sub，但側邊欄要畫出剛搬過來的 sub
+  test('a Stop whose only change is moving the previous version\'s running sub agents still reports them to herdr', () => {
+    const harness = createHarness();
+    mkdirSync(harness.stateDirectory, { mode: 0o700 });
+    writeFileSync(join(harness.stateDirectory, `session-${startPayload.session_id}.json`), JSON.stringify({
+      sessionId: startPayload.session_id,
+      subagents: [subagent('oldrunning', 990_000, 'Plan')],
+    }));
+    const result = runHook(payloadWith({ hook_event_name: 'Stop' }), harness.environment, harness.dependencies);
+    assert.equal(result.action, 'reported');
+    assert.deepEqual(result.removed, []);
+    assert.equal(harness.herdrCalls.length, 1);
+    assert.deepEqual(harness.herdrCalls[0].argumentList.slice(7, 9), ['--token', 'sub1=└─ Plan ●']);
+    assert.deepEqual(harness.readSubagents().map((entry) => entry.id), ['oldrunning']);
+  });
+
   test('seq follows the monotonic clock, so two events in the same millisecond still get increasing seq', () => {
     const harness = createHarness();
     runHook(startPayloadText, harness.environment, harness.dependencies);
