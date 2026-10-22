@@ -158,9 +158,11 @@ else
   if [ -z "$node" ] && [ -n "${FNM_DIR:-}" ]; then
     try_node "$FNM_DIR/aliases/default/bin/node"
   fi
+  # 舊版 fnm 在 macOS 的預設資料夾是 ~/Library/Application Support/fnm（路徑有空白，一定要整段 quote）
   if [ -z "$node" ] && [ -n "$home" ]; then
     try_node "${XDG_DATA_HOME:-$home/.local/share}/fnm/aliases/default/bin/node" ||
       try_node "$home/.local/share/fnm/aliases/default/bin/node" ||
+      try_node "$home/Library/Application Support/fnm/aliases/default/bin/node" ||
       try_node "$home/.fnm/aliases/default/bin/node" ||
       try_node "$home/.volta/bin/node" ||
       try_node "$(newest_nvm_node)"

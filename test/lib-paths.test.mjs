@@ -3,6 +3,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { getClaudeConfigDirectory, getClaudeProjectsDirectory, getClaudeSettingsPath } from '../lib/claude-config.mjs';
 import { resolveHerdrBinPath } from '../lib/herdr.mjs';
+import { resolveRuntimeDirectory } from '../lib/runtime-directory.mjs';
 
 test('CLAUDE_CONFIG_DIR moves both projects/ and settings.json', () => {
   const environment = { CLAUDE_CONFIG_DIR: '/data/claude-config', HOME: '/home/someone' };
@@ -32,4 +33,21 @@ test('without HERDR_BIN_PATH the first executable herdr on PATH is used, or null
   assert.equal(resolveHerdrBinPath({ PATH: '/a::/b:/c' }, isExecutable), '/b/herdr');
   assert.equal(resolveHerdrBinPath({ PATH: '/a' }, isExecutable), null);
   assert.equal(resolveHerdrBinPath({}, isExecutable), null);
+});
+
+// hook 與 popup 共用這個函式：兩邊選到同一個資料夾，popup 才找得到 pane 對照檔
+test('the runtime directory is XDG_RUNTIME_DIR on both platforms when it is set', () => {
+  const temporaryDirectory = '/var/folders/ab/xyz/T';
+  for (const platform of ['linux', 'darwin']) {
+    assert.equal(resolveRuntimeDirectory({ environment: { XDG_RUNTIME_DIR: '/run/user/1000' }, platform, temporaryDirectory }), '/run/user/1000');
+  }
+});
+
+test('without XDG_RUNTIME_DIR only macOS falls back to os.tmpdir(); Linux gets null instead of a shared /tmp', () => {
+  const temporaryDirectory = '/var/folders/ab/xyz/T';
+  assert.equal(resolveRuntimeDirectory({ environment: {}, platform: 'darwin', temporaryDirectory }), temporaryDirectory);
+  assert.equal(resolveRuntimeDirectory({ environment: { XDG_RUNTIME_DIR: '' }, platform: 'darwin', temporaryDirectory }), temporaryDirectory);
+  assert.equal(resolveRuntimeDirectory({ environment: {}, platform: 'linux', temporaryDirectory: '/tmp' }), null);
+  assert.equal(resolveRuntimeDirectory({ environment: { XDG_RUNTIME_DIR: '' }, platform: 'linux', temporaryDirectory: '/tmp' }), null);
+  assert.equal(resolveRuntimeDirectory({ environment: {}, platform: 'darwin', temporaryDirectory: '' }), null);
 });

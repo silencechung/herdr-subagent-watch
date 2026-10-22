@@ -124,7 +124,7 @@ The pane id comes from, in order: `SUBAGENT_WATCH_PANE_ID` (passed in by the ope
 In the two "not Claude Code" cases the viewer does not guess a session. It asks again every 2 seconds, so starting Claude Code in that pane later connects automatically.
 
 1. **herdr**: `agent_session` (reported by herdr's claude integration; observed as `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`). The session id is used to find `<session-id>.jsonl` under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/`. herdr's answer can be stale: after the herdr server restarted, a new Claude Code started in the same pane was still reported with the session from before the restart (observed; the cause is not known).
-2. **Pane map**: `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`, written by the sidebar hook (`sessionId`, `transcriptPath`, `cwd`, `updatedAtMs`). The hook writes it on `SessionStart`, so it names the pane's session from the moment a session starts, is resumed or cleared; the file then also carries `sessionStartSource` as a mark (kept when sub agent events of the same session rewrite the file). Without the mark (written only on `SubagentStart` / `SubagentStop`: setup from an older version not run again yet, or a session that started before the hooks were added), it can point at the previous session until the next sub agent starts.
+2. **Pane map**: `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json` (on macOS without `XDG_RUNTIME_DIR`: `$TMPDIR/subagent-watch/`, see [Files written](sidebar.md#files-written)), written by the sidebar hook (`sessionId`, `transcriptPath`, `cwd`, `updatedAtMs`). The hook writes it on `SessionStart`, so it names the pane's session from the moment a session starts, is resumed or cleared; the file then also carries `sessionStartSource` as a mark (kept when sub agent events of the same session rewrite the file). Without the mark (written only on `SubagentStart` / `SubagentStop`: setup from an older version not run again yet, or a session that started before the hooks were added), it can point at the previous session until the next sub agent starts.
 3. **Guess**, only when neither herdr nor the pane map names a session: the pane's cwd is mapped to `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd with / replaced by ->/` and the most recently modified `<session-id>.jsonl` is used. The bottom separator then shows `(guessed: latest session)`: with several Claude Code sessions in the same folder, the guess can be wrong. Both `/var/home/...` and `/home/...` spellings are tried (Fedora Atomic keeps home under `/var/home`), plus a spelling with every non-alphanumeric character replaced by `-` (not verified whether Claude Code encodes paths containing `.` that way).
 
 **A pane map with the mark whose transcript exists is used as it is**: herdr's answer and write times are not compared, and the popup switches whenever the pane map names another session (the bottom separator still shows `herdr says session <id>, pane map says <id>` when herdr disagrees). Right after a new session starts, its transcript does not exist yet (with Claude Code 2.1.296 it is written after the first prompt); until it appears, the rules below apply.
@@ -163,7 +163,7 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
 
 1. `SUBAGENT_WATCH_NODE` (when set, only this one is used; if it is not usable, it is an error)
 2. `command -v node`, after checking that the file really exists and is executable. The herdr server's `PATH` may still contain a node that no longer exists (for example fnm's per-shell temporary path).
-3. `aliases/default/bin/node` under `$FNM_DIR`, `${XDG_DATA_HOME:-~/.local/share}/fnm` and `~/.fnm`
+3. `aliases/default/bin/node` under `$FNM_DIR`, `${XDG_DATA_HOME:-~/.local/share}/fnm`, `~/Library/Application Support/fnm` (the macOS default of older fnm versions) and `~/.fnm`
 4. `~/.volta/bin/node`
 5. The newest version under `${NVM_DIR:-~/.nvm}/versions/node/*/bin/node`
 6. `/opt/homebrew/bin/node`, `/usr/local/bin/node`, `/usr/bin/node`
@@ -193,6 +193,8 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
 - In narrow windows the tab bar shows only the numbers around the selected tab (adding one on each side in turn), with a magenta `◀` / `▶` on a side that has hidden tabs. With nothing hidden on the left, the `◀` position stays blank, so the numbers do not shift when it appears; with nothing hidden on the right, nothing is drawn. The selected tab is always fully visible: when it is wider than the space left, only its name is cut (ending in `…`), never its number or status symbol. If the window is too narrow for even the summary plus the selected tab's number and symbol, the summary is left out. The line never exceeds the window width.
 - Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings, `rows_by_agent` written as an inline table, and so on) are skipped, or rejected by `herdr config check` (the original file is left untouched, so nothing needs restoring). In that case paste the snippet from the log by hand.
 - If the plugin directory path contains `"`, `$`, `` ` `` or `\`, setup does not write the hooks (they would break the shell command); set them up by hand.
+- macOS: without `XDG_RUNTIME_DIR` the state files live in `$TMPDIR/subagent-watch/`, and macOS deletes files in `$TMPDIR` that have not been accessed for 3 days. After a pane has been idle for 3 days its pane map can be gone, and the popup falls back to guessing the session from the pane's cwd until the next `SessionStart` or sub agent event writes it again. The hook and the popup must see the same `TMPDIR` (or the same `XDG_RUNTIME_DIR`); otherwise the popup does not find the pane map and guesses.
+- macOS: the hook tells a nested `claude -p` apart by the process names in `ps -A -o pid=,ppid=,comm=`. What the native Claude Code binary shows there has not been checked on a real Mac; if it is not `claude`, the ancestor scan finds no `claude` and every event is accepted, nested ones included (see Known limitations in [`docs/sidebar.md`](sidebar.md#known-limitations)).
 
 ## Development
 
@@ -219,7 +221,7 @@ In the repo directory:
 node --test 'test/*.test.mjs'
 ```
 
-Node 22's `node --test` only accepts files or globs; passing a folder (`node --test test/`) treats it as a module to load and fails. The pty tests need util-linux's `script` and are skipped without it; the `herdr config check` tests are skipped when herdr is not found.
+Node 22's `node --test` only accepts files or globs; passing a folder (`node --test test/`) treats it as a module to load and fails. The pty tests need util-linux's `script` and are skipped without it (macOS ships the BSD `script`, which takes different options, so they are skipped there); the `herdr config check` tests are skipped when herdr is not found.
 
 ### Testing the open action without a popup
 

@@ -4,6 +4,7 @@ import { createDemoSource } from './lib/demo.mjs';
 import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder, createTabNumberInput, isDigitKey } from './lib/keys.mjs';
 import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight } from './lib/render.mjs';
+import { resolveRuntimeDirectory } from './lib/runtime-directory.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { chooseSession, describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
@@ -67,7 +68,7 @@ async function resolveFromEnvironment(environment, signal) {
     // plugin process 的 cwd 是 plugin 資料夾，拿來猜 session 一定錯
     fallbackCwd: isPluginProcess ? null : process.cwd(),
     projectsDirectory: getClaudeProjectsDirectory(environment),
-    runtimeDirectory: environment.XDG_RUNTIME_DIR,
+    runtimeDirectory: resolveRuntimeDirectory({ environment }),
     herdrBinPath: resolveHerdrBinPath(environment),
     signal,
   });

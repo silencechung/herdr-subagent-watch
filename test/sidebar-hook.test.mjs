@@ -218,16 +218,17 @@ describe('takeSequence', () => {
     assert.ok(takeSequence(null, 0n) < takeSequence(1_790_000_000n, 0n));
   });
 
-  test('the boot time is read from btime in /proc/stat', () => {
+  test('on Linux the boot time is read from btime in /proc/stat', () => {
     const procStat = 'cpu  1 2 3\nintr 5\nctxt 6\nbtime 1791608737\nprocesses 7\n';
-    assert.equal(readBootTimeSeconds(() => procStat), 1_791_608_737n);
-    assert.equal(readBootTimeSeconds(() => 'cpu 1 2 3\n'), null);
-    assert.equal(readBootTimeSeconds(() => 'btime 0\n'), null);
-    assert.equal(readBootTimeSeconds(() => 'btime -5\n'), null);
-    assert.equal(readBootTimeSeconds(() => {
+    const readOnLinux = (readText) => readBootTimeSeconds({ platform: 'linux', readText });
+    assert.equal(readOnLinux(() => procStat), 1_791_608_737n);
+    assert.equal(readOnLinux(() => 'cpu 1 2 3\n'), null);
+    assert.equal(readOnLinux(() => 'btime 0\n'), null);
+    assert.equal(readOnLinux(() => 'btime -5\n'), null);
+    assert.equal(readOnLinux(() => {
       throw new Error('ENOENT');
     }), null);
-    if (existsSync('/proc/stat')) {
+    if (process.platform === 'linux' && existsSync('/proc/stat')) {
       assert.equal(typeof readBootTimeSeconds(), 'bigint');
     }
   });

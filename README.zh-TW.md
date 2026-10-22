@@ -11,7 +11,7 @@ herdr plugin `subagent.watch`：即時看 Claude Code 的 sub agent 在做什麼
 - herdr ≥ 0.9.3
 - Node.js ≥ 22（自動找，見 [Node 怎麼找](docs/internals.zh-TW.md#node-怎麼找)）
 - Claude Code
-- Linux（sidebar hook 靠 `/proc` 與 `XDG_RUNTIME_DIR`）
+- Linux 或 macOS。sidebar hook 在 Linux 讀 `/proc` 與 `XDG_RUNTIME_DIR`；macOS 改用 `ps`、`sysctl` 與 `$TMPDIR`（沒有 `XDG_RUNTIME_DIR` 時）。macOS 的限制見[疑難排解與已知限制](docs/internals.zh-TW.md#疑難排解與已知限制)。
 
 ## 安裝
 

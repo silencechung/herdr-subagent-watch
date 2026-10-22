@@ -11,7 +11,7 @@ A herdr plugin to watch Claude Code sub agents live: a popup viewer and a sideba
 - herdr ≥ 0.9.3
 - Node.js ≥ 22 (found automatically, see [How Node is found](docs/internals.md#how-node-is-found))
 - Claude Code
-- Linux (the sidebar hook relies on `/proc` and `XDG_RUNTIME_DIR`)
+- Linux or macOS. The sidebar hook reads `/proc` and `XDG_RUNTIME_DIR` on Linux; on macOS it uses `ps`, `sysctl` and `$TMPDIR` (when `XDG_RUNTIME_DIR` is not set). macOS limitations are in [Troubleshooting and known limitations](docs/internals.md#troubleshooting-and-known-limitations).
 
 ## Install
 
