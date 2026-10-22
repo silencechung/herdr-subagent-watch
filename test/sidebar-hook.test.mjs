@@ -813,40 +813,50 @@ describe('without a lock, any interleaving of hooks ends with the newest seq sho
     assert.equal(isOwnFileGoneAtSequence, true);
   });
 
-  for (const [firstLabel, firstPayload] of [['start', start('a')], ['stop', stop('a')]]) {
-    for (const [secondLabel, secondPayload] of [['start', start('b')], ['stop', stop('b')]]) {
-      for (const pause of ['seq', 'report']) {
-        test(`a ${secondLabel} running entirely inside a ${firstLabel} at its ${pause} step`, () => {
-          const interleaving = createInterleavingCase();
-          // stop 要有東西可停：兩個 sub 都先跑起來
-          interleaving.run(start('a'));
-          interleaving.run(start('b'));
-          interleaving.run(firstPayload, { [pause]: () => interleaving.run(secondPayload) });
-          assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
-        });
-      }
+  // 事先只啟動要被 stop 的 sub：start 的都是新的 sub，兩邊的改動都會讓數量變，取 seq 的時機錯了（例如 readdir 之後才取、改檔之前就取）數字就會不同。
+  // resume 已經在跑的 sub 不改數量，拿它當外層或插進來的 hook 時，時機錯了也是同一個數字，驗不出來
+  const nestedCases = [
+    { outer: ['start', start('a')], inner: ['start', start('b')], runningBefore: [], runningAfter: 2 },
+    { outer: ['start', start('a')], inner: ['stop', stop('b')], runningBefore: ['b'], runningAfter: 1 },
+    { outer: ['stop', stop('a')], inner: ['start', start('b')], runningBefore: ['a'], runningAfter: 1 },
+    { outer: ['stop', stop('a')], inner: ['stop', stop('b')], runningBefore: ['a', 'b'], runningAfter: 0 },
+  ];
+  const expectedTokensFor = (runningCount) => (runningCount > 0 ? runningTokens(runningCount) : allTokensCleared);
+
+  for (const { outer: [outerLabel, outerPayload], inner: [innerLabel, innerPayload], runningBefore, runningAfter } of nestedCases) {
+    for (const pause of ['seq', 'report']) {
+      test(`a ${innerLabel} running entirely inside a ${outerLabel} at its ${pause} step`, () => {
+        const interleaving = createInterleavingCase();
+        for (const agentId of runningBefore) {
+          interleaving.run(start(agentId));
+        }
+        interleaving.run(outerPayload, { [pause]: () => interleaving.run(innerPayload) });
+        assert.deepEqual(interleaving.expectedTokens(), expectedTokensFor(runningAfter), 'the files left');
+        assert.deepEqual(interleaving.shown(), expectedTokensFor(runningAfter));
+      });
     }
   }
 
   // 撞號：另一個 hook 在這個 hook 讀時鐘的同一個 ns 取號，拿到一樣的 seq。同一個 ns 代表另一個 hook 取號時，這個 hook 的改動已經完成、readdir 還沒開始，
   // 所以把它整個插在取 seq 的當下（插在 report 的當下就不是同一個 ns 了：readdir 至少要幾 µs）。插進來的先送到，herdr 收它、忽略這個 hook 的；
   // 兩筆都看得到兩邊的改動，所以不管收哪一筆都正確
-  for (const [firstLabel, firstPayload] of [['start', start('a')], ['stop', stop('a')]]) {
-    for (const [secondLabel, secondPayload] of [['start', start('b')], ['stop', stop('b')], ['start of a third sub agent', start('c')]]) {
-      test(`a ${secondLabel} that gets the same seq inside a ${firstLabel}: either report shows every change`, () => {
-        const interleaving = createInterleavingCase();
-        interleaving.run(start('a'));
-        interleaving.run(start('b'));
-        const reportCountBefore = interleaving.reports.length;
-        interleaving.run(firstPayload, { seq: (valueNs) => interleaving.run(secondPayload, {}, valueNs) });
-        const collided = interleaving.reports.slice(reportCountBefore);
-        assert.equal(collided.length, 2);
-        assert.equal(collided[0][6], collided[1][6], 'both reports carry the same seq');
-        assert.deepEqual(collided[0].slice(7), interleaving.expectedTokens(), 'the report herdr keeps (first to arrive)');
-        assert.deepEqual(collided[1].slice(7), interleaving.expectedTokens(), 'the report herdr ignores');
-        assert.deepEqual(interleaving.shown(), interleaving.expectedTokens());
-      });
-    }
+  for (const { outer: [outerLabel, outerPayload], inner: [innerLabel, innerPayload], runningBefore, runningAfter } of nestedCases) {
+    test(`a ${innerLabel} that gets the same seq inside a ${outerLabel}: either report shows every change`, () => {
+      const interleaving = createInterleavingCase();
+      for (const agentId of runningBefore) {
+        interleaving.run(start(agentId));
+      }
+      const reportCountBefore = interleaving.reports.length;
+      interleaving.run(outerPayload, { seq: (valueNs) => interleaving.run(innerPayload, {}, valueNs) });
+      const collided = interleaving.reports.slice(reportCountBefore);
+      const expectedTokens = expectedTokensFor(runningAfter);
+      assert.equal(collided.length, 2);
+      assert.equal(collided[0][6], collided[1][6], 'both reports carry the same seq');
+      assert.deepEqual(interleaving.expectedTokens(), expectedTokens, 'the files left');
+      assert.deepEqual(collided[0].slice(7), expectedTokens, 'the report herdr keeps (first to arrive)');
+      assert.deepEqual(collided[1].slice(7), expectedTokens, 'the report herdr ignores');
+      assert.deepEqual(interleaving.shown(), expectedTokens);
+    });
   }
 
   // 隨機產生多層巢狀的交錯（每個 hook 在取 seq 或回報時，可能先讓另一個 hook 整個跑完）；固定種子，失敗可重現

@@ -499,6 +499,8 @@ export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePa
 // ns 撞號無害：8 個 hook 同時觸發時，不同核心偶爾在同一個 ns 讀時鐘，拿到一樣的 seq（平行測試連跑 30 次撞了 4 次，最後顯示都等於檔案狀態），herdr 收先到的、忽略後到的。
 // 同一個 seq 代表兩邊在同一個 ns 取號：兩邊取號時自己的改動都已經完成，readdir 又都在取號之後（readdir 至少要幾 µs），所以兩筆都看得到 seq 不大於它的每一個改動；
 // 兩次 readdir 之間若又有別的改動，那個 hook 是改完才取號，seq 一定比較大，會蓋過這兩筆。毫秒的撞號不一樣：同一毫秒內別的 hook 還來得及改完檔，被忽略的那筆可能是唯一看到改動的（下面的 22/60）。
+// 撞號無害的前提是時鐘的 tick 比「讀時鐘到 readdir」之間的時間短。本機 clocksource 是 tsc（ns 等級，看 /sys/devices/system/clocksource/clocksource0/current_clocksource）；
+// 退到 hpet、acpi_pm（tick 約 70–280 ns）推測仍成立（未驗證）；退到 jiffies（1/HZ，ms 等級）就跟毫秒 seq 一樣會漏（未驗證）。
 // POC（8 個 hook 同時觸發、20 輪×3 種情境：同時 start、同時 stop、start 後馬上 stop；一般／taskset -c 0／再加 4 或 6 個吃滿 CPU 的 process）：
 // 這個做法 0 次漏掉；seq 用毫秒時撞號漏 22/60，seq 在寫檔之前取漏 1–2/60，不帶 seq 漏 10–19/60。
 // 值是「開機時刻（btime 秒）× 1e9 ＋ monotonic ns」，BigInt 算、字串傳：monotonic（process.hrtime，所有 process 共用同一個時鐘）解析度夠細，

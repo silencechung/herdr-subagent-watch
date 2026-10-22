@@ -11,7 +11,7 @@
 1. Claude Code：`${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` 的 `hooks.SubagentStart`、`hooks.SubagentStop`、`hooks.SessionStart`、`hooks.Stop`、`hooks.StopFailure` 各加一筆，五個都是同一個 command：`sh "<plugin 目錄>/bin/run.sh" "<plugin 目錄>/hooks/sidebar-hook.mjs"`（timeout 5 秒）。
    - 本 plugin 之前加的 hook（plugin 目錄換過也算），或手動加的舊寫法 `<node 絕對路徑> <絕對路徑>/hooks/sidebar-hook.mjs`，會原地換成新的寫法，不重複加；別的工具的 hook 只是檔名剛好叫 `sidebar-hook.mjs` 不算。
    - 其他 hook 一個都不動；你自己的 `SessionStart`／`Stop`／`StopFailure` hook 留著，本 plugin 的加在它們後面。
-   - **用舊版 setup 過**（只有 `SubagentStart`／`SubagentStop`）：再跑一次 setup，會補上 `SessionStart`、`Stop` 與 `StopFailure`，原本的兩個不動。每個 event 各自檢查，缺哪個補哪個，不會重複。補上之前 popup 照舊版的方式找 session，側邊欄的 sub 也只有收到 `SubagentStop` 才拿掉。已經在跑的 Claude Code session 要等它下一次 `SessionStart`（重開、`/resume`、`/clear` 或 compaction）才會寫 session 對照。
+   - **用舊版 setup 過**（只有 `SubagentStart`／`SubagentStop`）：再跑一次 setup，會補上 `SessionStart`、`Stop` 與 `StopFailure`，原本的兩個不動。每個 event 各自檢查，缺哪個補哪個，不會重複。補上之前 popup 照舊版的方式找 session；沒收到 `SubagentStop` 就結束的 sub，要等同一個 session 另一個 sub 的 `SubagentStart`／`SubagentStop`（在它最後一次寫入 2 分鐘以後）才從數量拿掉：清除每個事件都會跑，但只接了這兩種事件。已經在跑的 Claude Code session 要等它下一次 `SessionStart`（重開、`/resume`、`/clear` 或 compaction）才會寫 session 對照。
 2. herdr：`$HERDR_CONFIG_PATH`，沒設就是 `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml`。加的內容都包在 `# >>> subagent.watch` ／ `# <<< subagent.watch` 之間。
    - 快捷鍵：沒有任何東西用 `prefix+.` 才加 `[[keys.command]]`；已被別的動作佔用就跳過，log 裡附上可以改成別的鍵的片段。
    - 側邊欄：沒有 `[ui.sidebar.agents.rows_by_agent]` 就整段加上；有這個表但沒有 `claude =` 就插在表頭下一行；已經有自己的 `claude =` 而且沒有 `$sub1` 就不動，log 裡附上要自己貼進去的那一行。claude rows 已經有 `$sub1` 的（包括舊版 setup 寫的 `$sub1`…`$sub5` 五行）當成設定好，不改寫（見 [setup 會加什麼](sidebar.zh-TW.md#setup-會加什麼)）。
@@ -87,7 +87,7 @@ claude
 ● 3 running
 ```
 
-- 只顯示數量，不列名稱，也沒有上限。每次 `SubagentStart` 加一、`SubagentStop` 減一。
+- 只顯示數量，不列名稱，也沒有上限。`SubagentStart` 加一，但 resume 一個還算在數量裡的 sub（上一輪的 `SubagentStop` 沒收到，它的檔還在）時只換啟動時間，數字不變；`SubagentStop` 減一，之前沒看過 `SubagentStart` 的不影響數字。
 - 側邊欄不留歷程，sub 一結束就不算進數量；因 API 錯誤（例如額度用完）等原因沒收到 `SubagentStop` 的 sub，在它最後一次寫入 2 分鐘後的下一次 hook 事件拿掉（例如主 session 下一次回合結束的 `Stop`；那一回合本身因 API 錯誤結束時是 `StopFailure`），這只是安全網：沒有結束訊號的 sub（或 resume 後新一輪還沒寫紀錄的）不管多久沒寫入都留著。
 - pane 換 session（新的 `claude`、`/clear`、`/resume`）時側邊欄馬上換成新 session 的數量。
 - 沒有任何跑中的 sub 時，那一行消失，側邊欄只剩 claude 那一列。
