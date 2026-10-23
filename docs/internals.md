@@ -11,7 +11,7 @@ The `subagent.watch.setup` action edits two of your own config files. The result
 1. **Claude Code**: in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, adds one entry each to `hooks.SubagentStart`, `hooks.SubagentStop`, `hooks.SessionStart`, `hooks.Stop` and `hooks.StopFailure`, all with the same command: `sh "<plugin dir>/bin/run.sh" "<plugin dir>/hooks/sidebar-hook.mjs"` (timeout 5 seconds).
    - A hook this plugin added earlier (even from an older plugin folder), or the older hand-written form `<absolute node path> <absolute path>/hooks/sidebar-hook.mjs`, is replaced in place, not added twice. Another tool's hook that merely has a file named `sidebar-hook.mjs` does not count.
    - No other hook is touched; your own `SessionStart` / `Stop` / `StopFailure` hooks stay, and this entry is added after them.
-   - **Already set up with an older version** (only `SubagentStart` / `SubagentStop`)? Run setup again: it adds `SessionStart`, `Stop` and `StopFailure` and leaves the existing two as they are. Each event is checked on its own, so whichever are missing get added and none is added twice. Until then the popup uses the older session lookup and a sub agent row goes away only with its `SubagentStop`. A Claude Code session that was already running gets its session mapping at its next `SessionStart` (restart, `/resume`, `/clear` or compaction).
+   - **Already set up with an older version** (only `SubagentStart` / `SubagentStop`)? Run setup again: it adds `SessionStart`, `Stop` and `StopFailure` and leaves the existing two as they are. Each event is checked on its own, so whichever are missing get added and none is added twice. Until then the popup uses the older session lookup, and a sub agent that ended without its `SubagentStop` leaves the sidebar count only at a `SubagentStart` / `SubagentStop` of another sub agent of the same session that comes 2 minutes or more after its last write: the cleanup runs on every event, but only those two events are hooked. A Claude Code session that was already running gets its session mapping at its next `SessionStart` (restart, `/resume`, `/clear` or compaction).
 2. **herdr**: in `$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set. Everything added is wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`.
    - Key binding: a `[[keys.command]]` for `prefix+.` is added only when nothing else uses `prefix+.`. If another action already has it, setup skips it and the log includes a snippet you can use to bind a different key.
    - Sidebar rows: if there is no `[ui.sidebar.agents.rows_by_agent]`, the whole table is added; if the table exists but has no `claude =`, the rows are inserted right below the table header; if you already have your own `claude =` without `$sub1`, it is left alone and the log includes the line to paste yourself. Claude rows that already contain `$sub1`, including the five `$sub1`…`$sub5` lines written by an older setup, count as set up and are not rewritten (see [What setup adds](sidebar.md#what-setup-adds)).
@@ -34,7 +34,7 @@ What remove does not touch:
 
 - Settings you added by hand outside the markers are not deleted; the log lists their line numbers.
 - Your other hooks and the rest of both files.
-- The sidebar line already on screen stays until that pane reports again or herdr restarts. To clear them right away, see [How to remove](sidebar.md#how-to-remove) in `docs/sidebar.md`.
+- The sidebar line already on screen stays until that pane reports again or herdr restarts. To clear it right away, see [How to remove](sidebar.md#how-to-remove) in `docs/sidebar.md`.
 
 ## Popup viewer details
 
@@ -99,7 +99,7 @@ claude
 ● 3 running
 ```
 
-- Only the number is shown, without names and without an upper limit. It goes up with every `SubagentStart` and down with every `SubagentStop`.
+- Only the number is shown, without names and without an upper limit. A `SubagentStart` adds one, except when it resumes a sub agent that is still counted (its previous `SubagentStop` was missed, so its file is still there): that only replaces the start time and the number stays the same. A `SubagentStop` subtracts one; one without a `SubagentStart` seen earlier changes nothing.
 - A sub agent that ended without `SubagentStop` (for example stopped by an API error such as a usage limit) is removed at the first hook event of that session that comes 2 minutes or more after its last write, for example when the main session finishes its next turn (`Stop`, or `StopFailure` when that turn itself ends with an API error). This is only a safety net: a sub agent without an end signal (or a resumed one whose new run has not written anything yet) is never removed, however long it is silent.
 - When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the count is redrawn for that session right away.
 - With nothing running, the line disappears and only the claude row is left.
