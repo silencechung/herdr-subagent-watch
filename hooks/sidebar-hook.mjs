@@ -3,7 +3,7 @@
 // 這是全域 hook，會套用到使用者所有 Claude session：永遠 exit 0、stdout 不輸出、在 totalBudgetMs 內結束。
 // 跑中的 sub 一個一個檔（sub-<sessionId>-<agentId>.json），每個 hook 只改自己那個 sub 的檔，不用 lock；
 // 平行的 hook 各自回報，靠 herdr 的 --seq 只留最新的一筆（見 takeSequence）
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -20,9 +20,11 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isExecutableFile, resolveHerdrBinPath } from '../lib/herdr.mjs';
+import { resolveRuntimeDirectory } from '../lib/runtime-directory.mjs';
 import { applyMeta, applyRecord, createSubAgentState, getSubAgentStatus } from '../lib/subagent-state.mjs';
 import { parseJsonLine, parseTaskNotifications, parseTimestampMs } from '../lib/transcript.mjs';
 
@@ -69,6 +71,16 @@ const subagentFileSuffix = '.json';
 // herdr 的 --seq 是 u64（實測超過上限 exit 1）；開機時間讀不到時的基準，理由見 takeSequence
 export const fallbackSequenceBaseNs = 10n ** 17n;
 const maximumAncestorDepth = 64;
+// macOS 沒有 /proc，改跑系統指令。用絕對路徑：hook 的 PATH 來自使用者的環境，不能讓同名的檔案頂替。
+// 兩個上限加上 maximumPaneQueryMs 與 minimumHerdrBudgetMs 仍遠小於 totalBudgetMs，逾時只會退回「讀不到」的處理
+const darwinPsPath = '/bin/ps';
+const darwinSysctlPath = '/usr/sbin/sysctl';
+const processSnapshotTimeoutMs = 300;
+const bootTimeQueryTimeoutMs = 200;
+// ps 的 comm 欄是最後一欄、可能含空白，原樣保留到行尾
+const psLinePattern = /^\s*(\d+)\s+(\d+)\s(.*)$/;
+// macOS 讀不到 argv 的 process（別人的）ps 顯示成 `(p_comm)`
+const parenthesizedCommandPattern = /^\((.+)\)$/;
 const safeIdentifierPattern = /^[A-Za-z0-9_.:-]{1,128}$/;
 const invisibleCharacterPattern = /[\p{Cc}\p{Cf}]/gu;
 
@@ -475,8 +487,43 @@ export function buildSidebarLine(runningCount) {
   return runningCount > 0 ? `${runningIcon} ${runningCount} running` : null;
 }
 
-// /proc/stat 的 btime：開機時刻（epoch 秒）。讀不到或不像樣回傳 null
-export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePath, 'utf8')) {
+// 回傳 stdout；不存在、非 0 結束、逾時（SIGKILL）都回傳 null。stdout 一定要 pipe 進來：直接繼承的話會變成 hook 的輸出
+export function runSystemCommand(binaryPath, argumentList, timeoutMs) {
+  try {
+    return execFileSync(binaryPath, argumentList, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return null;
+  }
+}
+
+// `sysctl -n kern.boottime` 的輸出：`{ sec = 1791608737, usec = 123456 } Thu Oct …`。\b 讓 usec 不會被當成 sec
+export function parseKernBoottime(text) {
+  if (typeof text !== 'string') {
+    return null;
+  }
+  const match = /\bsec = (\d{1,19})\b/.exec(text);
+  if (match === null) {
+    return null;
+  }
+  const seconds = BigInt(match[1]);
+  return seconds > 0n ? seconds : null;
+}
+
+function readTextFile(filePath) {
+  return readFileSync(filePath, 'utf8');
+}
+
+// 開機時刻（epoch 秒）：Linux 讀 /proc/stat 的 btime，macOS 讀 kern.boottime。讀不到或不像樣回傳 null
+export function readBootTimeSeconds({ platform = process.platform, readText = readTextFile, runCommand = runSystemCommand } = {}) {
+  if (platform === 'darwin') {
+    return parseKernBoottime(runCommand(darwinSysctlPath, ['-n', 'kern.boottime'], bootTimeQueryTimeoutMs));
+  }
   let text;
   try {
     text = readText('/proc/stat');
@@ -501,16 +548,18 @@ export function readBootTimeSeconds(readText = (filePath) => readFileSync(filePa
 // 兩次 readdir 之間若又有別的改動，那個 hook 是改完才取號，seq 一定比較大，會蓋過這兩筆。毫秒的撞號不一樣：同一毫秒內別的 hook 還來得及改完檔，被忽略的那筆可能是唯一看到改動的（下面的 22/60）。
 // 撞號無害的前提是時鐘的 tick 比「讀時鐘到 readdir」之間的時間短。本機 clocksource 是 tsc（ns 等級，看 /sys/devices/system/clocksource/clocksource0/current_clocksource）；
 // 退到 hpet、acpi_pm（tick 約 70–280 ns）推測仍成立（未驗證）；退到 jiffies（1/HZ，ms 等級）就跟毫秒 seq 一樣會漏（未驗證）。
+// macOS：Node 22 的 hrtime 在 darwin 用 mach_continuous_time（libuv 1.51 src/unix/darwin.c），M1 的 tick 約 41.67 ns（timebase 125/3），比 µs 級的 readdir 短，推測前提仍成立（未驗證）。
 // POC（8 個 hook 同時觸發、20 輪×3 種情境：同時 start、同時 stop、start 後馬上 stop；一般／taskset -c 0／再加 4 或 6 個吃滿 CPU 的 process）：
 // 這個做法 0 次漏掉；seq 用毫秒時撞號漏 22/60，seq 在寫檔之前取漏 1–2/60，不帶 seq 漏 10–19/60。
-// 值是「開機時刻（btime 秒）× 1e9 ＋ monotonic ns」，BigInt 算、字串傳：monotonic（process.hrtime，所有 process 共用同一個時鐘）解析度夠細，
+// 值是「開機時刻（Linux 是 /proc/stat 的 btime，macOS 是 kern.boottime，秒）× 1e9 ＋ monotonic ns」，BigInt 算、字串傳：monotonic（process.hrtime，所有 process 共用同一個時鐘）解析度夠細，
 // 但重開機歸零；herdr 若重開機後還記得舊的 seq（未驗證）就會忽略之後全部的回報，加上開機時刻後跨重開機也遞增。
 // 現在約 1.79e18，離 u64 上限（約 1.8e19）很遠；舊版的 seq 是毫秒（約 1.79e12），升級後新的一定比較大。
 // 讀不到 btime 時改用固定基準 1e17 ＋ monotonic ns：仍然夠細、仍大於舊版的毫秒 seq，只是重開機後會從小的值重來（同上，herdr 是否記得未驗證）。
 // 不用 Date.now()：毫秒解析度在平行 hook 間會撞號（上面的 22/60）；Date.now() 毫秒 × 1e6 ＋ hrtime 的 ns 餘數也不行，
-// 兩個時鐘的毫秒邊界不一致，同一毫秒內的先後會排錯。讀不到 btime 只會發生在沒有 /proc 的環境（README 只支援 Linux），所以不另外想辦法跨重開機。
+// 兩個時鐘的毫秒邊界不一致，同一毫秒內的先後會排錯。macOS 也不用 Date.now() − os.uptime() 當開機時刻：每次算出來有 ms 抖動，取秒時碰到進位邊界基準會跳 1 秒、seq 倒退被 herdr 忽略。
+// 讀不到開機時刻只會發生在 /proc、sysctl 都讀不到的環境，所以不另外想辦法跨重開機。
 // 已知風險：btime 是「現在的系統時間 − 開機後經過的時間」，取到秒（無條件捨去），系統時間被往回調（手動改時間、NTP step）時 btime 跟著變小，只往回調幾 ms 也可能退約 1 秒；
-// 在時間追上之前 seq 可能小於調整前送出的，那段時間的回報都會被忽略，往回調多久側邊欄就可能凍結多久（再加最多 1 秒）。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變 btime（未實測）
+// 在時間追上之前 seq 可能小於調整前送出的，那段時間的回報都會被忽略，往回調多久側邊欄就可能凍結多久（再加最多 1 秒）。依 Linux timekeeping 的算法，睡眠與 NTP 慢慢校正（slew）不會改變 btime（未實測）；macOS 睡眠、改時間後 kern.boottime 會不會變未驗證
 export function takeSequence(bootTimeSeconds, monotonicNs) {
   const baseNs = bootTimeSeconds === null ? fallbackSequenceBaseNs : bootTimeSeconds * 1_000_000_000n;
   return baseNs + monotonicNs;
@@ -547,6 +596,37 @@ export function readProcessInfo(processId) {
   } catch {
     return null;
   }
+}
+
+// macOS 的 comm 是 argv[0]，可能是完整路徑（`/Users/me/.local/bin/claude`），比對前取檔名；`(p_comm)` 去掉括號；zombie 的 `<defunct>` 原樣留著
+function normalizePsCommand(command) {
+  const parenthesized = parenthesizedCommandPattern.exec(command);
+  return parenthesized === null ? basename(command) : parenthesized[1];
+}
+
+// `ps -A -o pid=,ppid=,comm=` 的輸出 → Map<pid, { command, parentProcessId }>；解析不了的行略過
+export function parsePsOutput(text) {
+  const processTable = new Map();
+  if (typeof text !== 'string') {
+    return processTable;
+  }
+  for (const line of text.split('\n')) {
+    const match = psLinePattern.exec(line);
+    if (match === null) {
+      continue;
+    }
+    processTable.set(Number(match[1]), { command: normalizePsCommand(match[3]), parentProcessId: Number(match[2]) });
+  }
+  return processTable;
+}
+
+// Linux 每層讀一次 /proc；macOS 跑一次 ps 拿整張表，不每層 spawn 一次（hook 有時間預算）。ps 失敗時是空表，祖先數 0，跟讀不到 /proc 一樣當成不是巢狀
+export function createProcessInfoReader({ platform = process.platform, runCommand = runSystemCommand } = {}) {
+  if (platform !== 'darwin') {
+    return readProcessInfo;
+  }
+  const processTable = parsePsOutput(runCommand(darwinPsPath, ['-A', '-o', 'pid=,ppid=,comm='], processSnapshotTimeoutMs));
+  return (processId) => processTable.get(processId) ?? null;
 }
 
 // 相鄰的 claude 只算一個：名稱也叫 claude 的 wrapper script（沒有 exec）跟真正的 claude 是直接的父子；
@@ -613,7 +693,7 @@ export function runHerdr(binaryPath, argumentList, timeoutMs) {
   spawnSync(binaryPath, argumentList, { stdio: 'ignore', timeout: timeoutMs, killSignal: 'SIGKILL' });
 }
 
-// XDG_RUNTIME_DIR 只是環境變數：資料夾若是別人的、是 symlink、或權限放寬，別的使用者就能預放 symlink 讓這裡寫到別的檔案，寧可不寫
+// XDG_RUNTIME_DIR、TMPDIR（macOS）都只是環境變數：資料夾若是別人的、是 symlink、或權限放寬，別的使用者就能預放 symlink 讓這裡寫到別的檔案，寧可不寫
 export function prepareStateDirectory(runtimeDirectory, userId) {
   const stateDirectory = join(runtimeDirectory, 'subagent-watch');
   try {
@@ -696,7 +776,7 @@ function removeFileIfPresent(filePath) {
 
 // 舊版每個 session 一個 session-<id>.json（用 lock 串起讀改寫）。升級時還在跑的 sub 只記在那個檔裡：不搬的話，升級後這個 session 第一次重畫就把它們從側邊欄拿掉，
 // 之後它們的 SubagentStop 也找不到自己的檔。每個事件都看一下自己 session 的舊檔（不存在只多一次 open 失敗），搬成 sub 檔（已經有的不蓋）後刪掉；
-// 搬過來的若其實已經結束，同一次事件的清除就會判斷。舊版的 .lock、.break-* 不理：新版不讀它們，跟狀態檔一樣在 tmpfs 上，重開機（或登出時 XDG_RUNTIME_DIR 被清掉）就沒了
+// 搬過來的若其實已經結束，同一次事件的清除就會判斷。舊版的 .lock、.break-* 不理：新版不讀它們，跟狀態檔一樣在 tmpfs 上，重開機（或登出時 XDG_RUNTIME_DIR 被清掉）就沒了；macOS 的 $TMPDIR 由系統定期清掉 3 天沒存取的檔
 function migrateLegacySessionFile(stateDirectory, sessionId) {
   const legacyPath = join(stateDirectory, `session-${sessionId}.json`);
   let text;
@@ -725,10 +805,12 @@ const defaultDependencies = {
   now: () => Date.now(),
   monotonicNs: () => process.hrtime.bigint(),
   readBootTimeSeconds: () => readBootTimeSeconds(),
+  platform: process.platform,
+  temporaryDirectory: () => tmpdir(),
   runHerdr,
   isExecutable: isExecutableFile,
   queryPaneAgentSession,
-  countClaudeAncestors: () => countClaudeAncestors(process.ppid),
+  countClaudeAncestors: () => countClaudeAncestors(process.ppid, createProcessInfoReader()),
   getUserId: () => process.getuid(),
   readFileTail,
 };
@@ -740,8 +822,8 @@ export function runHook(rawInput, environment, overrides = {}) {
   if (!isSafeIdentifier(paneId)) {
     return { action: 'skipped', reason: 'not-in-herdr' };
   }
-  const runtimeDirectory = environment.XDG_RUNTIME_DIR;
-  if (!runtimeDirectory) {
+  const runtimeDirectory = resolveRuntimeDirectory({ environment, platform: dependencies.platform, temporaryDirectory: dependencies.temporaryDirectory() });
+  if (runtimeDirectory === null) {
     return { action: 'skipped', reason: 'no-runtime-directory' };
   }
   const herdrBinaryPath = resolveHerdrBinPath(environment, dependencies.isExecutable);

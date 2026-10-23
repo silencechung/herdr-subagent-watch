@@ -151,6 +151,15 @@ test('~/.fnm and Volta are looked at when there is no node on PATH', () => {
   assert.match(result.stdout, new RegExp(`^fake-node ${voltaNode}$`, 'm'));
 });
 
+test('the macOS fnm folder of older fnm versions (with a space in its path) is looked at before ~/.fnm', () => {
+  const { homeDirectory } = createCase();
+  const macosFnmNode = writeFakeNode(path.join(homeDirectory, 'Library', 'Application Support', 'fnm', 'aliases', 'default', 'bin', 'node'), 'v22.4.0');
+  writeFakeNode(path.join(homeDirectory, '.fnm', 'aliases', 'default', 'bin', 'node'), 'v23.0.0');
+  const result = runLauncher(['viewer.mjs'], { environment: { HOME: homeDirectory } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.split('\n').includes(`fake-node ${macosFnmNode}`), result.stdout);
+});
+
 test('nvm: the newest installed version wins, compared as numbers', () => {
   const { homeDirectory } = createCase();
   const versionsDirectory = path.join(homeDirectory, '.nvm', 'versions', 'node');
@@ -218,7 +227,8 @@ test('with the real node it runs viewer.mjs end to end', () => {
   assert.match(result.stdout.split('\n')[0], /^2 running · 1 done │/);
 });
 
-const hasScript = findOnPath('script') !== null;
+// 只認 util-linux 的 script（認得 --version）：macOS 的 BSD script 不吃下面的 -qfec，語法也不同
+const hasScript = findOnPath('script') !== null && spawnSync(findOnPath('script'), ['--version'], { encoding: 'utf8' }).status === 0;
 
 describe('inside a popup', { skip: (!hasScript && 'util-linux script is not available') || skipWithoutNode }, () => {
   test('the error stays on screen until a key is pressed', { timeout: 15_000 }, async () => {

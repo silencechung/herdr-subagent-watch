@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 
 const repositoryDirectory = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 const launcherPath = path.join(repositoryDirectory, 'bin', 'run.sh');
-const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-watch-setup-'));
+// macOS 的 os.tmpdir() 在 /var 底下，/var 是指向 /private/var 的 symlink；setup 回報 realpath，所以根目錄一開始就取 realpath
+const temporaryRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-watch-setup-')));
 after(() => {
   fs.rmSync(temporaryRoot, { recursive: true, force: true });
 });

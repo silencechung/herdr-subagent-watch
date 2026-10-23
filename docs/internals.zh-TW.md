@@ -112,7 +112,7 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 這兩種「不是 Claude Code」的情況不會去猜 session；viewer 每 2 秒重問一次，之後在同一個 pane 開 Claude Code 會自動接上。
 
 1. **herdr**：`agent_session`（herdr 的 claude integration 會回報，實測 `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`）。用 session id 在 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/` 找 `<session-id>.jsonl`。herdr 的回報可能過期：實測 herdr server 重啟後，在同一個 pane 開新的 Claude Code，herdr 仍回報重啟前的 session（原因未知）。
-2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。hook 在 `SessionStart` 時就寫，所以 session 一開始、resume 或 clear 之後就指向這個 pane 現在的 session，檔案裡另外帶 `sessionStartSource` 當標記（同一個 session 的 sub 事件重寫時會留著）。沒有標記的（只在 `SubagentStart`／`SubagentStop` 時寫：舊版 setup 還沒重跑，或加 hook 之前就開的 session）在開下一個 sub 之前可能還指向上一個 session。
+2. **pane map**：sidebar hook 寫的 `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json`（macOS 沒有 `XDG_RUNTIME_DIR` 時是 `$TMPDIR/subagent-watch/`，見[寫出的檔案](sidebar.zh-TW.md#寫出的檔案)）（`sessionId`、`transcriptPath`、`cwd`、`updatedAtMs`）。hook 在 `SessionStart` 時就寫，所以 session 一開始、resume 或 clear 之後就指向這個 pane 現在的 session，檔案裡另外帶 `sessionStartSource` 當標記（同一個 session 的 sub 事件重寫時會留著）。沒有標記的（只在 `SubagentStart`／`SubagentStop` 時寫：舊版 setup 還沒重跑，或加 hook 之前就開的 session）在開下一個 sub 之前可能還指向上一個 session。
 3. **猜**（herdr 和 pane map 都沒有 session 時才用）：用 pane 的 cwd 對到 `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd 的 / 換成 ->/`，取最新修改的 `<session-id>.jsonl`。底部分隔線會標 `(guessed: latest session)`：同一個資料夾開多個 Claude Code 時可能猜錯。`/var/home/...` 與 `/home/...` 兩種寫法都會試（Fedora Atomic 的 home 在 `/var/home`）；另外也試把所有非英數字元換成 `-` 的寫法（未驗證 Claude Code 是否這樣編碼含 `.` 的路徑）。
 
 **帶標記、而且 transcript 存在的 pane map 直接用**：不跟 herdr 比、不看寫入時間，pane map 改指別的 session 時 popup 就換過去（herdr 說法不同時，底部分隔線照樣標出 `herdr says session <id>, pane map says <id>`）。新 session 剛開時 transcript 還不存在（Claude Code 2.1.296 實測：第一個 prompt 之後才寫出來），出現之前照下面的規則。
@@ -151,7 +151,7 @@ manifest 的 action／pane 與 Claude Code hook 都經過 `bin/run.sh`（POSIX s
 
 1. `SUBAGENT_WATCH_NODE`（有設就只用它，不能用直接報錯）
 2. `command -v node`：會檢查檔案真的存在且可執行。herdr server 的 PATH 可能還留著已經消失的 node（例如 fnm 每個 shell 各自的暫存路徑）。
-3. `$FNM_DIR`、`${XDG_DATA_HOME:-~/.local/share}/fnm`、`~/.fnm` 的 `aliases/default/bin/node`
+3. `$FNM_DIR`、`${XDG_DATA_HOME:-~/.local/share}/fnm`、`~/Library/Application Support/fnm`（舊版 fnm 在 macOS 的預設位置）、`~/.fnm` 的 `aliases/default/bin/node`
 4. `~/.volta/bin/node`
 5. `${NVM_DIR:-~/.nvm}/versions/node/*/bin/node` 裡版本最新的
 6. `/opt/homebrew/bin/node`、`/usr/local/bin/node`、`/usr/bin/node`
@@ -179,6 +179,8 @@ manifest 的 action／pane 與 Claude Code hook 都經過 `bin/run.sh`（POSIX s
 - 視窗窄時 tab 列只顯示選取的 tab 附近的編號（左右輪流往外加），哪一側有藏起來的 tab 就在那一側畫 magenta 的 `◀` / `▶`。左邊沒有藏起來的 tab 時 `◀` 的位置留空白，`◀` 出現時後面的編號不會位移；右邊沒有時不畫。選取的 tab 一定完整看得到：比剩下的寬度還寬時只截名稱（結尾 `…`），編號與狀態符號不截；窄到連摘要加上選取 tab 的編號、符號都放不下時，摘要讓位。整列寬度不會超過視窗寬度。
 - setup 沒有 TOML parser，只做逐行文字處理：看不懂的寫法（多行字串、inline table 形式的 `rows_by_agent` 等）會跳過或被 `herdr config check` 擋下（原檔完全沒動過，不需要還原），這時照 log 的片段手動貼。
 - plugin 目錄路徑含 `"`、`$`、`` ` ``、`\` 時 setup 不會寫 hook（會破壞 shell command），要手動設定。
+- macOS：沒有 `XDG_RUNTIME_DIR` 時狀態檔放在 `$TMPDIR/subagent-watch/`，macOS 會清掉 `$TMPDIR` 裡 3 天沒存取的檔。pane 閒置 3 天後 pane map 可能已經不在，popup 會退回用 pane 的 cwd 猜 session，直到下一次 `SessionStart` 或 sub 事件重新寫入。hook 與 popup 要拿到同一個 `TMPDIR`（或同一個 `XDG_RUNTIME_DIR`），不然 popup 找不到 pane map、只能猜。
+- macOS：hook 用 `ps -A -o pid=,ppid=,comm=` 的 process 名稱分辨巢狀的 `claude -p`。native 版 Claude Code 在這裡顯示成什麼還沒在 Mac 真機確認；不是 `claude` 的話，祖先掃描找不到 `claude`，所有事件（包括巢狀的）都會被收（見 [`docs/sidebar.zh-TW.md`](sidebar.zh-TW.md#已知限制) 的已知限制）。
 
 ## 開發
 
@@ -205,7 +207,7 @@ sh bin/run.sh scripts/setup.mjs [--remove] [--dry-run]
 node --test 'test/*.test.mjs'
 ```
 
-Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test test/`）會被當成要載入的 module 而失敗。pty 測試需要 util-linux 的 `script`，沒有就跳過；`herdr config check` 的測試在找不到 herdr 時跳過。
+Node 22 的 `node --test` 只吃檔案或 glob，傳資料夾（`node --test test/`）會被當成要載入的 module 而失敗。pty 測試需要 util-linux 的 `script`，沒有就跳過（macOS 內建的是 BSD 的 `script`，參數不同，所以 macOS 上會跳過）；`herdr config check` 的測試在找不到 herdr 時跳過。
 
 ### 測 open action 不開 popup
 
