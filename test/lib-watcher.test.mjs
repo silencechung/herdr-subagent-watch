@@ -114,8 +114,19 @@ test('fs.watch picks up a new sub agent without waiting for the poll interval', 
   watcher.start();
   try {
     const subagentsDirectory = getSessionPaths(transcriptPath).subagentsDirectory;
-    fs.writeFileSync(path.join(subagentsDirectory, 'agent-f666watch.jsonl'), `${assistantLine('f666watch', '2026-10-10T01:11:00.000Z', { type: 'thinking', thinking: 'x' })}\n`);
-    await waitFor(() => watcher.getSubAgents().length === 5);
+    const agentPath = path.join(subagentsDirectory, 'agent-f666watch.jsonl');
+    fs.writeFileSync(agentPath, `${assistantLine('f666watch', '2026-10-10T01:11:00.000Z', { type: 'thinking', thinking: 'x' })}\n`);
+    // macOS 的 fs.watch（FSEvents）剛建立時，很忙的話會漏掉緊接著的事件（整套測試一起跑時偶爾發生，單跑不會）；
+    // 正式執行時由 polling 補上，這裡 polling 設成 60 秒，所以每 500 ms 再 touch 一次，測的仍然是 fs.watch
+    const retouchTimer = setInterval(() => {
+      const nowSeconds = Date.now() / 1000;
+      fs.utimesSync(agentPath, nowSeconds, nowSeconds);
+    }, 500);
+    try {
+      await waitFor(() => watcher.getSubAgents().length === 5);
+    } finally {
+      clearInterval(retouchTimer);
+    }
     assert.ok(changeCount >= 1);
   } finally {
     watcher.stop();
