@@ -574,6 +574,7 @@ describe('hook script as Claude Code runs it', () => {
       [
         `#!${process.execPath}`,
         'const argumentList = process.argv.slice(2);',
+        `if (argumentList[0] === '--warm-up') process.exit(0);`,
         `if (argumentList[0] === 'pane' && argumentList[1] === 'get') { process.stdout.write(${JSON.stringify(paneGetOutput)}); process.exit(0); }`,
         `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(argumentList) + '\\n');`,
         `process.stdout.write('noise that must not leak');`,
@@ -581,6 +582,8 @@ describe('hook script as Claude Code runs it', () => {
       ].join('\n'),
       { mode: 0o755 },
     );
+    // macOS 第一次執行新寫的 script 要 0.6–1.5 秒（系統掃描新檔案），先跑一次，不然會吃掉「1 秒內」的預算
+    spawnSync(fakeHerdrPath, ['--warm-up']);
     return fakeHerdrPath;
   }
 
