@@ -153,6 +153,31 @@ test('a kill notification arriving after the sub agent was loaded marks it done'
   assert.equal(getSubAgentStatus(explore, Date.now()).reason, 'failed');
 });
 
+test('a sub agent waiting on its own background work stays running until the notification that it finished', () => {
+  const transcriptPath = copyFixtureSession();
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const explore = watcher.getSubAgents()[0];
+  const appendNotification = (timestamp, summary, note) => {
+    const content = `<task-notification>\n<task-id>a111explore</task-id>\n<status>completed</status>\n<summary>${summary}</summary>\n<note>${note}</note>\n</task-notification>`;
+    fs.appendFileSync(transcriptPath, `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp, content })}\n`);
+  };
+  appendNotification(
+    '2026-10-10T01:20:00.000Z',
+    'Agent "Find key handling code" is waiting on its own background work',
+    'This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.',
+  );
+  watcher.refresh();
+  assert.equal(getSubAgentStatus(explore, Date.now()).isDone, false);
+  appendNotification(
+    '2026-10-10T01:20:30.000Z',
+    'Agent "Find key handling code" finished',
+    'A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.',
+  );
+  watcher.refresh();
+  assert.equal(getSubAgentStatus(explore, Date.now()).reason, 'completed');
+});
+
 function toolUseLine(agentId, offsetSeconds, toolUseId, command) {
   const timestamp = new Date(Date.parse('2026-10-10T01:00:00.000Z') + offsetSeconds * 1000).toISOString();
   return `${assistantLine(agentId, timestamp, { type: 'tool_use', id: toolUseId, name: 'Bash', input: { command } })}\n`;

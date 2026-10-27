@@ -157,6 +157,38 @@ test('only the first task-id and status of a notification count, so a descriptio
   assert.deepEqual(parseTaskNotifications(queueOperationLine(content)).map(({ agentId, status }) => `${agentId}:${status}`), ['a1:completed']);
 });
 
+// 實測：sub 把 sleep 丟到背景後停下來等，先收到中途通知，28 秒後 SubagentHandback 完才收到真正結束的通知
+const interimNotification = [
+  '<task-notification>',
+  '<task-id>a1</task-id>',
+  '<tool-use-id>toolu_x</tool-use-id>',
+  '<output-file>/tmp/tasks/a1.output</output-file>',
+  '<status>completed</status>',
+  '<summary>Agent "Sleep 30s then report (1)" is waiting on its own background work</summary>',
+  '<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>',
+  '<result>This agent has not reported yet: it is waiting on its own background work and will deliver its report through SubagentHandback when that finishes.',
+  '</result>',
+  '</task-notification>',
+].join('\n');
+const finishedNotification = [
+  '<task-notification>',
+  '<task-id>a1</task-id>',
+  '<output-file>/tmp/tasks/a1.output</output-file>',
+  '<status>completed</status>',
+  '<summary>Agent "Sleep 30s then report (1)" finished</summary>',
+  '<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>',
+  '<result>This agent\'s report was delivered to you as a message from "a1" (its SubagentHandback call). Read it there; it is not repeated here.',
+  '</result>',
+  '</task-notification>',
+].join('\n');
+
+test('a completed notification sent while the sub agent waits on its own background work is not an end', () => {
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(interimNotification)), []);
+  assert.deepEqual(parseTaskNotifications(queueOperationLine(finishedNotification)), [
+    { agentId: 'a1', status: 'completed', timestampMs: Date.parse('2026-10-10T01:05:00.000Z') },
+  ]);
+});
+
 test('a 1 MB line full of task-id tags is parsed in linear time', () => {
   const content = `<task-notification>${'<task-id>a</task-id>'.repeat(50_000)}`;
   for (const line of [queueOperationLine(content), JSON.stringify({ type: 'user', message: { content } })]) {
