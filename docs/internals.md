@@ -2,39 +2,35 @@
 
 English | [繁體中文](internals.zh-TW.md)
 
-Details for anyone who wants to know how the plugin works or work on it. For installing and everyday use, see the [README](../README.md); the sidebar has its own page, [`sidebar.md`](sidebar.md).
+Details for anyone who wants to know how the plugin works or work on it. For installing and everyday use, see the [README](../README.md).
 
 ## Setup details
 
-The `subagent.watch.setup` action edits two of your own config files. The result is shown as a herdr notification; the details (including any snippet you need to paste by hand, and the plugin directory on the `plugin:` line) are in `herdr plugin log list --plugin subagent.watch`.
+The `subagent.watch.setup` action adds the `prefix+.` key binding to your herdr config and cleans up what older versions added. The result is shown as a herdr notification; the details (including any snippet you need to paste by hand, and the plugin directory on the `plugin:` line) are in `herdr plugin log list --plugin subagent.watch`.
 
-1. **Claude Code**: in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, adds one entry each to `hooks.SubagentStart`, `hooks.SubagentStop`, `hooks.SessionStart`, `hooks.Stop` and `hooks.StopFailure`, all with the same command: `sh "<plugin dir>/bin/run.sh" "<plugin dir>/hooks/sidebar-hook.mjs"` (timeout 5 seconds).
-   - A hook this plugin added earlier (even from an older plugin folder), or the older hand-written form `<absolute node path> <absolute path>/hooks/sidebar-hook.mjs`, is replaced in place, not added twice. Another tool's hook that merely has a file named `sidebar-hook.mjs` does not count.
-   - No other hook is touched; your own `SessionStart` / `Stop` / `StopFailure` hooks stay, and this entry is added after them.
-   - **Already set up with an older version** (only `SubagentStart` / `SubagentStop`)? Run setup again: it adds `SessionStart`, `Stop` and `StopFailure` and leaves the existing two as they are. Each event is checked on its own, so whichever are missing get added and none is added twice. Until then the popup uses the older session lookup, and a sub agent that ended without its `SubagentStop` leaves the sidebar count only at a `SubagentStart` / `SubagentStop` of another sub agent of the same session that comes 2 minutes or more after its last write: the cleanup runs on every event, but only those two events are hooked. A Claude Code session that was already running gets its session mapping at its next `SessionStart` (restart, `/resume`, `/clear` or compaction).
-2. **herdr**: in `$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set. Everything added is wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`.
+1. **herdr**: in `$HERDR_CONFIG_PATH`, or `${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml` when that is not set. Everything added is wrapped between `# >>> subagent.watch` and `# <<< subagent.watch`.
    - Key binding: a `[[keys.command]]` for `prefix+.` is added only when nothing else uses `prefix+.`. If another action already has it, setup skips it and the log includes a snippet you can use to bind a different key.
-   - Sidebar rows: if there is no `[ui.sidebar.agents.rows_by_agent]`, the whole table is added; if the table exists but has no `claude =`, the rows are inserted right below the table header; if you already have your own `claude =` without `$sub1`, it is left alone and the log includes the line to paste yourself. Claude rows that already contain `$sub1`, including the five `$sub1`…`$sub5` lines written by an older setup, count as set up and are not rewritten (see [What setup adds](sidebar.md#what-setup-adds)).
+   - Sidebar rows from an older version (a marked block with `$sub1`, including the five `$sub1`…`$sub5` lines of an even older one) are removed: the sidebar count is gone. `$sub1` rows you added by hand, outside the markers, are left alone and the log lists their line numbers.
    - The new content is first written to a temporary file next to the config file and checked with `herdr config check`. If it reports new problems, the temporary file is deleted and the error is reported (the original file was never touched, so there is nothing to restore); only when it passes is the temporary file `rename`d into place and `herdr server reload-config` run.
+2. **Claude Code**, only to clean up an older version: in `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`, the hooks an older setup added (`sh "<plugin dir>/bin/run.sh" "<plugin dir>/hooks/sidebar-hook.mjs"` on `SubagentStart`, `SubagentStop`, `SessionStart`, `Stop` and `StopFailure`, or the older hand-written form `<absolute node path> <absolute path>/hooks/sidebar-hook.mjs`) are removed; an event array left empty is removed entirely. Another tool's hook that merely has a file named `sidebar-hook.mjs` does not count, and no other hook is touched. Nothing is added, and the file is not written when there is nothing to remove. Until you run setup, an old hook left there runs `bin/run.sh`, which exits 0 at once without output, so it never disturbs the Claude session.
+3. **Old sidebar state**: the files the old hook wrote (`sub-*.json`, `pane-*.json`, and `session-*.json` with its `.lock` / `.lock.break-*` from even older versions, plus their `*.<16 hex>.tmp` temporary files) are deleted from `$XDG_RUNTIME_DIR/subagent-watch` and, on macOS, `$TMPDIR/subagent-watch`; the folder goes too when nothing else is left in it. A folder that is a symlink or not yours is left alone, and files with any other name are kept (the log lists them).
 
 Notes:
 
-- Before a change, both files are backed up to `<file name>.subagent-watch.bak` in the same folder, **only the first time**: an existing `.bak` is never overwritten, so the earliest original is kept (delete the old `.bak` yourself if you want a fresh one).
+- Before a change, the file is backed up to `<file name>.subagent-watch.bak` in the same folder, **only the first time**: an existing `.bak` is never overwritten, so the earliest original is kept (delete the old `.bak` yourself if you want a fresh one).
 - Idempotent: running it again gives the same result, and nothing is written when everything is already set up.
-- To preview the changes, run `sh bin/run.sh scripts/setup.mjs --dry-run` in the plugin directory. It only prints the changes: no file is written and herdr is not called.
-- The config paths come from `CLAUDE_CONFIG_DIR`, `HERDR_CONFIG_PATH` and `XDG_CONFIG_HOME` in the environment that runs setup; the action runs with the herdr server's environment. If the paths are wrong, run `sh bin/run.sh scripts/setup.mjs` from your own shell in the plugin directory instead.
-- After reinstalling with `herdr plugin install` the plugin directory may move. Run setup again and it points the hooks to the new location.
+- To preview the changes, run `sh bin/run.sh scripts/setup.mjs --dry-run` in the plugin directory. It only prints the changes: no file is written or deleted and herdr is not called.
+- The config paths come from `CLAUDE_CONFIG_DIR`, `HERDR_CONFIG_PATH`, `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR` and `TMPDIR` in the environment that runs setup; the action runs with the herdr server's environment. If the paths are wrong, run `sh bin/run.sh scripts/setup.mjs` from your own shell in the plugin directory instead.
 
 ## Remove details
 
 - Run remove **before** uninstall: after uninstalling, the action no longer exists.
-- `subagent.watch.remove` only removes this plugin's hooks from `settings.json` (recognized the same way as in setup; an event array left empty is removed entirely) and the content between the markers in `config.toml`. Backups and `herdr config check` work the same way as in setup; then it runs `herdr server reload-config`.
+- `subagent.watch.remove` removes the content between the markers in `config.toml` (the key binding, and sidebar rows left by an older version), and cleans up the old hooks and state files the same way as setup. Backups and `herdr config check` work the same way as in setup; then it runs `herdr server reload-config`.
 
 What remove does not touch:
 
 - Settings you added by hand outside the markers are not deleted; the log lists their line numbers.
 - Your other hooks and the rest of both files.
-- The sidebar line already on screen stays until that pane reports again or herdr restarts. To clear it right away, see [How to remove](sidebar.md#how-to-remove) in `docs/sidebar.md`.
 
 ## Popup viewer details
 
@@ -90,23 +86,6 @@ Scrolling:
 
 You can also open the popup without the action: `herdr plugin pane open --plugin subagent.watch --entrypoint viewer`. The viewer then uses the `focused_pane_id` from the popup's own context JSON.
 
-## Sidebar
-
-Under the claude row of the herdr sidebar, one line shows how many sub agents of that session are **still running**:
-
-```
-claude
-● 3 running
-```
-
-- Only the number is shown, without names and without an upper limit. A `SubagentStart` adds one, except when it resumes a sub agent that is still counted (its previous `SubagentStop` was missed, so its file is still there): that only replaces the start time and the number stays the same. A `SubagentStop` subtracts one; one without a `SubagentStart` seen earlier changes nothing.
-- A sub agent that ended without `SubagentStop` (for example stopped by an API error such as a usage limit) is removed at the first hook event of that session that comes 2 minutes or more after its last write, for example when the main session finishes its next turn (`Stop`, or `StopFailure` when that turn itself ends with an API error). This is only a safety net: a sub agent without an end signal (or a resumed one whose new run has not written anything yet) is never removed, however long it is silent.
-- When the pane switches to another session (a new `claude`, `/clear`, `/resume`), the count is redrawn for that session right away.
-- With nothing running, the line disappears and only the claude row is left.
-- Finished sub agents and what they did are in the popup viewer.
-
-Details are in [`docs/sidebar.md`](sidebar.md).
-
 ## How it works
 
 Nothing is hard-coded (paths, accounts, colors): node is located by `bin/run.sh`, herdr is called through `HERDR_BIN_PATH` (or `herdr` on `PATH` when that is not set), Claude Code config follows `CLAUDE_CONFIG_DIR`, and colors are only the 16 ANSI colors of your terminal theme.
@@ -123,24 +102,19 @@ The pane id comes from, in order: `SUBAGENT_WATCH_PANE_ID` (passed in by the ope
 
 In the two "not Claude Code" cases the viewer does not guess a session. It asks again every 2 seconds, so starting Claude Code in that pane later connects automatically.
 
-1. **herdr**: `agent_session` (reported by herdr's claude integration; observed as `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`). The session id is used to find `<session-id>.jsonl` under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/`. herdr's answer can be stale: after the herdr server restarted, a new Claude Code started in the same pane was still reported with the session from before the restart (observed; the cause is not known).
-2. **Pane map**: `$XDG_RUNTIME_DIR/subagent-watch/pane-<paneId>.json` (on macOS without `XDG_RUNTIME_DIR`: `$TMPDIR/subagent-watch/`, see [Files written](sidebar.md#files-written)), written by the sidebar hook (`sessionId`, `transcriptPath`, `cwd`, `updatedAtMs`). The hook writes it on `SessionStart`, so it names the pane's session from the moment a session starts, is resumed or cleared; the file then also carries `sessionStartSource` as a mark (kept when sub agent events of the same session rewrite the file). Without the mark (written only on `SubagentStart` / `SubagentStop`: setup from an older version not run again yet, or a session that started before the hooks were added), it can point at the previous session until the next sub agent starts.
-3. **Guess**, only when neither herdr nor the pane map names a session: the pane's cwd is mapped to `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd with / replaced by ->/` and the most recently modified `<session-id>.jsonl` is used. The bottom separator then shows `(guessed: latest session)`: with several Claude Code sessions in the same folder, the guess can be wrong. Both `/var/home/...` and `/home/...` spellings are tried (Fedora Atomic keeps home under `/var/home`), plus a spelling with every non-alphanumeric character replaced by `-` (not verified whether Claude Code encodes paths containing `.` that way).
+1. **herdr**: `agent_session` (reported by herdr's claude integration; observed as `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<session-id>"}`). The session id is used to find `<session-id>.jsonl` under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/`. When that transcript does not exist yet (a session that has just started; with Claude Code 2.1.296 it is written after the first prompt), the viewer waits for it instead of falling back to a guess. herdr's answer can be stale: after the herdr server restarted, herdr 0.9.3 still reported the session from before the restart for a new Claude Code in the same pane (observed; the cause is not known). herdr 0.9.5 updated it right away after `/clear` (tested). Older versions also read a pane map written by the sidebar hook to cover this; it is gone together with the hook, so after a herdr server restart, reopen the pane if the popup shows an old session.
+2. **Guess**, only when herdr names no session: the pane's cwd is mapped to `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd with / replaced by ->/` and the most recently modified `<session-id>.jsonl` is used. The bottom separator then shows `(guessed: latest session)`: with several Claude Code sessions in the same folder, the guess can be wrong. Both `/var/home/...` and `/home/...` spellings are tried (Fedora Atomic keeps home under `/var/home`), plus a spelling with every non-alphanumeric character replaced by `-` (not verified whether Claude Code encodes paths containing `.` that way).
 
-**A pane map with the mark whose transcript exists is used as it is**: herdr's answer and write times are not compared, and the popup switches whenever the pane map names another session (the bottom separator still shows `herdr says session <id>, pane map says <id>` when herdr disagrees). Right after a new session starts, its transcript does not exist yet (with Claude Code 2.1.296 it is written after the first prompt); until it appears, the rules below apply.
+If herdr cannot be asked (herdr not found, or `herdr pane get` fails), only the guess is left; without any pane id it can only guess (2). When nothing is found it shows `No Claude Code session found for this pane` plus the reason each step failed.
 
-Without the mark, either of the first two can be out of date, so neither one always wins. When the viewer has no session yet (or the transcript on screen was deleted), it uses the session whose transcript exists and was written most recently (on a tie, herdr's): both belong to this pane, and a stale value usually names an old session nobody is writing any more. When they name different sessions, the bottom separator adds `herdr says session <id>, pane map says <id>`. When neither transcript exists yet (a session that has just started and not written anything), the viewer waits for the session herdr reported (otherwise the pane map's) instead of falling back to a guess.
+The lookup keeps running every 2 seconds after a session is found, but from then on write times alone never decide a switch. A stale value can name a session that another pane keeps writing (`claude -c` and `--resume` continue the same session id); the two transcripts then take turns being the newest, and following the newest one switched the popup back and forth every few seconds, losing the selected tab and the scroll position. Instead the viewer remembers the session herdr reported at its last successful lookup, and replaces the session on screen only when:
 
-If herdr cannot be asked (herdr not found, or `herdr pane get` fails), only the pane map is left before the guess; without any pane id it can only guess (3). When nothing is found it shows `No Claude Code session found for this pane` plus the reason each step failed.
-
-The lookup keeps running every 2 seconds after a session is found, but from then on write times alone never decide a switch. A stale value can name a session that another pane keeps writing (`claude -c` and `--resume` continue the same session id); the two transcripts then take turns being the newest, and following the newest one switched the popup back and forth every few seconds, losing the selected tab and the scroll position. Instead the viewer remembers the session herdr and the pane map each reported at their last successful lookup, and replaces the session on screen only when:
-
-- the current session is a guess and the new one comes from herdr or the pane map;
-- neither is a guess, and herdr or the pane map now reports a different session than before (its value changed), that session is not the one on screen, and its transcript exists. If both changed in the same lookup, the more recently written one wins. A source that reports a session for the first time (for example herdr failing at first and recovering later) only wins if that transcript was written more recently than the current one, and only that once;
+- the current session is a guess and the new one comes from herdr;
+- neither is a guess, and herdr now reports a different session than before (its value changed), that session is not the one on screen, and its transcript exists. When herdr reports a session for the first time (for example failing at first and recovering later), it only wins if that transcript was written more recently than the current one, and only that once;
 - the current transcript no longer exists (the session is then picked again as described above);
 - both are guesses and the current transcript no longer exists.
 
-So after `/resume` or restarting `claude`, the popup switches to the new session as soon as herdr or the pane map reports it and its transcript exists (rebuilding the tabs and updating the session label). A failed lookup leaves what the viewer remembers unchanged, so herdr briefly failing, or coming back with the same stale value, does not bring a previous session back. A guess never replaces a session that came from herdr or the pane map, and a lookup that finds nothing keeps the session on screen. With two sessions in the same folder writing in turn, a guessed session stays put instead of switching back and forth. If the lookup itself fails with an error while a session is on screen, the error is shown on the bottom separator and cleared by the next successful lookup. Lookups run asynchronously and one at a time, and `herdr pane get` times out after 3 seconds, so `q` / `Esc` close the popup right away even while herdr is stuck.
+So after `/resume` or restarting `claude`, the popup switches to the new session as soon as herdr reports it and its transcript exists (rebuilding the tabs and updating the session label). A failed lookup leaves what the viewer remembers unchanged, so herdr briefly failing, or coming back with the same stale value, does not bring a previous session back. A guess never replaces a session that came from herdr, and a lookup that finds nothing keeps the session on screen. With two sessions in the same folder writing in turn, a guessed session stays put instead of switching back and forth. If the lookup itself fails with an error while a session is on screen, the error is shown on the bottom separator and cleared by the next successful lookup. Lookups run asynchronously and one at a time, and `herdr pane get` times out after 3 seconds, so `q` / `Esc` close the popup right away even while herdr is stuck.
 
 ### Data sources and when a sub agent counts as finished
 
@@ -160,13 +134,9 @@ So after `/resume` or restarting `claude`, the popup switches to the new session
   - The output file format and the `origin` / `queued_command` / `TaskStop` shapes are Claude Code internals seen with 2.1.311 (macOS); they may change between versions. If they do, a waiting sub agent stays `◐` instead of being shown as finished.
 - Foreground sub agents: the sample has only one (`"requestShape":"foreground"`), and it ended with `SubagentHandback` (rule 1). Rule 2 (`end_turn`) still applies to them; whether a foreground sub agent can also stop at `end_turn` mid-run is **not verified**.
 
-### Sidebar count
-
-Claude Code fires the `SessionStart`, `SubagentStart`, `SubagentStop`, `Stop` and `StopFailure` hooks (`StopFailure` fires instead of `Stop` when a turn ends with an API error); `hooks/sidebar-hook.mjs` (run through `bin/run.sh`) writes or removes one small file per running sub agent (no lock: hooks running in parallel only ever touch their own sub agent's file, and herdr's `--seq` keeps the newest report) and calls `herdr pane report-metadata` to write `● N running` into pane token `sub1`, which the `claude` rows added by setup display (`sub2`…`sub5`, used by older versions, are cleared on every report). The hook also writes the pane map used in step 2 above (on every event except `Stop` and `StopFailure`). On every event it also removes sub agents of that session whose transcript ends with an end signal (a `SubagentHandback`, an API error, an interruption, a task notification, and so on) from this run and has not been written for 2 minutes, because some of them never get a `SubagentStop`. The hook applies to every Claude Code session, so it always exits 0, prints nothing and finishes within its time budget. See [`docs/sidebar.md`](sidebar.md) for the details.
-
 ### How Node is found
 
-The manifest's actions and pane, and the Claude Code hook, all go through `bin/run.sh` (POSIX sh), which uses the first node ≥ 22 from:
+The manifest's actions and pane all go through `bin/run.sh` (POSIX sh), which uses the first node ≥ 22 from:
 
 1. `SUBAGENT_WATCH_NODE` (when set, only this one is used; if it is not usable, it is an error)
 2. `command -v node`, after checking that the file really exists and is executable. The herdr server's `PATH` may still contain a node that no longer exists (for example fnm's per-shell temporary path).
@@ -180,28 +150,22 @@ The manifest's actions and pane, and the Claude Code hook, all go through `bin/r
 - **Node.js 22+ not found** (or every candidate is older than 22): the reason is printed.
   - In the popup, it waits at `Press any key to close.` instead of vanishing immediately.
   - Actions also show a herdr notification.
-  - The sidebar hook exits 0 silently so it never disturbs the Claude session.
-  - To pick a specific node, set `SUBAGENT_WATCH_NODE` in the environment that starts herdr and Claude Code.
+  - To pick a specific node, set `SUBAGENT_WATCH_NODE` in the environment that starts herdr.
 - **Setup wrote to the wrong config file**: the action uses the herdr server's environment; run `sh bin/run.sh scripts/setup.mjs` from your own shell in the plugin directory (see [Setup details](#setup-details)).
-- **`(guessed: latest session)` in the popup**: the session was guessed from the pane's cwd and may be the wrong one when several Claude Code sessions share a folder. It was the newest one when it was guessed and stays until herdr or the pane map names a session or its transcript is removed (see [Which session a pane maps to](#which-session-a-pane-maps-to)).
-- **The popup stays on the previous session after starting a new one**:
-  - With the `SessionStart` hook in place, this lasts only until the new session's transcript exists (in testing it was written after the first prompt).
-  - Without it (setup from an older version not run again, or a session that started before the hooks were added): when herdr and the pane map are both stale (herdr kept an old value, and no sub agent has started in the new session yet), the popup switches only when the first sub agent starts and the hook updates the pane map. When the popup first picks a session it compares write times; if a stale value names a session another pane is still writing, that session can be picked. After that, the popup switches only when herdr or the pane map reports a different session than it last reported, or the transcript on screen is deleted (see [Which session a pane maps to](#which-session-a-pane-maps-to)).
-- **The popup switches to a `claude -p` started from that pane**: only for a nested `claude -p` the hook cannot tell apart from the pane's own session (see Known limitations in [`docs/sidebar.md`](sidebar.md#known-limitations)). Its `SessionStart` writes the pane map with the mark, so the popup follows it until the pane's own session writes the pane map again (its next sub agent event or `SessionStart`).
-- **The popup ends up on an older session and stays there**: only when the pane map has no `SessionStart` mark. Two cases where the rule above does this while the popup is open:
-  - herdr's report changes back to an older session (for example the herdr server restoring an old value after a restart). That counts as a changed value, so the popup switches to that session without comparing write times, and stays there until herdr or the pane map reports a different session than it last reported. Whether the viewer survives a herdr server restart at all is not verified.
-  - herdr or the pane map reports a session for the first time (for example the pane map did not exist when the popup opened and the hook writes it when a sub agent starts, or herdr failed at first and recovers), while another pane happened to write the old session's transcript at the same time or later. The popup stays on the old session, and write times are not compared again for that source.
+- **`(guessed: latest session)` in the popup**: the session was guessed from the pane's cwd and may be the wrong one when several Claude Code sessions share a folder. It was the newest one when it was guessed and stays until herdr names a session or its transcript is removed (see [Which session a pane maps to](#which-session-a-pane-maps-to)).
+- **The popup stays on the previous session after starting a new one**: it switches once herdr reports the new session and its transcript exists (in testing it was written after the first prompt). If herdr keeps reporting the old session (seen with herdr 0.9.3 after a server restart), reopen the pane.
+- **The popup ends up on an older session and stays there**: two cases where the rule in [Which session a pane maps to](#which-session-a-pane-maps-to) does this while the popup is open:
+  - herdr's report changes back to an older session (for example the herdr server restoring an old value after a restart). That counts as a changed value, so the popup switches to that session without comparing write times, and stays there until herdr reports a different session than it last reported. Whether the viewer survives a herdr server restart at all is not verified.
+  - herdr reports a session for the first time (it failed at first and recovers), while another pane happened to write the old session's transcript at the same time or later. The popup stays on the old session, and write times are not compared again.
   - In both cases, closing and reopening the popup picks the session again by write time, the same way as on first open.
+- **A tab stays `◐` for a sub agent that is gone**: its background work could not be checked (the output file moved, or its format changed in a newer Claude Code). The popup does not guess that it finished; see [Data sources and when a sub agent counts as finished](#data-sources-and-when-a-sub-agent-counts-as-finished).
 - `◀ ▶ ● ─ │ · … ↑ ↓` are East Asian ambiguous width characters. With a terminal set to treat ambiguous width as wide, the layout breaks.
 - Only characters whose East Asian Width is W or F (Unicode 16.0) count as 2 columns. Symbols that some terminals draw wide only with a variation selector (for example `❤️`) can be measured differently from how the terminal draws them. An emoji ZWJ sequence is measured as the sum of its parts (👨‍👩‍👧 counts as 6 columns), so a terminal that joins it into one glyph draws it narrower than measured.
 - Whether herdr forwards the mouse wheel to the popup is **not verified**. If the wheel does nothing, use `↑` / `↓`. Left clicks were checked in a real herdr popup: herdr forwards them as SGR press / release with coordinates relative to the popup content (top-left is 1,1), and clicks outside the popup do nothing.
 - With mouse reporting on, selecting text by dragging inside the viewer is captured by the viewer, so nothing gets selected. Some terminals let you hold Shift while dragging to get around this; whether that works inside a herdr popup is not verified.
 - When reading the transcript, a summary keeps only its first 20 lines and at most 8000 columns in total (enough to fill 20 lines in a 400-column summary column). In `+N`, each cut original line counts as one line, so the real number of screen lines can be higher when an original line is very long.
 - In narrow windows the tab bar shows only the numbers around the selected tab (adding one on each side in turn), with a magenta `◀` / `▶` on a side that has hidden tabs. With nothing hidden on the left, the `◀` position stays blank, so the numbers do not shift when it appears; with nothing hidden on the right, nothing is drawn. The selected tab is always fully visible: when it is wider than the space left, only its name is cut (ending in `…`), never its number or status symbol. If the window is too narrow for even the summary plus the selected tab's number and symbol, the summary is left out. The line never exceeds the window width.
-- Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings, `rows_by_agent` written as an inline table, and so on) are skipped, or rejected by `herdr config check` (the original file is left untouched, so nothing needs restoring). In that case paste the snippet from the log by hand.
-- If the plugin directory path contains `"`, `$`, `` ` `` or `\`, setup does not write the hooks (they would break the shell command); set them up by hand.
-- macOS: without `XDG_RUNTIME_DIR` the state files live in `$TMPDIR/subagent-watch/`, and macOS deletes files in `$TMPDIR` that have not been accessed for 3 days. After a pane has been idle for 3 days its pane map can be gone, and the popup falls back to guessing the session from the pane's cwd until the next `SessionStart` or sub agent event writes it again. The hook and the popup must see the same `TMPDIR` (or the same `XDG_RUNTIME_DIR`); otherwise the popup does not find the pane map and guesses.
-- macOS: the hook tells a nested `claude -p` apart by the process names in `ps -A -o pid=,ppid=,comm=`. What the native Claude Code binary shows there has not been checked on a real Mac; if it is not `claude`, the ancestor scan finds no `claude` and every event is accepted, nested ones included (see Known limitations in [`docs/sidebar.md`](sidebar.md#known-limitations)).
+- Setup has no TOML parser and works line by line. Forms it does not understand (multi-line strings and so on) are skipped, or rejected by `herdr config check` (the original file is left untouched, so nothing needs restoring). In that case paste the snippet from the log by hand.
 
 ## Development
 

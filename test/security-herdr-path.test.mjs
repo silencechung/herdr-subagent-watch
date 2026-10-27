@@ -55,24 +55,6 @@ test('relative and empty PATH entries are never searched for herdr', () => {
   assert.equal(resolveHerdrBinPath({ PATH: 'node_modules/.bin:.' }, () => true), null);
 });
 
-test('review PoC: the sidebar hook does not run a herdr from a relative PATH entry', () => {
-  const { caseDirectory, repositoryPath, markerPath, emptyDirectory } = createEvilRepository();
-  const runtimeDirectory = path.join(caseDirectory, 'runtime');
-  fs.mkdirSync(runtimeDirectory, { mode: 0o700 });
-  const payload = JSON.stringify({ hook_event_name: 'SubagentStart', session_id: 's-r', agent_id: 'agr', agent_type: 'gp' });
-  const result = spawnSync(process.execPath, [path.join(repositoryDirectory, 'hooks', 'sidebar-hook.mjs')], {
-    cwd: repositoryPath,
-    env: { HERDR_PANE_ID: 'w1:p1', XDG_RUNTIME_DIR: runtimeDirectory, PATH: `node_modules/.bin:${emptyDirectory}` },
-    input: payload,
-    encoding: 'utf8',
-    timeout: 5000,
-  });
-  assert.equal(result.status, 0);
-  assert.equal(result.stdout, '');
-  assert.equal(fs.existsSync(markerPath), false, 'the repo herdr must not run');
-  assert.deepEqual(fs.readdirSync(runtimeDirectory), []);
-});
-
 test('the open action does not pick a herdr from a relative PATH entry', () => {
   const { repositoryPath, markerPath, emptyDirectory } = createEvilRepository();
   const environment = { HOME: emptyDirectory, PATH: `node_modules/.bin:${emptyDirectory}`, HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w1:p1' }) };
@@ -99,8 +81,8 @@ const systemNodePaths = ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/
 const existingSystemNode = systemNodePaths.find((candidate) => fs.existsSync(candidate));
 const shellPath = findOnPath('sh');
 
-// review PoC：herdr 以外的外部指令（dirname、sed、sort、tail、cut）以前也照原本的 PATH 找，repo 的 node_modules/.bin/dirname 每次 hook 都會被執行
-test('review PoC: bin/run.sh runs no tool from a relative PATH entry, and the hook still runs to the end', () => {
+// review PoC：herdr 以外的外部指令（dirname、sed、sort、tail、cut）以前也照原本的 PATH 找，repo 的 node_modules/.bin/dirname 會被 launcher 執行
+test('review PoC: bin/run.sh runs no tool from a relative PATH entry, and the script still runs', () => {
   const { caseDirectory, repositoryPath, markerPath } = createEvilRepository();
   const toolNames = ['dirname', 'sed', 'sort', 'tail', 'cut'];
   for (const toolName of [...toolNames, 'node']) {
@@ -123,43 +105,21 @@ test('review PoC: bin/run.sh runs no tool from a relative PATH entry, and the ho
   const nvmBinDirectory = path.join(homeDirectory, '.nvm', 'versions', 'node', 'v22.0.0', 'bin');
   fs.mkdirSync(nvmBinDirectory, { recursive: true });
   fs.symlinkSync(process.execPath, path.join(nvmBinDirectory, 'node'));
-  const runtimeDirectory = path.join(caseDirectory, 'runtime');
-  fs.mkdirSync(runtimeDirectory, { mode: 0o700 });
-  const callLogPath = path.join(caseDirectory, 'herdr-calls.jsonl');
-  const fakeHerdrPath = path.join(caseDirectory, 'herdr');
-  const sessionId = 's-tools';
-  const paneGetOutput = JSON.stringify({ result: { pane: { agent: 'claude', agent_session: { agent: 'claude', kind: 'id', value: sessionId } } } });
-  fs.writeFileSync(fakeHerdrPath, [
-    `#!${process.execPath}`,
-    'const argumentList = process.argv.slice(2);',
-    `if (argumentList[0] === '--warm-up') process.exit(0);`,
-    `if (argumentList[0] === 'pane' && argumentList[1] === 'get') { process.stdout.write(${JSON.stringify(paneGetOutput)}); process.exit(0); }`,
-    `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(argumentList) + '\\n');`,
-    '',
-  ].join('\n'), { mode: 0o755 });
-  // macOS 第一次執行新寫的 script 要 0.6–1.5 秒（系統掃描新檔案），會超過 hook 呼叫 herdr 的預算而被砍掉，先跑一次
-  spawnSync(fakeHerdrPath, ['--warm-up']);
 
-  const result = spawnSync(shellPath, [path.join(repositoryDirectory, 'bin', 'run.sh'), 'hooks/sidebar-hook.mjs'], {
+  const result = spawnSync(shellPath, [path.join(repositoryDirectory, 'bin', 'run.sh'), 'open-action.mjs', '--dry-run'], {
     cwd: repositoryPath,
     env: {
       HOME: homeDirectory,
       PATH: `node_modules/.bin::.:${toolsDirectory}`,
-      HERDR_PANE_ID: 'w1:p1',
-      HERDR_BIN_PATH: fakeHerdrPath,
-      XDG_RUNTIME_DIR: runtimeDirectory,
+      HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w1:p1' }),
     },
-    input: JSON.stringify({ hook_event_name: 'SubagentStart', session_id: sessionId, agent_id: 'agt', agent_type: 'gp' }),
     encoding: 'utf8',
     timeout: 10_000,
   });
   const repoToolRuns = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf8') : '';
   assert.equal(repoToolRuns, '', 'no tool from the repo may run');
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, '');
-  const calls = fs.readFileSync(callLogPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.equal(calls.length, 1, 'the hook ran through the launcher and reported to herdr');
-  assert.deepEqual(calls[0].slice(0, 3), ['pane', 'report-metadata', 'w1:p1']);
+  assert.equal(JSON.parse(result.stdout).herdrBinPath, null, 'the script ran through the launcher with the nvm node');
 });
 
 test('bin/run.sh does not notify through a herdr from a relative PATH entry when node is missing', { skip: existingSystemNode ? `a system node exists at ${existingSystemNode}` : false }, () => {
