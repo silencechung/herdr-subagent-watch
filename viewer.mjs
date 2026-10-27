@@ -3,7 +3,7 @@ import { getClaudeProjectsDirectory } from './lib/claude-config.mjs';
 import { createDemoSource } from './lib/demo.mjs';
 import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder, createTabNumberInput, isDigitKey } from './lib/keys.mjs';
-import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight } from './lib/render.mjs';
+import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight, waitingNote } from './lib/render.mjs';
 import { resolveRuntimeDirectory } from './lib/runtime-directory.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { chooseSession, describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
@@ -202,11 +202,15 @@ function createController({ options, environment, onChange }) {
     const subAgents = source?.getSubAgents() ?? [];
     const labels = buildTabLabels(subAgents);
     return subAgents.map((subAgent, index) => {
-      const status = getSubAgentStatus(subAgent, nowMs);
-      const events = status.isDone
-        ? [...subAgent.events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: describeEndReason(status.reason) }]
-        : subAgent.events;
-      return { agentId: subAgent.agentId, label: labels[index], isDone: status.isDone, events };
+      // watcher 的 getStatus 會去看背景工作的輸出檔；demo 沒有背景工作，直接用 getSubAgentStatus
+      const status = source?.getStatus?.(subAgent, nowMs) ?? getSubAgentStatus(subAgent, nowMs);
+      let events = subAgent.events;
+      if (status.isDone) {
+        events = [...events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: describeEndReason(status.reason) }];
+      } else if (status.isWaiting) {
+        events = [...events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: waitingNote }];
+      }
+      return { agentId: subAgent.agentId, label: labels[index], isDone: status.isDone, isWaiting: status.isWaiting, events };
     });
   }
 

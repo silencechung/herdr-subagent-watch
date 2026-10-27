@@ -55,6 +55,11 @@ test('tab summary counts running and done tabs', () => {
   assert.equal(summary.runningText + summary.restText, '2 running · 3 done │ ');
 });
 
+test('a sub agent waiting on its background work shows ◐ and its own count', () => {
+  const tabs = [makeTab('Explore', false), { ...makeTab('general-purpose', false), isWaiting: true }, makeTab('Plan', true)];
+  assert.equal(buildTabBar(tabs, 1, 120, false), '1 running · 1 waiting · 1 done │   1 [2 ◐ general-purpose] 3');
+});
+
 test('tab order follows the input even when done and running tabs interleave', () => {
   const tabBar = buildTabBar([makeTab('first', true), makeTab('second', false), makeTab('third', true)], 1, 120, false);
   assert.equal(tabBar, '1 running · 2 done │   1 [2 ● second] 3');

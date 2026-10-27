@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -224,4 +225,87 @@ test('main transcript lines that only quote a task notification do not end a sub
   ].join('\n'));
   watcher.refresh();
   assert.equal(getSubAgentStatus(explore, Date.now()).isDone, false);
+});
+
+// ── sub 自己的背景工作：watcher 讀輸出檔結尾、巢狀 Agent 看它自己的狀態 ──
+
+function createBackgroundSession() {
+  copyCounter += 1;
+  const projectDirectory = path.join(temporaryRoot, `background-${copyCounter}`, '-tmp-demo-project');
+  const sessionId = 'bbbb0000-0000-4000-8000-000000000000';
+  const transcriptPath = path.join(projectDirectory, `${sessionId}.jsonl`);
+  const subagentsDirectory = path.join(projectDirectory, sessionId, 'subagents');
+  const tasksDirectory = path.join(temporaryRoot, `background-${copyCounter}`, 'tmp', sessionId, 'tasks');
+  fs.mkdirSync(subagentsDirectory, { recursive: true });
+  fs.mkdirSync(tasksDirectory, { recursive: true });
+  fs.writeFileSync(transcriptPath, '');
+  const writeSubAgent = (agentId, records) => {
+    fs.writeFileSync(path.join(subagentsDirectory, `agent-${agentId}.meta.json`), JSON.stringify({ agentType: 'general-purpose', description: agentId, requestShape: 'background' }));
+    fs.writeFileSync(path.join(subagentsDirectory, `agent-${agentId}.jsonl`), records.map((record) => `${JSON.stringify(record)}\n`).join(''));
+  };
+  return { transcriptPath, tasksDirectory, writeSubAgent };
+}
+
+function shellLaunch(timestamp, taskId, outputPath) {
+  return {
+    type: 'user',
+    timestamp,
+    message: { content: [{ type: 'tool_result', tool_use_id: `toolu_${taskId}`, content: `Command running in background with ID: ${taskId}. Output is being written to: ${outputPath}` }] },
+    toolUseResult: { stdout: '', stderr: '', backgroundTaskId: taskId },
+  };
+}
+
+const waitingText = (timestamp) => assistantLine('x', timestamp, { type: 'text', text: 'waiting for the background task' }, 'end_turn');
+
+test('a sub agent waiting on a background shell becomes done once the output file shows killed and it does not come back', () => {
+  const { transcriptPath, tasksDirectory, writeSubAgent } = createBackgroundSession();
+  const outputPath = path.join(tasksDirectory, 'bzeikx0gq.output');
+  fs.writeFileSync(outputPath, '');
+  writeSubAgent('probeD', [shellLaunch('2026-10-10T01:00:01.000Z', 'bzeikx0gq', outputPath), JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const [probe] = watcher.getSubAgents();
+  const nowMs = Date.now();
+  assert.equal(watcher.getStatus(probe, nowMs).isWaiting, true, 'output file still empty: the sleep is running');
+  // 等待中被停掉：輸出檔寫上 [killed]，sub 沒有再寫任何東西
+  fs.writeFileSync(outputPath, '\n[killed]\n');
+  const killedAtSeconds = Date.parse('2026-10-10T01:00:10.000Z') / 1000;
+  fs.utimesSync(outputPath, killedAtSeconds, killedAtSeconds);
+  assert.equal(watcher.getStatus(probe, killedAtSeconds * 1000 + 1_000).isWaiting, true, 'within the grace period it may still resume');
+  assert.deepEqual(watcher.getStatus(probe, killedAtSeconds * 1000 + 31_000), { isDone: true, isWaiting: false, reason: 'not_resumed', atMs: killedAtSeconds * 1000 });
+});
+
+test('a sub agent waiting on a background Agent follows the nested sub agent status', () => {
+  const { transcriptPath, writeSubAgent } = createBackgroundSession();
+  const nestedLaunch = { type: 'user', timestamp: '2026-10-10T01:00:01.000Z', message: { content: [] }, toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'nested1' } };
+  writeSubAgent('parent1', [nestedLaunch, JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  writeSubAgent('nested1', [JSON.parse(assistantLine('nested1', '2026-10-10T01:00:03.000Z', { type: 'tool_use', id: 'toolu_b', name: 'Bash', input: { command: 'echo nested' } }))]);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const byId = new Map(watcher.getSubAgents().map((subAgent) => [subAgent.agentId, subAgent]));
+  const nowMs = Date.parse('2026-10-10T01:00:05.000Z');
+  assert.equal(watcher.getStatus(byId.get('parent1'), nowMs).isWaiting, true);
+  assert.equal(watcher.getStatus(byId.get('nested1'), nowMs).isDone, false);
+  // 巢狀 sub 回報結束後，parent 在寬限時間內被叫醒、回報
+  const nestedPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-nested1.jsonl');
+  fs.appendFileSync(nestedPath, `${assistantLine('nested1', '2026-10-10T01:00:06.000Z', { type: 'tool_use', id: 'toolu_h', name: 'SubagentHandback', input: {} })}\n`);
+  watcher.refresh();
+  assert.equal(watcher.getStatus(byId.get('parent1'), Date.parse('2026-10-10T01:00:07.000Z')).isWaiting, true);
+  const parentPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-parent1.jsonl');
+  fs.appendFileSync(parentPath, `${assistantLine('parent1', '2026-10-10T01:00:08.000Z', { type: 'tool_use', id: 'toolu_p', name: 'SubagentHandback', input: {} })}\n`);
+  watcher.refresh();
+  assert.deepEqual(watcher.getStatus(byId.get('parent1'), Date.parse('2026-10-10T01:00:09.000Z')), { isDone: true, isWaiting: false, reason: 'handback', atMs: Date.parse('2026-10-10T01:00:08.000Z') });
+});
+
+test('an output path that is a FIFO does not block the viewer and keeps the sub agent waiting', { skip: process.platform === 'win32' }, () => {
+  const { transcriptPath, tasksDirectory, writeSubAgent } = createBackgroundSession();
+  const outputPath = path.join(tasksDirectory, 'bfifo0001.output');
+  const made = spawnSync('mkfifo', [outputPath]);
+  assert.equal(made.status, 0, 'mkfifo');
+  writeSubAgent('fifo1', [shellLaunch('2026-10-10T01:00:01.000Z', 'bfifo0001', outputPath), JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const startMs = Date.now();
+  assert.equal(watcher.getStatus(watcher.getSubAgents()[0], Date.now() + 3_600_000).isWaiting, true);
+  assert.ok(Date.now() - startMs < 1000);
 });

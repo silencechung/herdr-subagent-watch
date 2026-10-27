@@ -53,7 +53,7 @@ popup 開、關都手動：所有 sub 結束也不會自己關。
 - tab 列長這樣：`2 running · 3 done │   1 [2 ● general-purpose] 3 4 5`：選取的 tab 顯示編號、狀態與名稱，其他 tab 只顯示編號。
   - 顏色跟著 terminal theme：只用 bold、dim、reverse 和 ANSI 16 色，不寫死任何色碼。
   - 最左邊固定是跑中／結束數量摘要，跑中數字是 ANSI magenta，其餘 dim。
-  - 選取的 tab 是 `[<編號> <狀態> <名稱>]`，reverse video＋bold；`●` 跑中、`✓` 結束。其他 tab 只有編號：跑中 bold、結束 dim（不上色，只用文字屬性）。
+  - 選取的 tab 是 `[<編號> <狀態> <名稱>]`，reverse video＋bold；`●` 跑中、`◐` 在等自己的背景工作、`✓` 結束。其他 tab 只有編號：跑中與等待中 bold、結束 dim（不上色，只用文字屬性）。
   - 編號從 1 開始，是 tab 在完整清單裡的位置，順序照啟動時間；結束的 tab 留著，狀態改變不會重排，tab 列可見範圍捲動也不會改編號。兩位數、三位數照原樣顯示，不補零。
   - 輸入編號直接跳到那個 tab。目前輸入的數字還可能是更長編號的開頭時（例：14 個 tab 時按 `1`，可能是 10–14），等 600 ms 看有沒有下一位，沒有就跳到目前輸入的編號；不可能再延伸時（tab 不到 20 個時按 `2`–`9`）立刻跳。`0` 開頭或超過 tab 數的編號忽略並清掉。輸入到一半按其他鍵會丟掉已輸入的數字，那個鍵照常作用。等待期間畫面照常更新。
   - 滑鼠點擊只對 tab 列有效：點編號或選取的 tab 切到那個 tab，點 `◀` / `▶` 切到上一個／下一個；點其他地方不理。只算左鍵按下（放開不算），可點的欄位範圍取自最後一次畫出來的 tab 列，和畫面用同一套顯示寬度（中文、emoji 算 2 格）。
@@ -139,6 +139,13 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
   3. main transcript 出現 `<task-notification>`，`<task-id>` 是這個 agent、`<status>` 是 `completed`／`killed`／`failed`（被 kill 的 sub 只有這個訊號）。只認 content 以 `<task-notification>` 開頭的 `queue-operation` 行：樣本裡每則通知都是這樣寫的；user 訊息、排隊中的訊息、tool result 裡引用的同樣 tag 不算。
   4. 備案：transcript 超過 10 分鐘沒寫入。門檻對齊 Bash tool 單次最長 10 分鐘，避免把正在等指令的 sub 誤判。這時結束行顯示 `no writes for 10 min`，之後若又寫入會變回 `●`。
 - 結束訊號比最後一筆 assistant 活動早時不算數：sub 被 resume 後會回到 `●`。
+- **在等自己的背景工作（`◐`）**：sub 啟動背景工作後結束這一輪並不代表做完了，那個工作結束後它會自己接著跑。等待期間 `SubagentHandback`（可能在等待前就送出）、`end_turn`、main transcript 的 `completed` 通知都會出現，只看規則 1–3 會顯示 `✓`（實測）。所以先做這幾步：
+  - 從 sub 自己的 transcript 記下它啟動的背景工作：Bash `run_in_background`（`toolUseResult.backgroundTaskId`，shell）或背景 Agent（`toolUseResult.isAsync` 加 `agentId`，agent；巢狀 sub 在同一個 `subagents` 資料夾有自己的 transcript）。
+  - 這一輪已經結束（規則 1–3 任一，或 `end_turn`，background sub 也算），而這些工作還有沒結束的：tab 顯示 `◐`，結束行是 `waiting on background work`，標題列算成 `N waiting`。
+  - 工作什麼時候結束，依序看：sub transcript 裡說它結束的紀錄（`origin.kind` 是 `task-notification` 的 `user` 紀錄、`queued_command` 的 `attachment`、sub 自己 `TaskStop` 的結果，本機看過這三種），沒有的話 shell 看輸出檔（路徑在啟動時的 tool result 裡；最後一行是 `[exited with code N]` 或 `[killed]` 就是結束了，以檔案修改時間當結束時間），agent 看巢狀 sub 自己的狀態。判斷不了的工作讓 sub 維持 `◐`，不會變成 `✓`，也不套用 10 分鐘的備案。
+  - 工作都結束了、sub 之後都沒有寫入：再維持 `◐` 30 秒（正常 1–2 秒內就會被叫醒），之後顯示為結束，結束行是 `background work ended, not resumed`。這是給等待中被停掉的 sub 用的：本機實測它不會留下 `SubagentStop`、`killed` 通知或任何紀錄，只有被 kill 的背景 shell。
+  - 工作結束後 sub 又跑過：照原本的規則 1–4 判斷。main transcript 的 `killed`／`failed` 通知就算在等待中也直接算結束。
+  - 輸出檔格式與 `origin`／`queued_command`／`TaskStop` 的形式都是 Claude Code internal（本機 2.1.311、macOS 實測），升版可能改；改了的話等待中的 sub 會一直是 `◐`，不會誤判成結束。
 - 前景 sub：樣本只有一個（`"requestShape":"foreground"`），用 `SubagentHandback` 結束（規則 1）。規則 2（`end_turn`）對前景 sub 照樣適用；前景 sub 會不會中途出現 `end_turn` **未驗證**。
 
 ### 側邊欄數量
