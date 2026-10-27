@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -668,9 +669,12 @@ test('the herdr / pane map disagreement note carries no terminal escapes', async
   assert.doesNotMatch(result.statusNote, terminalControlPattern);
 });
 
+// macOS 第一次執行剛寫好的 script 要 0.6–1.5 秒（系統掃描新檔案），第二次起只要幾 ms；
+// 先用 --warm-up 跑一次，不然 300 ms 逾時的測試裡 shell 還沒開始跑就被 kill
 function writeExecutable(name, body) {
   const filePath = path.join(temporaryRoot, name);
-  fs.writeFileSync(filePath, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  fs.writeFileSync(filePath, `#!/bin/sh\n[ "$1" = --warm-up ] && exit 0\n${body}\n`, { mode: 0o755 });
+  execFileSync(filePath, ['--warm-up']);
   return filePath;
 }
 

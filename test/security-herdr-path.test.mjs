@@ -132,10 +132,13 @@ test('review PoC: bin/run.sh runs no tool from a relative PATH entry, and the ho
   fs.writeFileSync(fakeHerdrPath, [
     `#!${process.execPath}`,
     'const argumentList = process.argv.slice(2);',
+    `if (argumentList[0] === '--warm-up') process.exit(0);`,
     `if (argumentList[0] === 'pane' && argumentList[1] === 'get') { process.stdout.write(${JSON.stringify(paneGetOutput)}); process.exit(0); }`,
     `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(argumentList) + '\\n');`,
     '',
   ].join('\n'), { mode: 0o755 });
+  // macOS 第一次執行新寫的 script 要 0.6–1.5 秒（系統掃描新檔案），會超過 hook 呼叫 herdr 的預算而被砍掉，先跑一次
+  spawnSync(fakeHerdrPath, ['--warm-up']);
 
   const result = spawnSync(shellPath, [path.join(repositoryDirectory, 'bin', 'run.sh'), 'hooks/sidebar-hook.mjs'], {
     cwd: repositoryPath,

@@ -837,9 +837,12 @@ describe('hook script with SessionStart and Stop, as Claude Code runs it', () =>
     const fakeHerdrPath = join(workDirectory, 'herdr');
     writeFileSync(fakeHerdrPath, [
       `#!${process.execPath}`,
+      `if (process.argv[2] === '--warm-up') process.exit(0);`,
       `require('node:fs').appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
       '',
     ].join('\n'), { mode: 0o755 });
+    // macOS 第一次執行新寫的 script 要 0.6–1.5 秒（系統掃描新檔案），先跑一次，不然會吃掉下面「1 秒內」的預算
+    spawnSync(fakeHerdrPath, ['--warm-up']);
     return {
       runtimeDirectory,
       callLogPath,
