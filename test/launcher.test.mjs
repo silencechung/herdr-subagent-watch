@@ -151,6 +151,15 @@ test('~/.fnm and Volta are looked at when there is no node on PATH', () => {
   assert.match(result.stdout, new RegExp(`^fake-node ${voltaNode}$`, 'm'));
 });
 
+test('the macOS fnm folder of older fnm versions (with a space in its path) is looked at before ~/.fnm', () => {
+  const { homeDirectory } = createCase();
+  const macosFnmNode = writeFakeNode(path.join(homeDirectory, 'Library', 'Application Support', 'fnm', 'aliases', 'default', 'bin', 'node'), 'v22.4.0');
+  writeFakeNode(path.join(homeDirectory, '.fnm', 'aliases', 'default', 'bin', 'node'), 'v23.0.0');
+  const result = runLauncher(['viewer.mjs'], { environment: { HOME: homeDirectory } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.split('\n').includes(`fake-node ${macosFnmNode}`), result.stdout);
+});
+
 test('nvm: the newest installed version wins, compared as numbers', () => {
   const { homeDirectory } = createCase();
   const versionsDirectory = path.join(homeDirectory, '.nvm', 'versions', 'node');
@@ -173,15 +182,19 @@ test('without any usable node it explains what to install and lists the versions
   assert.match(result.stderr, /Too old or unusable:\n {2}.+\/node \(v18\.20\.0\)/);
 });
 
-test('the sidebar hook stays silent and exits 0 when there is no node', { skip: skipWithoutNode }, () => {
-  const { homeDirectory } = createCase();
-  const result = runLauncher([path.join(repositoryDirectory, 'hooks', 'sidebar-hook.mjs')], {
-    environment: { HOME: homeDirectory },
-    input: '{"hook_event_name":"SubagentStart"}',
-  });
-  assert.equal(result.status, 0);
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr, '');
+// 側邊欄 hook 已經拿掉，但還沒重跑 setup 的使用者 settings.json 裡還掛著它：有沒有 node 都要安靜地 exit 0
+test('a sidebar hook left in settings.json by an older version exits 0 silently, with or without node', { skip: skipWithoutNode }, () => {
+  const { binDirectory, homeDirectory } = createCase();
+  const explicitNode = writeFakeNode(path.join(binDirectory, 'node'), 'v22.0.0');
+  for (const environment of [{ HOME: homeDirectory }, { HOME: homeDirectory, SUBAGENT_WATCH_NODE: explicitNode }]) {
+    const result = runLauncher([path.join(repositoryDirectory, 'hooks', 'sidebar-hook.mjs')], {
+      environment,
+      input: '{"hook_event_name":"SubagentStart"}',
+    });
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
+  }
 });
 
 test('an action without node tells the user through a herdr notification', { skip: skipWithoutNode }, () => {
@@ -197,11 +210,11 @@ test('an action without node tells the user through a herdr notification', { ski
   assert.deepEqual(calls.slice(0, 3), ['notification', 'show', 'subagent.watch: Node.js 22+ not found']);
 });
 
-test('stdin reaches the script untouched (the hook reads its payload from stdin)', () => {
+test('stdin reaches the script untouched', () => {
   const { binDirectory, homeDirectory } = createCase();
   const explicitNode = writeFakeNode(path.join(binDirectory, 'node'), 'v22.0.0');
-  const payload = '{"hook_event_name":"SubagentStart","agent_id":"abc"}';
-  const result = runLauncher(['hooks/sidebar-hook.mjs'], {
+  const payload = '{"some":"input","agent_id":"abc"}';
+  const result = runLauncher(['open-action.mjs'], {
     environment: { HOME: homeDirectory, SUBAGENT_WATCH_NODE: explicitNode },
     input: payload,
   });
@@ -218,7 +231,8 @@ test('with the real node it runs viewer.mjs end to end', () => {
   assert.match(result.stdout.split('\n')[0], /^2 running · 1 done │/);
 });
 
-const hasScript = findOnPath('script') !== null;
+// 只認 util-linux 的 script（認得 --version）：macOS 的 BSD script 不吃下面的 -qfec，語法也不同
+const hasScript = findOnPath('script') !== null && spawnSync(findOnPath('script'), ['--version'], { encoding: 'utf8' }).status === 0;
 
 describe('inside a popup', { skip: (!hasScript && 'util-linux script is not available') || skipWithoutNode }, () => {
   test('the error stays on screen until a key is pressed', { timeout: 15_000 }, async () => {

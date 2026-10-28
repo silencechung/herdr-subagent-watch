@@ -3,7 +3,10 @@ import { test } from 'node:test';
 import {
   buildToolSummary,
   detectRecordEndSignal,
+  extractBackgroundLaunch,
+  extractBackgroundSettlement,
   extractRecordEvents,
+  isTaskOutputFinished,
   parseJsonLine,
   parseTaskNotifications,
   splitCompleteLines,
@@ -166,4 +169,54 @@ test('a 1 MB line full of task-id tags is parsed in linear time', () => {
     const elapsedMs = performance.now() - startMs;
     assert.ok(elapsedMs < 50, `took ${elapsedMs.toFixed(1)} ms`);
   }
+});
+
+// ── sub 自己的背景工作（格式照實測） ──
+
+function shellLaunchRecord(taskId, outputText) {
+  return {
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_x', content: outputText }] },
+    toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: taskId },
+  };
+}
+
+test('a background Bash launch gives the task id and the output path from the tool result', () => {
+  const record = shellLaunchRecord('brh8kmhaf', 'Command running in background with ID: brh8kmhaf. Output is being written to: /private/tmp/claude-501/-p/s1/tasks/brh8kmhaf.output');
+  assert.deepEqual(extractBackgroundLaunch(record), { taskId: 'brh8kmhaf', kind: 'shell', outputPath: '/private/tmp/claude-501/-p/s1/tasks/brh8kmhaf.output' });
+  // 路徑要是絕對路徑、結尾是 tasks/<這個 taskId>.output，不然不拿來讀（transcript 是別的程式寫的）
+  for (const text of ['Output is being written to: relative/tasks/brh8kmhaf.output', 'Output is being written to: /etc/passwd', 'Output is being written to: /tmp/tasks/other.output', 'no path here']) {
+    assert.equal(extractBackgroundLaunch(shellLaunchRecord('brh8kmhaf', text)).outputPath, null, text);
+  }
+  assert.equal(extractBackgroundLaunch(shellLaunchRecord('../../x', 'Output is being written to: /tmp/tasks/../../x.output')), null);
+  assert.equal(extractBackgroundLaunch({ type: 'assistant', toolUseResult: { backgroundTaskId: 'b1' } }), null);
+});
+
+test('a background Agent launch is recognised by isAsync and agentId', () => {
+  const record = { type: 'user', message: { content: [] }, toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'a7a46cbf7453761df' } };
+  assert.deepEqual(extractBackgroundLaunch(record), { taskId: 'a7a46cbf7453761df', kind: 'agent', outputPath: null });
+  assert.equal(extractBackgroundLaunch({ ...record, toolUseResult: { ...record.toolUseResult, isAsync: false } }), null);
+});
+
+test('background work settles through a notification record, a queued attachment or TaskStop', () => {
+  const notification = '<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>';
+  // 等待中送進來的 user 紀錄：前面有一段前言
+  assert.equal(extractBackgroundSettlement({ type: 'user', origin: { kind: 'task-notification' }, message: { content: `[SYSTEM NOTIFICATION - NOT USER INPUT]\n${notification}` } }), 'b1');
+  // 一輪中途送達
+  assert.equal(extractBackgroundSettlement({ type: 'attachment', attachment: { type: 'queued_command', prompt: notification } }), 'b1');
+  // sub 自己用 TaskStop 停掉
+  assert.equal(extractBackgroundSettlement({ type: 'user', toolUseResult: { message: 'Successfully stopped task: b2 (sleep 60)', task_id: 'b2', task_type: 'local_bash' } }), 'b2');
+  // 不是 Claude Code 送的、或還沒結束的都不算
+  assert.equal(extractBackgroundSettlement({ type: 'user', message: { content: notification } }), null);
+  assert.equal(extractBackgroundSettlement({ type: 'attachment', attachment: { type: 'queued_command', prompt: `pasted:\n${notification}` } }), null);
+  assert.equal(extractBackgroundSettlement({ type: 'user', origin: { kind: 'task-notification' }, message: { content: notification.replace('completed', 'running') } }), null);
+});
+
+test('a task output file is finished only when its last line is the exit or killed marker', () => {
+  assert.equal(isTaskOutputFinished('\n[killed]\n'), true);
+  assert.equal(isTaskOutputFinished('some output\n[exited with code 0]\n'), true);
+  assert.equal(isTaskOutputFinished('x\n[exited with code 137]'), true);
+  assert.equal(isTaskOutputFinished(''), false);
+  assert.equal(isTaskOutputFinished('still running\n'), false);
+  assert.equal(isTaskOutputFinished('[killed] appears mid-output\nmore\n'), false);
 });

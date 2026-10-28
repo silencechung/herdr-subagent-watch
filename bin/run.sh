@@ -39,10 +39,10 @@ case $script in
   *) script=$plugin_root/$script ;;
 esac
 
-# sidebar hook 套用到使用者所有 Claude session：找不到 node 也要安靜地 exit 0，不能讓每次開 sub agent 都跳 hook error
-is_quiet=0
+# 側邊欄 hook 已經拿掉，但舊版 setup 寫進使用者 settings.json 的 hook 還會叫這裡（還沒重跑 setup／remove 時）：
+# 它套用到使用者所有 Claude session，直接安靜地 exit 0，不能讓每個 Claude Code 事件都跳 hook error
 case $script in
-  */hooks/sidebar-hook.mjs) is_quiet=1 ;;
+  */hooks/sidebar-hook.mjs) exit 0 ;;
 esac
 
 node=''
@@ -129,9 +129,6 @@ find_herdr() {
 }
 
 fail() {
-  if [ "$is_quiet" = 1 ]; then
-    exit 0
-  fi
   printf '%s\n' "$1" >&2
   if [ -n "${HERDR_PLUGIN_ACTION_ID:-}" ] && herdr_path=$(find_herdr); then
     # action 的輸出只進 plugin log，使用者看不到；用 herdr 通知告訴他為什麼沒反應
@@ -158,9 +155,11 @@ else
   if [ -z "$node" ] && [ -n "${FNM_DIR:-}" ]; then
     try_node "$FNM_DIR/aliases/default/bin/node"
   fi
+  # 舊版 fnm 在 macOS 的預設資料夾是 ~/Library/Application Support/fnm（路徑有空白，一定要整段 quote）
   if [ -z "$node" ] && [ -n "$home" ]; then
     try_node "${XDG_DATA_HOME:-$home/.local/share}/fnm/aliases/default/bin/node" ||
       try_node "$home/.local/share/fnm/aliases/default/bin/node" ||
+      try_node "$home/Library/Application Support/fnm/aliases/default/bin/node" ||
       try_node "$home/.fnm/aliases/default/bin/node" ||
       try_node "$home/.volta/bin/node" ||
       try_node "$(newest_nvm_node)"

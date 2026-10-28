@@ -1,4 +1,5 @@
-// subagent.watch.setup／subagent.watch.remove：把 Claude Code hook、herdr 快捷鍵與側邊欄 rows 加進（或移出）使用者自己的設定檔。
+// subagent.watch.setup／subagent.watch.remove：把 herdr 的 prefix+. 快捷鍵加進（或移出）使用者的 config.toml，
+// 並清掉舊版加的 Claude Code hook 與側邊欄 rows（側邊欄數量已經拿掉）。
 // 用法：sh bin/run.sh scripts/setup.mjs [--remove] [--dry-run]
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -8,23 +9,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getClaudeSettingsPath } from '../lib/claude-config.mjs';
 import { herdrNotFoundMessage, resolveHerdrBinPath } from '../lib/herdr.mjs';
-import {
-  buildHookCommand,
-  findSettingsShapeProblem,
-  formatSettings,
-  hookEventNames,
-  installSidebarHooks,
-  removeSidebarHooks,
-} from '../lib/setup-claude.mjs';
-import {
-  applyHerdrSetup,
-  buildManualKeySnippet,
-  buildManualRowsSnippet,
-  keyBinding,
-  openActionId,
-  removeHerdrSetup,
-  rowsTableName,
-} from '../lib/setup-herdr.mjs';
+import { findSettingsShapeProblem, formatSettings, hookEventNames, removeSidebarHooks } from '../lib/setup-claude.mjs';
+import { applyHerdrSetup, buildManualKeySnippet, keyBinding, openActionId, removeHerdrSetup } from '../lib/setup-herdr.mjs';
 
 export const backupSuffix = '.subagent-watch.bak';
 const defaultPluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -203,7 +189,8 @@ function isAcceptableCheck(before, after) {
   return !before.isOk && !after.isParseError && after.diagnostics.every((line) => before.diagnostics.includes(line));
 }
 
-function setUpClaudeHooks({ environment, pluginRoot, isRemove, isDryRun }) {
+// setup 與 remove 都一樣：只清掉舊版寫的側邊欄 hook，不再安裝任何 hook
+function removeLegacyClaudeHooks({ environment, isDryRun }) {
   const settingsPath = getClaudeSettingsPath(environment);
   const section = { title: `Claude Code (${settingsPath})`, lines: [], errors: [], warnings: [], changed: false };
   const file = readTextFile(settingsPath);
@@ -226,29 +213,17 @@ function setUpClaudeHooks({ environment, pluginRoot, isRemove, isDryRun }) {
     return section;
   }
 
-  let result;
-  if (isRemove) {
-    result = removeSidebarHooks(settings);
-  } else {
-    let command;
-    try {
-      command = buildHookCommand(pluginRoot);
-    } catch (error) {
-      section.errors.push(error.message);
-      return section;
-    }
-    result = installSidebarHooks(settings, command);
-    section.lines.push(`hook command: ${command}`);
-  }
-  for (const eventName of hookEventNames) {
-    section.lines.push(`${eventName}: ${result.changes[eventName]}`);
-  }
-  const nextText = formatSettings(result.settings, file.existed ? file.text : '');
-  const isUnchanged = isRemove ? result.removedCount === 0 : JSON.stringify(result.settings) === JSON.stringify(settings);
-  if (isUnchanged) {
-    section.lines.push(isRemove ? 'nothing to remove, file not touched' : 'already set up, file not touched');
+  const result = removeSidebarHooks(settings);
+  if (result.removedCount === 0) {
+    section.lines.push('no subagent.watch hooks from an older version, file not touched');
     return section;
   }
+  for (const eventName of hookEventNames) {
+    if (result.changes[eventName] === 'removed') {
+      section.lines.push(`${eventName}: removed the subagent.watch hook left by an older version`);
+    }
+  }
+  const nextText = formatSettings(result.settings, file.text);
   const target = resolveWritePath(settingsPath);
   if (target.error !== null) {
     section.errors.push(`${target.error}; not modified`);
@@ -261,7 +236,7 @@ function setUpClaudeHooks({ environment, pluginRoot, isRemove, isDryRun }) {
   }
   try {
     const mode = readFileMode(target.path);
-    const backupLine = file.existed ? backUpOnce(settingsPath, file.text, mode) : `created ${settingsPath}`;
+    const backupLine = backUpOnce(settingsPath, file.text, mode);
     replaceFile(writeTemporaryFile(target.path, nextText, mode), target.path);
     section.lines.push(backupLine, ...describeSymlinkTarget(settingsPath, target));
   } catch (error) {
@@ -285,7 +260,10 @@ function describeOperations(operations) {
 }
 
 function describeSetupAnalysis(analysis, section) {
-  const { key, rows } = analysis;
+  const { key } = analysis;
+  if (analysis.removedRowsBlockCount > 0) {
+    section.lines.push('sidebar rows: removing the block added by an older version (the sidebar count is gone)');
+  }
   if (key.state === 'missing') {
     section.lines.push(`${keyBinding}: adding a binding to ${openActionId}`);
   } else if (key.state === 'configured') {
@@ -293,20 +271,6 @@ function describeSetupAnalysis(analysis, section) {
   } else {
     section.warnings.push(`${keyBinding} is already used at line ${key.lineNumber}; left it alone. Bind ${openActionId} to another key yourself:`);
     section.warnings.push(...buildManualKeySnippet().map((line) => `    ${line}`));
-  }
-  if (rows.state === 'missing-table') {
-    section.lines.push(`sidebar rows: adding [${rowsTableName}] with claude rows`);
-  } else if (rows.state === 'missing-claude') {
-    section.lines.push(`sidebar rows: adding claude rows to the existing [${rowsTableName}]`);
-  } else if (rows.state === 'configured') {
-    section.lines.push(`sidebar rows: claude rows already show $sub1 (line ${rows.lineNumber})`);
-  } else {
-    section.warnings.push(`sidebar rows: ${rows.reason} (line ${rows.lineNumber}); left them alone. Add the sub agent row yourself:`);
-    section.warnings.push(...buildManualRowsSnippet().map((line) => `    ${line}`));
-  }
-  const isAddingRows = rows.state === 'missing-table' || rows.state === 'missing-claude';
-  if (isAddingRows && analysis.customAgentRowsLineNumber !== null) {
-    section.warnings.push(`your [ui.sidebar.agents] rows (line ${analysis.customAgentRowsLineNumber}) no longer apply to claude panes; edit the added claude rows if you want them back`);
   }
 }
 
@@ -335,9 +299,16 @@ function setUpHerdrConfig({ environment, isRemove, isDryRun }) {
     }
   } else {
     const result = applyHerdrSetup(file.text);
+    if (result.error !== null) {
+      section.errors.push(result.error);
+      return section;
+    }
     nextText = result.text;
     operations = result.operations;
     describeSetupAnalysis(result.analysis, section);
+    if (result.leftoverRowLineNumbers.length > 0) {
+      section.warnings.push(`lines ${result.leftoverRowLineNumbers.join(', ')} still mention $sub1 outside the subagent.watch markers (sidebar rows added by hand?); the sidebar count is gone, remove them yourself if you want`);
+    }
   }
 
   if (operations.length === 0) {
@@ -413,6 +384,88 @@ function setUpHerdrConfig({ environment, isRemove, isDryRun }) {
   return section;
 }
 
+// 舊版 hook 的狀態資料夾：Linux 是 $XDG_RUNTIME_DIR/subagent-watch，macOS 沒有 XDG_RUNTIME_DIR 時是 $TMPDIR/subagent-watch
+// 兩個都看（setup 由 herdr server 跑，環境可能跟當初跑 hook 的 Claude Code 不同）
+export function getLegacyStateDirectories(environment, { platform = process.platform, temporaryDirectory = os.tmpdir() } = {}) {
+  const directories = [];
+  if (typeof environment.XDG_RUNTIME_DIR === 'string' && environment.XDG_RUNTIME_DIR !== '') {
+    directories.push(path.join(environment.XDG_RUNTIME_DIR, 'subagent-watch'));
+  }
+  if (platform === 'darwin' && typeof temporaryDirectory === 'string' && temporaryDirectory !== '') {
+    directories.push(path.join(temporaryDirectory, 'subagent-watch'));
+  }
+  return [...new Set(directories)];
+}
+
+// 舊版 hook 寫過的檔名：每個 sub 一個 sub-*.json、popup 用的 pane-*.json、更舊版的 session-*.json 與它的 .lock／.lock.break-<inode>，
+// 以及寫入時的暫存檔 <name>.<16 hex>.tmp。其他檔案一律不刪
+const legacyStateFilePattern = /^(?:sub-.+\.json|pane-.+\.json|session-.+\.json(?:\.lock(?:\.break-\d+)?)?)(?:\.[0-9a-f]{16}\.tmp)?$/;
+
+export function isLegacyStateFileName(fileName) {
+  return legacyStateFilePattern.test(fileName);
+}
+
+// 資料夾要是自己的、不是 symlink 才動；只刪認得的一般檔案，刪完是空的才連資料夾一起刪
+function cleanLegacyStateDirectory(directory, section, isDryRun) {
+  let stats;
+  try {
+    stats = fs.lstatSync(directory);
+  } catch {
+    return;
+  }
+  if (!stats.isDirectory() || stats.isSymbolicLink() || (typeof process.getuid === 'function' && stats.uid !== process.getuid())) {
+    section.warnings.push(`${directory} is not a folder of yours (or is a symlink); left it alone`);
+    return;
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    section.warnings.push(`cannot read ${directory} (${error.message}); left it alone`);
+    return;
+  }
+  const removable = entries.filter((entry) => entry.isFile() && isLegacyStateFileName(entry.name));
+  const unknown = entries.filter((entry) => !removable.includes(entry)).map((entry) => entry.name);
+  if (isDryRun) {
+    section.lines.push(`(dry run) would remove ${removable.length} file(s) left by the old sidebar hook in ${directory}${unknown.length === 0 ? ' and the folder' : ''}`);
+  } else {
+    let removedCount = 0;
+    for (const entry of removable) {
+      try {
+        fs.unlinkSync(path.join(directory, entry.name));
+        removedCount += 1;
+      } catch (error) {
+        section.warnings.push(`cannot remove ${path.join(directory, entry.name)} (${error.message})`);
+      }
+    }
+    section.lines.push(`removed ${removedCount} file(s) left by the old sidebar hook in ${directory}`);
+    if (unknown.length === 0 && removedCount === removable.length) {
+      try {
+        fs.rmdirSync(directory);
+        section.lines.push(`removed the empty folder ${directory}`);
+      } catch (error) {
+        section.warnings.push(`cannot remove ${directory} (${error.message})`);
+      }
+    }
+  }
+  if (unknown.length > 0) {
+    section.warnings.push(`${directory} also holds files this setup does not know (${unknown.slice(0, 5).join(', ')}${unknown.length > 5 ? ', …' : ''}); kept them and the folder`);
+  }
+  section.changed = section.changed || removable.length > 0;
+}
+
+function removeLegacyState({ environment, isDryRun }) {
+  const section = { title: 'Old sidebar state', lines: [], errors: [], warnings: [], changed: false };
+  const directories = getLegacyStateDirectories(environment);
+  for (const directory of directories) {
+    cleanLegacyStateDirectory(directory, section, isDryRun);
+  }
+  if (section.lines.length === 0 && section.warnings.length === 0) {
+    section.lines.push('nothing left by the old sidebar hook');
+  }
+  return section;
+}
+
 function formatReport({ pluginRoot, isRemove, isDryRun, sections }) {
   const lines = [`subagent.watch ${isRemove ? 'remove' : 'setup'}${isDryRun ? ' (dry run, nothing is written)' : ''}`, `plugin: ${pluginRoot}`];
   for (const section of sections) {
@@ -423,10 +476,7 @@ function formatReport({ pluginRoot, isRemove, isDryRun, sections }) {
   }
   const hasErrors = sections.some((section) => section.errors.length > 0);
   if (!isRemove && !isDryRun && !hasErrors) {
-    lines.push('', `Next: press ${keyBinding} in a pane running Claude Code. Sub agents started from now on show up in the sidebar.`);
-  }
-  if (isRemove && !isDryRun && !hasErrors) {
-    lines.push('', 'Sidebar rows already shown stay until the pane reports again or herdr restarts.');
+    lines.push('', `Next: press ${keyBinding} in a pane running Claude Code.`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -456,7 +506,7 @@ export function runSetup({ argv, environment, pluginRoot = defaultPluginRoot, wr
     return options.error === '' ? 0 : 2;
   }
   const context = { environment, pluginRoot, isRemove: options.isRemove, isDryRun: options.isDryRun };
-  const sections = [setUpClaudeHooks(context), setUpHerdrConfig(context)];
+  const sections = [removeLegacyClaudeHooks(context), setUpHerdrConfig(context), removeLegacyState(context)];
   write(formatReport({ ...context, sections }));
   if (!options.isDryRun) {
     const herdrBinPath = resolveHerdrBinPath(environment);
