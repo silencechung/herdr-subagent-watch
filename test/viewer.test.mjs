@@ -80,7 +80,6 @@ test('inside a plugin popup without any pane information the viewer explains it 
     environment: isolatedEnvironment({
       HERDR_PLUGIN_ID: 'subagent.watch',
       HERDR_BIN_PATH: '/nonexistent/herdr',
-      XDG_RUNTIME_DIR: temporaryRoot,
       CLAUDE_CONFIG_DIR: path.join(temporaryRoot, 'no-config'),
     }),
   });
@@ -102,7 +101,6 @@ test('the popup uses the pane id from the open action and labels a cwd guess', (
       HERDR_BIN_PATH: '/nonexistent/herdr',
       SUBAGENT_WATCH_PANE_ID: 'w9:p9',
       HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w9:p8', focused_pane_cwd: workDirectory }),
-      XDG_RUNTIME_DIR: temporaryRoot,
       CLAUDE_CONFIG_DIR: configDirectory,
     }),
   });
@@ -131,7 +129,6 @@ function popupEnvironmentWithGuessableSession(herdrBinPath, name) {
     HERDR_BIN_PATH: herdrBinPath,
     SUBAGENT_WATCH_PANE_ID: 'w1:p1',
     HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w1:p1', focused_pane_cwd: workDirectory }),
-    XDG_RUNTIME_DIR: temporaryRoot,
     CLAUDE_CONFIG_DIR: configDirectory,
   });
 }
@@ -746,7 +743,6 @@ function popupEnvironment(herdrBinPath, { configDirectory, workDirectory }) {
     HERDR_BIN_PATH: herdrBinPath,
     SUBAGENT_WATCH_PANE_ID: 'w1:p1',
     HERDR_PLUGIN_CONTEXT_JSON: JSON.stringify({ focused_pane_id: 'w1:p1', focused_pane_cwd: workDirectory }),
-    XDG_RUNTIME_DIR: temporaryRoot,
     CLAUDE_CONFIG_DIR: configDirectory,
   });
 }
@@ -766,37 +762,6 @@ function isProcessAlive(pid) {
     return false;
   }
 }
-
-// hook 收到 SessionStart 時寫的 pane map：fixture session 的 transcript 改成比較舊，herdr 停在比較新的第二個 session
-function writeSessionStartSetup(name, sessions, paneMapSessionId) {
-  const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
-  const olderDate = new Date(Date.now() - 60_000);
-  fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
-  const runtimeDirectory = path.join(temporaryRoot, `${name}-runtime`);
-  fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
-  const writePaneMap = (sessionId, source) => {
-    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
-      sessionId,
-      transcriptPath: path.join(sessions.projectDirectory, `${sessionId}.jsonl`),
-      cwd: sessions.workDirectory,
-      updatedAtMs: Date.now(),
-      sessionStartSource: source,
-    }));
-  };
-  writePaneMap(paneMapSessionId, 'resume');
-  return { runtimeDirectory, writePaneMap };
-}
-
-test('--once follows a pane map written at SessionStart even when herdr names a session written more recently', () => {
-  const sessions = writeTwoSessions('session-start-once');
-  const { runtimeDirectory } = writeSessionStartSetup('session-start-once', sessions, fixtureSessionId);
-  const herdr = writeScriptedHerdr('session-start-once-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
-  const result = runViewer(['--once'], { environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout.split('\n')[0], /\[1 ● Explore\]/);
-  assert.doesNotMatch(result.stdout, /Plan/);
-  assert.match(result.stdout, /session 11111111 · herdr says session 22222222, pane map says 11111111/);
-});
 
 describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'util-linux script is not available' }, () => {
   test('only the app\'s own escape sequences reach the terminal', { timeout: 20_000 }, async () => {
@@ -855,27 +820,18 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     }
   });
 
-  test('herdr failing after /resume does not bring back the older session from the pane map', { timeout: 20_000 }, async () => {
+  test('herdr failing after /resume does not switch the screen to a guessed session', { timeout: 20_000 }, async () => {
     const sessions = writeTwoSessions('flap');
-    // pane map 停在 /resume 前的 fixture session（只有開 sub 時才更新），那個 transcript 比較舊
+    // herdr 回報第二個 session；fixture session 寫得比較近，herdr 失敗退回去猜時會猜到它
+    const secondTranscriptPath = path.join(sessions.projectDirectory, `${secondSessionId}.jsonl`);
     const olderDate = new Date(Date.now() - 60_000);
-    const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
-    fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
-    const runtimeDirectory = path.join(temporaryRoot, 'flap-runtime');
-    fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
-    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
-      sessionId: fixtureSessionId,
-      transcriptPath: fixtureTranscriptPath,
-      cwd: sessions.workDirectory,
-      updatedAtMs: olderDate.getTime(),
-    }));
+    fs.utimesSync(secondTranscriptPath, olderDate, olderDate);
     const herdr = writeScriptedHerdr('flap-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
-    const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
-    const pty = startInPty([], { columns: 160, environment });
+    const pty = startInPty([], { columns: 160, environment: popupEnvironment(herdr.binPath, sessions) });
     const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
     try {
       await pty.waitForScreen(isSecondSession, 'second session');
-      // herdr 回不出 pane（和逾時一樣退回 pane map）：等兩次查詢，畫面不能跳回 fixture
+      // herdr 回不出 pane（和逾時一樣退回去猜）：等兩次查詢，畫面不能跳到猜的 fixture
       fs.writeFileSync(herdr.responsePath, 'not json');
       const callCount = readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
       await waitUntil(() => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length >= callCount + 2, 'two failed herdr lookups', 10_000);
@@ -884,9 +840,8 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
       });
       const screen = pty.getScreenLines();
       assert.ok(isSecondSession(screen), screen.join('\n'));
+      assert.ok(!screen.some((line) => /guessed/.test(line)), screen.join('\n'));
       assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
-      // herdr 與 pane map 說法不同時，狀態列看得出來
-      assert.ok(screen.some((line) => /session 22222222 · herdr says session 22222222, pane map says 11111111/.test(line)), screen.join('\n'));
       pty.send('q');
       assert.equal(await pty.exited, 0);
     } finally {
@@ -894,24 +849,15 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
     }
   });
 
-  test('a stale pane map naming a session another pane keeps writing does not make the screen flap', { timeout: 30_000 }, async () => {
+  test('another session in the same folder that keeps being written does not make the screen flap', { timeout: 30_000 }, async () => {
     const sessions = writeTwoSessions('stale-writer');
-    // pane map 停在 fixture session，而 fixture session 在別的 pane 被 \`claude -c\` 接著寫；herdr 正確回報第二個 session
+    // fixture session 在別的 pane 被 \`claude -c\` 接著寫；herdr 正確回報第二個 session
     const olderDate = new Date(Date.now() - 60_000);
     const fixtureTranscriptPath = path.join(sessions.projectDirectory, `${fixtureSessionId}.jsonl`);
     const secondTranscriptPath = path.join(sessions.projectDirectory, `${secondSessionId}.jsonl`);
     fs.utimesSync(fixtureTranscriptPath, olderDate, olderDate);
-    const runtimeDirectory = path.join(temporaryRoot, 'stale-writer-runtime');
-    fs.mkdirSync(path.join(runtimeDirectory, 'subagent-watch'), { recursive: true });
-    fs.writeFileSync(path.join(runtimeDirectory, 'subagent-watch', 'pane-w1:p1.json'), JSON.stringify({
-      sessionId: fixtureSessionId,
-      transcriptPath: fixtureTranscriptPath,
-      cwd: sessions.workDirectory,
-      updatedAtMs: olderDate.getTime(),
-    }));
     const herdr = writeScriptedHerdr('stale-writer-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
-    const environment = { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory };
-    const pty = startInPty([], { columns: 160, environment });
+    const pty = startInPty([], { columns: 160, environment: popupEnvironment(herdr.binPath, sessions) });
     const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
     const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
     try {
@@ -928,36 +874,6 @@ describe('session lookup and terminal safety in a pty', { skip: !hasScript && 'u
       const screen = pty.getScreenLines();
       assert.ok(isSecondSession(screen), screen.join('\n'));
       assert.doesNotMatch(stripAnsi(pty.session.output), /Explore/);
-      pty.send('q');
-      assert.equal(await pty.exited, 0);
-    } finally {
-      pty.kill();
-    }
-  });
-
-  test('with a pane map written at SessionStart, herdr changing its session does not move the popup, the pane map changing does', { timeout: 30_000 }, async () => {
-    const sessions = writeTwoSessions('session-start-pty');
-    const { runtimeDirectory, writePaneMap } = writeSessionStartSetup('session-start-pty', sessions, fixtureSessionId);
-    const herdr = writeScriptedHerdr('session-start-pty-herdr', { response: claudePaneResponse(sessions.workDirectory, secondSessionId) });
-    const pty = startInPty([], { columns: 160, environment: { ...popupEnvironment(herdr.binPath, sessions), XDG_RUNTIME_DIR: runtimeDirectory } });
-    const isFixtureSession = (lines) => /\[1 ● Explore\]/.test(lines[0] ?? '') && lines.some((line) => /── session 11111111 /.test(line));
-    const isSecondSession = (lines) => /\[1 ● Plan\]/.test(lines[0] ?? '') && lines.some((line) => /── session 22222222 /.test(line));
-    const countFinishedLookups = () => readCallLog(herdr.logPath).filter((call) => call.kind === 'end').length;
-    try {
-      await pty.waitForScreen(isFixtureSession, 'the session from the SessionStart pane map');
-      // /clear 或 /resume：SessionStart 改寫 pane map
-      writePaneMap(secondSessionId, 'clear');
-      await pty.waitForScreen(isSecondSession, 'the new session from the rewritten pane map', 10_000);
-      // herdr 的值改成另一個 session（例：server 重啟後還原的舊值）：畫面不動
-      fs.writeFileSync(herdr.responsePath, JSON.stringify(claudePaneResponse(sessions.workDirectory, fixtureSessionId)));
-      const finishedLookups = countFinishedLookups();
-      await waitUntil(() => countFinishedLookups() >= finishedLookups + 2, 'two lookups after herdr changed', 10_000);
-      await new Promise((resolve) => {
-        setTimeout(resolve, 300);
-      });
-      const screen = pty.getScreenLines();
-      assert.ok(isSecondSession(screen), screen.join('\n'));
-      assert.ok(screen.some((line) => /session 22222222 · herdr says session 11111111, pane map says 22222222/.test(line)), screen.join('\n'));
       pty.send('q');
       assert.equal(await pty.exited, 0);
     } finally {

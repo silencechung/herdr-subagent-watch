@@ -182,15 +182,19 @@ test('without any usable node it explains what to install and lists the versions
   assert.match(result.stderr, /Too old or unusable:\n {2}.+\/node \(v18\.20\.0\)/);
 });
 
-test('the sidebar hook stays silent and exits 0 when there is no node', { skip: skipWithoutNode }, () => {
-  const { homeDirectory } = createCase();
-  const result = runLauncher([path.join(repositoryDirectory, 'hooks', 'sidebar-hook.mjs')], {
-    environment: { HOME: homeDirectory },
-    input: '{"hook_event_name":"SubagentStart"}',
-  });
-  assert.equal(result.status, 0);
-  assert.equal(result.stdout, '');
-  assert.equal(result.stderr, '');
+// 側邊欄 hook 已經拿掉，但還沒重跑 setup 的使用者 settings.json 裡還掛著它：有沒有 node 都要安靜地 exit 0
+test('a sidebar hook left in settings.json by an older version exits 0 silently, with or without node', { skip: skipWithoutNode }, () => {
+  const { binDirectory, homeDirectory } = createCase();
+  const explicitNode = writeFakeNode(path.join(binDirectory, 'node'), 'v22.0.0');
+  for (const environment of [{ HOME: homeDirectory }, { HOME: homeDirectory, SUBAGENT_WATCH_NODE: explicitNode }]) {
+    const result = runLauncher([path.join(repositoryDirectory, 'hooks', 'sidebar-hook.mjs')], {
+      environment,
+      input: '{"hook_event_name":"SubagentStart"}',
+    });
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, '');
+  }
 });
 
 test('an action without node tells the user through a herdr notification', { skip: skipWithoutNode }, () => {
@@ -206,11 +210,11 @@ test('an action without node tells the user through a herdr notification', { ski
   assert.deepEqual(calls.slice(0, 3), ['notification', 'show', 'subagent.watch: Node.js 22+ not found']);
 });
 
-test('stdin reaches the script untouched (the hook reads its payload from stdin)', () => {
+test('stdin reaches the script untouched', () => {
   const { binDirectory, homeDirectory } = createCase();
   const explicitNode = writeFakeNode(path.join(binDirectory, 'node'), 'v22.0.0');
-  const payload = '{"hook_event_name":"SubagentStart","agent_id":"abc"}';
-  const result = runLauncher(['hooks/sidebar-hook.mjs'], {
+  const payload = '{"some":"input","agent_id":"abc"}';
+  const result = runLauncher(['open-action.mjs'], {
     environment: { HOME: homeDirectory, SUBAGENT_WATCH_NODE: explicitNode },
     input: payload,
   });

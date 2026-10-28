@@ -10,6 +10,7 @@ import {
   buildTabBarLayout,
   buildTabLabels,
   buildTabSummary,
+  describeEndReason,
   emptySessionMessage,
   findTabBarAction,
   getVisibleTabRange,
@@ -53,6 +54,11 @@ test('tab summary counts running and done tabs', () => {
   assert.deepEqual(buildTabSummary([]), { runningText: '0', restText: ' running · 0 done │ ' });
   const summary = buildTabSummary([makeTab('a', true), makeTab('b', false), makeTab('c', true), makeTab('d', false), makeTab('e', true)]);
   assert.equal(summary.runningText + summary.restText, '2 running · 3 done │ ');
+});
+
+test('a sub agent waiting on its background work shows ◐ and its own count', () => {
+  const tabs = [makeTab('Explore', false), { ...makeTab('general-purpose', false), isWaiting: true }, makeTab('Plan', true)];
+  assert.equal(buildTabBar(tabs, 1, 120, false), '1 running · 1 waiting · 1 done │   1 [2 ◐ general-purpose] 3');
 });
 
 test('tab order follows the input even when done and running tabs interleave', () => {
@@ -505,4 +511,11 @@ test('the footer counts new wrapped rows while follow is paused', () => {
   assert.equal(narrowView.newLineCount, 5);
   assert.match(buildFooter(80, false, narrowView), /^↓ 5 new {2}/);
   assert.equal(resolveScrollView(state, buildEventLayout(events, 120), 6).newLineCount, 2);
+});
+
+test('each end reason has its own end line, and an unknown reason reads done', () => {
+  assert.equal(describeEndReason('stale'), 'no writes for 10 min');
+  assert.equal(describeEndReason('not_resumed'), 'background work ended, not resumed');
+  assert.equal(describeEndReason('waiting_stale'), 'no change for 10 min while waiting');
+  assert.equal(describeEndReason('something_new'), 'done');
 });

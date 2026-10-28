@@ -13,16 +13,16 @@ title = "Open sub agent viewer"
 contexts = ["pane", "workspace"]
 command = ["sh", "bin/run.sh", "open-action.mjs"]
 
-# setup／remove 改的是使用者自己的 Claude Code settings.json 與 herdr config.toml，跟哪個 pane 無關；contexts 照 herdr-automatic-rename 的 global 寫法
+# setup／remove 改的是使用者自己的 herdr config.toml（並清掉舊版寫進 Claude Code settings.json 的 hook），跟哪個 pane 無關；contexts 照 herdr-automatic-rename 的 global 寫法
 [[actions]]
 id = "setup"
-title = "Sub agent watch: set up Claude Code hooks, key and sidebar rows"
+title = "Sub agent watch: set up the key (and clean up older versions)"
 contexts = ["global"]
 command = ["sh", "bin/run.sh", "scripts/setup.mjs"]
 
 [[actions]]
 id = "remove"
-title = "Sub agent watch: remove Claude Code hooks, key and sidebar rows"
+title = "Sub agent watch: remove the key (and anything older versions added)"
 contexts = ["global"]
 command = ["sh", "bin/run.sh", "scripts/setup.mjs", "--remove"]
 

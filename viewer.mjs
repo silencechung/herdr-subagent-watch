@@ -3,8 +3,7 @@ import { getClaudeProjectsDirectory } from './lib/claude-config.mjs';
 import { createDemoSource } from './lib/demo.mjs';
 import { resolveHerdrBinPath } from './lib/herdr.mjs';
 import { createKeyDecoder, createTabNumberInput, isDigitKey } from './lib/keys.mjs';
-import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight } from './lib/render.mjs';
-import { resolveRuntimeDirectory } from './lib/runtime-directory.mjs';
+import { ansi, buildEventLayout, buildFrameLayout, buildTabLabels, describeEndReason, emptySessionMessage, findTabBarAction, getBodyHeight, waitingNote } from './lib/render.mjs';
 import { applyScrollKey, createScrollState, resolveScrollView } from './lib/scroll.mjs';
 import { chooseSession, describeNonClaudePane, parseContextJson, resolveSession } from './lib/session.mjs';
 import { getSubAgentStatus } from './lib/subagent-state.mjs';
@@ -68,7 +67,6 @@ async function resolveFromEnvironment(environment, signal) {
     // plugin process 的 cwd 是 plugin 資料夾，拿來猜 session 一定錯
     fallbackCwd: isPluginProcess ? null : process.cwd(),
     projectsDirectory: getClaudeProjectsDirectory(environment),
-    runtimeDirectory: resolveRuntimeDirectory({ environment }),
     herdrBinPath: resolveHerdrBinPath(environment),
     signal,
   });
@@ -94,8 +92,8 @@ function describeSession(session) {
 
 function createController({ options, environment, onChange }) {
   let session = null;
-  // herdr、pane map 上一次查詢成功時回報的 session：pane map 沒有 SessionStart 標記時，已經接上 session 之後只有來源的值變了才換（見 chooseSession）
-  let lastSeenSessionIds = { herdr: null, paneMap: null };
+  // herdr 上一次查詢成功時回報的 session：已經接上 session 之後只有回報的值變了才換（見 chooseSession）
+  let lastSeenSessionIds = { herdr: null };
   let source = null;
   let selectedAgentId = null;
   let lastResolveAttemptMs = 0;
@@ -202,11 +200,15 @@ function createController({ options, environment, onChange }) {
     const subAgents = source?.getSubAgents() ?? [];
     const labels = buildTabLabels(subAgents);
     return subAgents.map((subAgent, index) => {
-      const status = getSubAgentStatus(subAgent, nowMs);
-      const events = status.isDone
-        ? [...subAgent.events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: describeEndReason(status.reason) }]
-        : subAgent.events;
-      return { agentId: subAgent.agentId, label: labels[index], isDone: status.isDone, events };
+      // watcher 的 getStatus 會去看背景工作的輸出檔；demo 沒有背景工作，直接用 getSubAgentStatus
+      const status = source?.getStatus?.(subAgent, nowMs) ?? getSubAgentStatus(subAgent, nowMs);
+      let events = subAgent.events;
+      if (status.isDone) {
+        events = [...events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: describeEndReason(status.reason) }];
+      } else if (status.isWaiting) {
+        events = [...events, { kind: 'end', timestampMs: status.atMs, tool: '', summary: waitingNote }];
+      }
+      return { agentId: subAgent.agentId, label: labels[index], isDone: status.isDone, isWaiting: status.isWaiting, events };
     });
   }
 
