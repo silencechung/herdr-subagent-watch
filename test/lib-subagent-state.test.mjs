@@ -231,11 +231,52 @@ test('a killed notification ends a sub agent even while it waits on background w
   assert.deepEqual(getSubAgentStatus(state, baseMs + 9_000, unknownTaskEnd), { isDone: true, isWaiting: false, reason: 'killed', atMs: baseMs + 8_000 });
 });
 
-test('background work whose end cannot be read keeps the sub agent waiting, not done, past the stale threshold', () => {
+// 實測：Claude Code 結束 session 時被殺的背景 shell 不寫結束標記，transcript 也沒有完成紀錄；--resume 後那個 sub 不會再被叫醒
+test('background work whose end cannot be read is done once the sub agent and the output file stay unchanged past the stale threshold', () => {
   const state = backgroundState();
   applyRecord(state, backgroundShellLaunch(2, 'b1'));
   applyRecord(state, textRecord(3));
-  assert.equal(getSubAgentStatus(state, baseMs + staleAfterMs * 3, unknownTaskEnd).isWaiting, true);
+  const outputWrittenAt = { getTaskEndMs: () => null, getTaskLastAliveMs: (task) => (task.taskId === 'b1' ? baseMs + 60_000 : null) };
+  assert.equal(getSubAgentStatus(state, baseMs + 60_000 + staleAfterMs, outputWrittenAt).isWaiting, true);
+  assert.deepEqual(getSubAgentStatus(state, baseMs + 60_000 + staleAfterMs + 1, outputWrittenAt), { isDone: true, isWaiting: false, reason: 'waiting_stale', atMs: baseMs + 60_000 });
+});
+
+test('a background shell that keeps writing its output file keeps the sub agent waiting past the stale threshold', () => {
+  const state = backgroundState();
+  applyRecord(state, backgroundShellLaunch(2, 'b1'));
+  applyRecord(state, textRecord(3));
+  const nowMs = baseMs + staleAfterMs * 3;
+  const stillWriting = { getTaskEndMs: () => null, getTaskLastAliveMs: () => nowMs - staleAfterMs + 1_000 };
+  assert.deepEqual(getSubAgentStatus(state, nowMs, stillWriting), { isDone: false, isWaiting: true, reason: null, atMs: baseMs + 3_000 });
+});
+
+test('background work with no readable output file is done once the sub agent stays unchanged past the stale threshold', () => {
+  const state = backgroundState();
+  applyRecord(state, backgroundShellLaunch(2, 'b1'));
+  applyRecord(state, textRecord(3));
+  assert.equal(getSubAgentStatus(state, baseMs + 3_000 + staleAfterMs, unknownTaskEnd).isWaiting, true);
+  assert.deepEqual(getSubAgentStatus(state, baseMs + 3_000 + staleAfterMs + 1, unknownTaskEnd), { isDone: true, isWaiting: false, reason: 'waiting_stale', atMs: baseMs + 3_000 });
+});
+
+test('the waiting stale limit counts from the latest of the sub agent writes, its turn end and its own task output', () => {
+  const state = backgroundState();
+  applyRecord(state, backgroundShellLaunch(2, 'b1'));
+  applyRecord(state, textRecord(3));
+  applyNotification(state, { agentId: 'a1', status: 'completed', timestampMs: baseMs + 5_000 });
+  state.lastWriteMs = baseMs + 4_000;
+  assert.equal(getSubAgentStatus(state, baseMs + 5_000 + staleAfterMs, unknownTaskEnd).isWaiting, true);
+  assert.equal(getSubAgentStatus(state, baseMs + 5_000 + staleAfterMs + 1, unknownTaskEnd).reason, 'waiting_stale');
+});
+
+test('background work whose end is known still uses the grace period, not the waiting stale limit', () => {
+  const state = backgroundState();
+  applyRecord(state, backgroundShellLaunch(2, 'b1'));
+  applyRecord(state, textRecord(3));
+  const endedLongAgo = { getTaskEndMs: () => baseMs + 10_000, getTaskLastAliveMs: () => baseMs + 10_000 };
+  assert.deepEqual(getSubAgentStatus(state, baseMs + staleAfterMs * 3, endedLongAgo), { isDone: true, isWaiting: false, reason: 'not_resumed', atMs: baseMs + 10_000 });
+  // transcript 裡的完成紀錄也一樣，不看輸出檔
+  applyRecord(state, settledNotification(12, 'b1'));
+  assert.deepEqual(getSubAgentStatus(state, baseMs + staleAfterMs * 3, unknownTaskEnd), { isDone: true, isWaiting: false, reason: 'not_resumed', atMs: baseMs + 12_000 });
 });
 
 test('a background sub agent whose own background work already ended keeps the old end_turn rule', () => {

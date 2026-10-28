@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, test } from 'node:test';
-import { getSubAgentStatus } from '../lib/subagent-state.mjs';
+import { getSubAgentStatus, staleAfterMs } from '../lib/subagent-state.mjs';
 import { createSessionWatcher, getSessionPaths } from '../lib/watcher.mjs';
 
 const fixtureProjectDirectory = fileURLToPath(new URL('./fixtures/viewer/projects/-tmp-demo-project', import.meta.url));
@@ -316,7 +316,64 @@ test('an output path that is a FIFO does not block the viewer and keeps the sub 
   writeSubAgent('fifo1', [shellLaunch('2026-10-10T01:00:01.000Z', 'bfifo0001', outputPath), JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
   const watcher = createSessionWatcher({ transcriptPath });
   watcher.refresh();
+  const [fifo] = watcher.getSubAgents();
   const startMs = Date.now();
-  assert.equal(watcher.getStatus(watcher.getSubAgents()[0], Date.now() + 3_600_000).isWaiting, true);
+  assert.equal(watcher.getStatus(fifo, Date.now()).isWaiting, true);
+  // FIFO 不是一般檔案，修改時間不算：只看 sub 自己，超過 stale 上限就結束
+  assert.equal(watcher.getStatus(fifo, Date.now() + 3_600_000).reason, 'waiting_stale');
   assert.ok(Date.now() - startMs < 1000);
+});
+
+function setModifiedMs(filePath, modifiedMs) {
+  fs.utimesSync(filePath, modifiedMs / 1000, modifiedMs / 1000);
+}
+
+test('a background shell killed without an end marker stops showing waiting once nothing changes for the stale threshold', () => {
+  const { transcriptPath, tasksDirectory, writeSubAgent } = createBackgroundSession();
+  const outputPath = path.join(tasksDirectory, 'bnomark01.output');
+  // 實測：關掉 Claude Code 時被殺的背景 shell，輸出檔停在最後一行 log，沒有 [exited with code N]／[killed]
+  fs.writeFileSync(outputPath, 'listening on :5173\n');
+  writeSubAgent('nomark1', [shellLaunch('2026-10-10T01:00:01.000Z', 'bnomark01', outputPath), JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  const subAgentPath = path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-nomark1.jsonl');
+  const lastChangeMs = Date.parse('2026-10-10T01:00:02.000Z');
+  setModifiedMs(subAgentPath, lastChangeMs);
+  const outputWrittenMs = Date.parse('2026-10-10T01:05:00.000Z');
+  setModifiedMs(outputPath, outputWrittenMs);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const [probe] = watcher.getSubAgents();
+  assert.equal(watcher.getStatus(probe, outputWrittenMs + staleAfterMs).isWaiting, true, 'the output file was written within the threshold');
+  assert.deepEqual(watcher.getStatus(probe, outputWrittenMs + staleAfterMs + 1), { isDone: true, isWaiting: false, reason: 'waiting_stale', atMs: outputWrittenMs });
+});
+
+test('a background shell whose output file is missing stops showing waiting once the sub agent is unchanged for the stale threshold', () => {
+  const { transcriptPath, tasksDirectory, writeSubAgent } = createBackgroundSession();
+  const outputPath = path.join(tasksDirectory, 'bmissing1.output');
+  writeSubAgent('missing1', [shellLaunch('2026-10-10T01:00:01.000Z', 'bmissing1', outputPath), JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  const lastChangeMs = Date.parse('2026-10-10T01:00:02.000Z');
+  setModifiedMs(path.join(getSessionPaths(transcriptPath).subagentsDirectory, 'agent-missing1.jsonl'), lastChangeMs);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const [probe] = watcher.getSubAgents();
+  assert.equal(watcher.getStatus(probe, lastChangeMs + staleAfterMs).isWaiting, true);
+  assert.deepEqual(watcher.getStatus(probe, lastChangeMs + staleAfterMs + 1), { isDone: true, isWaiting: false, reason: 'waiting_stale', atMs: lastChangeMs });
+});
+
+test('a sub agent waiting on a background Agent stays waiting past the stale threshold while the nested sub agent is not done', () => {
+  const { transcriptPath, writeSubAgent } = createBackgroundSession();
+  const nestedLaunch = { type: 'user', timestamp: '2026-10-10T01:00:01.000Z', message: { content: [] }, toolUseResult: { isAsync: true, status: 'async_launched', agentId: 'nested2' } };
+  writeSubAgent('parent2', [nestedLaunch, JSON.parse(waitingText('2026-10-10T01:00:02.000Z'))]);
+  writeSubAgent('nested2', [JSON.parse(assistantLine('nested2', '2026-10-10T01:20:00.000Z', { type: 'tool_use', id: 'toolu_n2', name: 'Bash', input: { command: 'echo nested' } }))]);
+  const { subagentsDirectory } = getSessionPaths(transcriptPath);
+  setModifiedMs(path.join(subagentsDirectory, 'agent-parent2.jsonl'), Date.parse('2026-10-10T01:00:02.000Z'));
+  const nestedWrittenMs = Date.parse('2026-10-10T01:20:00.000Z');
+  setModifiedMs(path.join(subagentsDirectory, 'agent-nested2.jsonl'), nestedWrittenMs);
+  const watcher = createSessionWatcher({ transcriptPath });
+  watcher.refresh();
+  const byId = new Map(watcher.getSubAgents().map((subAgent) => [subAgent.agentId, subAgent]));
+  assert.equal(watcher.getStatus(byId.get('parent2'), nestedWrittenMs + 60_000).isWaiting, true);
+  // 巢狀 sub 自己 10 分鐘沒寫入 → 它結束 → parent 走原本的寬限時間
+  const nestedStaleMs = nestedWrittenMs + staleAfterMs + 1;
+  assert.equal(watcher.getStatus(byId.get('nested2'), nestedStaleMs).reason, 'stale');
+  assert.equal(watcher.getStatus(byId.get('parent2'), nestedStaleMs).reason, 'not_resumed');
 });

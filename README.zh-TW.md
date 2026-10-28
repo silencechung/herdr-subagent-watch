@@ -53,7 +53,7 @@ herdr plugin uninstall subagent.watch    # link 的話用 herdr plugin unlink su
 - **按 `prefix+.` 沒反應**：看 setup 的 log。`prefix+.` 已被別的動作佔用時 setup 不加快捷鍵，log 裡附上要自己貼的片段。
 - **popup 還停在上一個 session，或顯示 `(guessed: latest session)`**：popup 跟著 herdr 回報的這個 pane 的 session，那個 session 的 transcript 出現後才換過去（第一個 prompt 之後才寫出來）。herdr 沒回報 session 時用 pane 的 cwd 猜，同一個資料夾開多個 Claude Code 時可能猜錯。見[怎麼找到 pane 對應的 session](docs/internals.zh-TW.md#怎麼找到-pane-對應的-session)。
 - **`No Claude Code session in this pane`**：herdr 回報那個 pane 沒有 agent（純 shell）。popup 每 2 秒重問一次，之後在同一個 pane 開 Claude Code 會自動接上。
-- **tab 一直是 `◐`**：那個 sub 在等它自己的背景工作。判斷不了那個工作有沒有結束時（見[資料來源與結束判斷](docs/internals.zh-TW.md#資料來源與結束判斷)），tab 維持 `◐`，不會說它已經結束。
+- **tab 一直是 `◐`**：那個 sub 在等它自己的背景工作。判斷不了那個工作有沒有結束時（見[資料來源與結束判斷](docs/internals.zh-TW.md#資料來源與結束判斷)），tab 維持 `◐`，直到 sub 與那個工作的輸出檔都 10 分鐘沒有變化，才變成 `✓`，結束行是 `no change for 10 min while waiting`。背景 shell 一直在寫輸出（例如 dev server）的話就一直是 `◐`。
 - **找不到 Node.js 22+**：會印出原因。要指定 node 就在啟動 herdr 的環境裡設 `SUBAGENT_WATCH_NODE`。
 - **setup 寫到錯的設定檔**：action 用的是 herdr server 的環境；改在自己的 shell 進 plugin 目錄跑 `sh bin/run.sh scripts/setup.mjs`。
 

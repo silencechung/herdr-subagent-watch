@@ -10,6 +10,7 @@ import {
   buildTabBarLayout,
   buildTabLabels,
   buildTabSummary,
+  describeEndReason,
   emptySessionMessage,
   findTabBarAction,
   getVisibleTabRange,
@@ -510,4 +511,11 @@ test('the footer counts new wrapped rows while follow is paused', () => {
   assert.equal(narrowView.newLineCount, 5);
   assert.match(buildFooter(80, false, narrowView), /^↓ 5 new {2}/);
   assert.equal(resolveScrollView(state, buildEventLayout(events, 120), 6).newLineCount, 2);
+});
+
+test('each end reason has its own end line, and an unknown reason reads done', () => {
+  assert.equal(describeEndReason('stale'), 'no writes for 10 min');
+  assert.equal(describeEndReason('not_resumed'), 'background work ended, not resumed');
+  assert.equal(describeEndReason('waiting_stale'), 'no change for 10 min while waiting');
+  assert.equal(describeEndReason('something_new'), 'done');
 });

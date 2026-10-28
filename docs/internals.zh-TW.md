@@ -116,10 +116,10 @@ pane id 來源依序：`SUBAGENT_WATCH_PANE_ID`（open action 傳入）→ conte
 - **在等自己的背景工作（`◐`）**：sub 啟動背景工作後結束這一輪並不代表做完了，那個工作結束後它會自己接著跑。等待期間 `SubagentHandback`（可能在等待前就送出）、`end_turn`、main transcript 的 `completed` 通知都會出現，只看規則 1–3 會顯示 `✓`（實測）。所以先做這幾步：
   - 從 sub 自己的 transcript 記下它啟動的背景工作：Bash `run_in_background`（`toolUseResult.backgroundTaskId`，shell）或背景 Agent（`toolUseResult.isAsync` 加 `agentId`，agent；巢狀 sub 在同一個 `subagents` 資料夾有自己的 transcript）。
   - 這一輪已經結束（規則 1–3 任一，或 `end_turn`，background sub 也算），而這些工作還有沒結束的：tab 顯示 `◐`，結束行是 `waiting on background work`，標題列算成 `N waiting`。
-  - 工作什麼時候結束，依序看：sub transcript 裡說它結束的紀錄（`origin.kind` 是 `task-notification` 的 `user` 紀錄、`queued_command` 的 `attachment`、sub 自己 `TaskStop` 的結果，本機看過這三種），沒有的話 shell 看輸出檔（路徑在啟動時的 tool result 裡；最後一行是 `[exited with code N]` 或 `[killed]` 就是結束了，以檔案修改時間當結束時間），agent 看巢狀 sub 自己的狀態。判斷不了的工作讓 sub 維持 `◐`，不會變成 `✓`，也不套用 10 分鐘的備案。
+  - 工作什麼時候結束，依序看：sub transcript 裡說它結束的紀錄（`origin.kind` 是 `task-notification` 的 `user` 紀錄、`queued_command` 的 `attachment`、sub 自己 `TaskStop` 的結果，本機看過這三種），沒有的話 shell 看輸出檔（路徑在啟動時的 tool result 裡；最後一行是 `[exited with code N]` 或 `[killed]` 就是結束了，以檔案修改時間當結束時間），agent 看巢狀 sub 自己的狀態。判斷不了的工作讓 sub 維持 `◐`，直到 10 分鐘都沒有變化（與規則 4 同一個門檻），之後顯示為結束，結束行是 `no change for 10 min while waiting`。算變化的有：sub transcript 寫入、這一輪結束、那個工作的輸出檔寫入（讀得到才算）；agent 則是巢狀 sub 還沒結束就算有變化。本機實測關掉 Claude Code 時被殺的背景 shell 不寫結束標記、transcript 也沒有紀錄，沒有這個上限的話用 `--resume` 接回來的 sub 會永遠是 `◐`。持續寫輸出檔的長命背景 shell（例如一直寫 request log 的 dev server）只要還在寫，sub 就一直是 `◐`。
   - 工作都結束了、sub 之後都沒有寫入：再維持 `◐` 30 秒（正常 1–2 秒內就會被叫醒），之後顯示為結束，結束行是 `background work ended, not resumed`。這是給等待中被停掉的 sub 用的：本機實測它不會留下 `SubagentStop`、`killed` 通知或任何紀錄，只有被 kill 的背景 shell。
   - 工作結束後 sub 又跑過：照原本的規則 1–4 判斷。main transcript 的 `killed`／`failed` 通知就算在等待中也直接算結束。
-  - 輸出檔格式與 `origin`／`queued_command`／`TaskStop` 的形式都是 Claude Code internal（本機 2.1.311、macOS 實測），升版可能改；改了的話等待中的 sub 會一直是 `◐`，不會誤判成結束。
+  - 輸出檔格式與 `origin`／`queued_command`／`TaskStop` 的形式都是 Claude Code internal（本機 2.1.311、macOS 實測），升版可能改；改了的話等待中的 sub 會維持 `◐`，直到同上的 10 分鐘沒有變化。
 - 前景 sub：樣本只有一個（`"requestShape":"foreground"`），用 `SubagentHandback` 結束（規則 1）。規則 2（`end_turn`）對前景 sub 照樣適用；前景 sub 會不會中途出現 `end_turn` **未驗證**。
 
 ### Node 怎麼找
@@ -146,7 +146,7 @@ manifest 的 action／pane 都經過 `bin/run.sh`（POSIX sh），依序找第�
   - herdr 的回報變回較舊的 session（例：herdr server 重啟後還原舊值）。這算值變了，popup 不比寫入時間就換過去，之後停在那裡，直到 herdr 回報跟上一次不同的 session。viewer 能不能撐過 herdr server 重啟未驗證。
   - herdr 第一次回報 session（一開始失敗、後來恢復），而別的 pane 剛好把舊 session 的 transcript 寫得一樣晚或更晚：popup 停在舊 session，之後不會再比寫入時間。
   - 兩種情況關掉 popup 再開，都會跟第一次開啟一樣照寫入時間重新選擇。
-- **已經不在的 sub 一直顯示 `◐`**：它的背景工作判斷不了（輸出檔不見了，或新版 Claude Code 改了格式）。popup 不會猜它已經結束，見[資料來源與結束判斷](#資料來源與結束判斷)。
+- **已經不在的 sub 一直顯示 `◐`**：它的背景工作判斷不了（輸出檔不見了，或新版 Claude Code 改了格式）。sub 與輸出檔都 10 分鐘沒有變化後會變成 `✓`；背景 shell 一直在寫輸出檔的話就一直是 `◐`。見[資料來源與結束判斷](#資料來源與結束判斷)。
 - `◀ ▶ ● ─ │ · … ↑ ↓` 是 East Asian ambiguous width 字元，terminal 設成 ambiguous = wide 時畫面會錯位。
 - 只有 East Asian Width 為 W 或 F（Unicode 16.0）的字元算 2 格。有些 terminal 只在加了 variation selector 時才畫成 2 格的符號（例 `❤️`），量出來的寬度可能和 terminal 實際畫的不同。emoji ZWJ 序列量的是各部分加總（👨‍👩‍👧 算 6 格），terminal 把它合成一個字畫的話會比量的窄。
 - herdr 會不會把滑鼠滾輪轉給 popup **沒驗證過**。若滾輪沒反應，用 `↑` / `↓`。左鍵點擊已在真的 herdr popup 裡確認：herdr 會以 SGR press／release 轉給 popup，座標以 popup 內容區左上角為 1,1；點 popup 外面不會有事件。
