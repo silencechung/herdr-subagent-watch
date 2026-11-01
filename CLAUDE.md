@@ -35,7 +35,8 @@ herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，pop
 
 ### 相關 skills
 
-`hotpapa:ts-js-style`、`hotpapa:node-first`
+- `hotpapa:ts-js-style`
+- `hotpapa:node-first`
 
 ### 專案 skills
 
