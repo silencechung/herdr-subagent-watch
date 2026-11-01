@@ -1,6 +1,6 @@
 # herdr-subagent-watch
 
-herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，popup 即時顯示該 session 的 sub agent 在做什麼。只支援 Claude Code、Linux 與 macOS；細節以 `README.md`、`docs/internals.md` 為準。
+herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，popup 即時顯示該 session 的 sub agent 在做什麼。以 Node.js（只用內建模組）實作，只支援 Claude Code、Linux 與 macOS；細節以 `README.md`、`docs/internals.md` 為準。
 
 ## 結構
 
@@ -34,11 +34,6 @@ README.md、docs/*.md   # 各有 .zh-TW 版，改一份要同步另一份
 ## Reading Notes
 
 給 sub-agent：改這個 repo 要讀什麼、載什麼。格式規格在 plugin `hotpapa` 的 skill `repo-agent`。
-
-### 語言 skills 對照
-
-- `.mjs` → `hotpapa:ts-js-style`
-- `.sh`、`.toml`、`.md`：無
 
 ### 專案 skills
 
