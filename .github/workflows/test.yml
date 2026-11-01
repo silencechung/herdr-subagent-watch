@@ -13,7 +13,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 不用 workflow 層的 paths-ignore：整個 workflow 不跑時，必過的 check test 會停在 Pending、PR 被擋；
+  # job 層 if 跳過的 job 會回報 Success，branch protection 才會放行
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_test: ${{ steps.filter.outputs.needs_test }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        # 新 branch（before 全是 0）或 base commit 不在本機時 git diff 會失敗，清單變空，script 會印 true（要跑）
+        run: echo "needs_test=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null | node scripts/ci-needs-test.mjs)" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: changes
+    if: needs.changes.outputs.needs_test == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -26,6 +49,8 @@ jobs:
 
   # 跟 test 分成兩個 job、不改成 matrix：main 的 branch protection 把 check 名稱 test 設成必過，matrix 會把名稱改成 test (ubuntu-latest)
   test-macos:
+    needs: changes
+    if: needs.changes.outputs.needs_test == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
