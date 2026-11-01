@@ -4,18 +4,16 @@ herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，pop
 
 ## 結構
 
-```
-herdr-plugin.toml      # manifest：actions（open／setup／remove）與 popup pane，command 一律經 bin/run.sh
-bin/run.sh             # node launcher：找 Node ≥ 22（SUBAGENT_WATCH_NODE → PATH → fnm／volta／nvm）
-viewer.mjs             # popup 本體（tab、捲動、按鍵）
-open-action.mjs        # prefix+. 的 action：問 herdr focused pane，開 viewer pane
-scripts/setup.mjs      # setup／remove：改 herdr config.toml 的 marker 區塊、清舊版殘留
-demo.mjs               # 等同 viewer.mjs --demo
-lib/*.mjs              # 純邏輯模組（transcript、session、watcher、render、text、setup-*…）
-test/*.test.mjs        # node:test；fixtures 在 test/fixtures/
-docs/internals.md      # 運作細節與開發說明
-README.md、docs/*.md   # 各有 .zh-TW 版，改一份要同步另一份
-```
+- `herdr-plugin.toml`：manifest：actions（open／setup／remove）與 popup pane，command 一律經 bin/run.sh
+- `bin/run.sh`：node launcher：找 Node ≥ 22（SUBAGENT_WATCH_NODE → PATH → fnm／volta／nvm）
+- `viewer.mjs`：popup 本體（tab、捲動、按鍵）
+- `open-action.mjs`：prefix+. 的 action：問 herdr focused pane，開 viewer pane
+- `scripts/setup.mjs`：setup／remove：改 herdr config.toml 的 marker 區塊、清舊版殘留
+- `demo.mjs`：等同 viewer.mjs --demo
+- `lib/*.mjs`：純邏輯模組（transcript、session、watcher、render、text、setup-*…）
+- `test/*.test.mjs`：node:test；fixtures 在 test/fixtures/
+- `docs/internals.md`：運作細節與開發說明
+- `README.md`、`docs/*.md`：各有 .zh-TW 版，改一份要同步另一份
 
 ## 指令
 
