@@ -9,6 +9,7 @@ herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，pop
 - `viewer.mjs`：popup 本體（tab、捲動、按鍵）
 - `open-action.mjs`：prefix+. 的 action：問 herdr focused pane，開 viewer pane
 - `scripts/setup.mjs`：setup／remove：改 herdr config.toml 的 marker 區塊、清舊版殘留
+- `scripts/ci-needs-test.mjs`：CI changes job 用，改動只有根目錄 `*.md` 與 `docs/**/*.md` 時印 false、跳過 test job
 - `demo.mjs`：等同 viewer.mjs --demo
 - `lib/*.mjs`：純邏輯模組（transcript、session、watcher、render、text、setup-*…）
 - `test/*.test.mjs`：node:test；fixtures 在 test/fixtures/
@@ -28,6 +29,7 @@ herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，pop
 - 顏色只用 bold／dim／reverse 與 ANSI 16 色，跟 terminal theme 走，不套 `bazzite-palette`。
 - 畫到 terminal 前 transcript 文字一律過 `lib/text.mjs` 的 sanitize。
 - `main` 有 branch protection：走 PR，required check 名稱固定是 `test`。
+- review 本 repo 的改動前先讀 `REVIEW.md`。
 
 ## Reading Notes
 
