@@ -32,7 +32,8 @@ jobs:
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         # 新 branch（before 全是 0）或 base commit 不在本機時 git diff 會失敗，清單變空，script 會印 true（要跑）
-        run: echo "needs_test=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null | node scripts/ci-needs-test.mjs)" >> "$GITHUB_OUTPUT"
+        # 三點 diff 從 merge-base 比，只看這個 branch 的改動；兩點會把 base branch 後來新進的檔也算進來
+        run: echo "needs_test=$(git diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null | node scripts/ci-needs-test.mjs)" >> "$GITHUB_OUTPUT"
 
   test:
     needs: changes
