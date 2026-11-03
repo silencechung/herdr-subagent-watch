@@ -35,11 +35,6 @@ herdr plugin `subagent.watch`：在跑 Claude Code 的 pane 按 `prefix+.`，pop
 
 給 sub-agent：改這個 repo 要讀什麼、載什麼。格式規格在 plugin `hotpapa` 的 skill `repo-agent`。
 
-### 相關 skills
-
-- `hotpapa:ts-js-style`
-- `hotpapa:node-first`
-
 ### 專案 skills
 
 無（沒有 `.claude/skills/`）。
